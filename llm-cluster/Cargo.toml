@@ -1,0 +1,18 @@
+[package]
+name = "llm-cluster"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+llm-core = { path = "../llm-core" }
+llm-scheduler = { path = "../llm-scheduler" }
+tokio = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sysinfo = { workspace = true }
+clap = { workspace = true }
+candle-core = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "llm-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+llm-core = { path = "../llm-core" }
+llm-scheduler = { path = "../llm-scheduler" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+libc = "0.2"
+rand = { workspace = true }

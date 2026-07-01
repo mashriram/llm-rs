@@ -1,0 +1,24 @@
+[package]
+name = "llm-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+llm-core = { path = "../llm-core" }
+llm-scheduler = { path = "../llm-scheduler" }
+llm-ffi = { path = "../llm-ffi" }
+llm-cli = { path = "../llm-cli" }
+llm-cluster = { path = "../llm-cluster" }
+candle-core = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+http = { workspace = true }
+half = { workspace = true }
+http-body-util = "0.1"
+rand = { workspace = true }
+base64 = "0.22"
+

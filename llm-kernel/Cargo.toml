@@ -1,0 +1,11 @@
+[package]
+name = "llm-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cubecl = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+cubecl-wgpu = { workspace = true }
