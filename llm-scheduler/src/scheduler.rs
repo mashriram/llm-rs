@@ -173,6 +173,7 @@ impl Scheduler {
                     self.block_allocator.free(block)?;
                 }
                 self.prefix_cache.recycle_sequence(seq_id);
+                self.backend.clear_sequence(seq_id);
             }
         }
 
@@ -186,6 +187,7 @@ impl Scheduler {
                 let _ = self.block_allocator.free(block);
             }
             self.prefix_cache.recycle_sequence(seq.seq_id);
+            self.backend.clear_sequence(seq.seq_id);
         }
     }
 

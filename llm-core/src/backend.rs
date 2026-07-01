@@ -30,6 +30,9 @@ pub trait LlmBackend: Send + Sync {
     /// Backend name for logging/metrics.
     fn name(&self) -> &str;
 
+    /// Clean up any resources associated with the sequence.
+    fn clear_sequence(&self, _seq_id: SeqId) {}
+
     /// Get the EOS token ID for this backend.
     fn eos_token_id(&self) -> u32 {
         2

@@ -153,63 +153,14 @@ fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
 
 // Host-side raw KV cache storage
 struct RawKvCache {
-    block_size: usize,
-    _n_layers: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    data_k: Vec<f32>,
-    data_v: Vec<f32>,
-    num_blocks: usize,
     seq_lengths: HashMap<SeqId, usize>,
 }
 
 impl RawKvCache {
-    fn new(num_blocks: usize, block_size: usize, n_layers: usize, n_kv_heads: usize, head_dim: usize) -> Self {
-        let size = n_layers * num_blocks * block_size * n_kv_heads * head_dim;
+    fn new(_num_blocks: usize, _block_size: usize, _n_layers: usize, _n_kv_heads: usize, _head_dim: usize) -> Self {
         Self {
-            block_size,
-            _n_layers: n_layers,
-            n_kv_heads,
-            head_dim,
-            data_k: vec![0.0; size],
-            data_v: vec![0.0; size],
-            num_blocks,
             seq_lengths: HashMap::new(),
         }
-    }
-
-    fn get_index(&self, layer: usize, block: usize, slot: usize, head: usize, dim: usize) -> usize {
-        layer * (self.num_blocks * self.block_size * self.n_kv_heads * self.head_dim)
-            + block * (self.block_size * self.n_kv_heads * self.head_dim)
-            + slot * (self.n_kv_heads * self.head_dim)
-            + head * self.head_dim
-            + dim
-    }
-
-
-
-    fn get_slice_k(&self, layer: usize, block: usize, slot: usize) -> &[f32] {
-        let start = self.get_index(layer, block, slot, 0, 0);
-        let len = self.n_kv_heads * self.head_dim;
-        &self.data_k[start..start + len]
-    }
-
-    fn get_slice_v(&self, layer: usize, block: usize, slot: usize) -> &[f32] {
-        let start = self.get_index(layer, block, slot, 0, 0);
-        let len = self.n_kv_heads * self.head_dim;
-        &self.data_v[start..start + len]
-    }
-
-    fn write_slice_k(&mut self, layer: usize, block: usize, slot: usize, src: &[f32]) {
-        let start = self.get_index(layer, block, slot, 0, 0);
-        let len = self.n_kv_heads * self.head_dim;
-        self.data_k[start..start + len].copy_from_slice(src);
-    }
-
-    fn write_slice_v(&mut self, layer: usize, block: usize, slot: usize, src: &[f32]) {
-        let start = self.get_index(layer, block, slot, 0, 0);
-        let len = self.n_kv_heads * self.head_dim;
-        self.data_v[start..start + len].copy_from_slice(src);
     }
 
     fn get_seq_len(&self, seq_id: SeqId) -> usize {
@@ -333,6 +284,7 @@ pub struct CandleBackend {
     device: Device,
     vision_encoder: Option<VisionEncoder>,
     visual_embeddings: Mutex<Option<Tensor>>,
+    gpu_kv_cache: Mutex<HashMap<(usize, SeqId), (Tensor, Tensor)>>,
 }
 
 impl CandleBackend {
@@ -357,6 +309,7 @@ impl CandleBackend {
             device: Device::Cpu,
             vision_encoder: None,
             visual_embeddings: Mutex::new(None),
+            gpu_kv_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -372,35 +325,30 @@ impl CandleBackend {
         }
         // 2. Already in local_cache (GPU or CPU tiered)
         if let Some(t) = local_cache.get(name) {
-            // If it is on the target device, return directly.
-            // Otherwise (offloaded to CPU), copy it to the target device.
-            if std::mem::discriminant(t.device()).eq(&std::mem::discriminant(&self.device)) {
-                return Ok(t.clone());
-            } else {
-                return Ok(t.to_device(&self.device)?);
-            }
+            return Ok(t.clone());
         }
-        // 3. Dequantize from QTensor (done only ONCE per weight name)
+        // 3. Dequantize from QTensor (done only ONCE per weight name if cached, or on-the-fly if not)
         if let Some(qt) = self.quantized_weights.get(name) {
-            let t = qt.dequantize(&self.device)
-                .with_context(|| format!("dequantize {} to {:?}", name, self.device))?;
-            let t = t.to_dtype(DType::F16)?;
-            let tensor_bytes = t.elem_count() as u64 * 2; // F16 = 2 bytes
+            let tensor_bytes = qt.shape().elem_count() as u64 * 2; // F16 = 2 bytes
 
             let mut cache = self.deq_cache.lock().map_err(|_| anyhow!("deq_cache poisoned"))?;
             let used = self.gpu_cache_bytes.load(std::sync::atomic::Ordering::Relaxed);
             if used + tensor_bytes <= self.gpu_cache_budget {
                 // GPU cached
+                let t = qt.dequantize(&self.device)
+                    .with_context(|| format!("dequantize {} to {:?}", name, self.device))?;
+                let t = t.to_dtype(DType::F16)?;
                 self.gpu_cache_bytes.fetch_add(tensor_bytes, std::sync::atomic::Ordering::Relaxed);
                 cache.insert(name.to_string(), t.clone());
                 local_cache.insert(name.to_string(), t.clone());
                 return Ok(t);
             } else {
-                // CPU offloaded - move the F16 tensor to CPU, cache it there,
-                // and return the target device (GPU) tensor for immediate use.
-                let cpu_t = t.to_device(&Device::Cpu)?;
-                cache.insert(name.to_string(), cpu_t.clone());
-                local_cache.insert(name.to_string(), cpu_t);
+                // CPU offloaded
+                let t = qt.dequantize(&Device::Cpu)
+                    .with_context(|| format!("dequantize {} to CPU", name))?;
+                let t = t.to_dtype(DType::F16)?;
+                cache.insert(name.to_string(), t.clone());
+                local_cache.insert(name.to_string(), t.clone());
                 return Ok(t);
             }
         }
@@ -466,6 +414,12 @@ impl LlmBackend for CandleBackend {
         self.eos_token_id
     }
 
+    fn clear_sequence(&self, seq_id: SeqId) {
+        if let Ok(mut cache) = self.gpu_kv_cache.lock() {
+            cache.retain(|&(_, sid), _| sid != seq_id);
+        }
+    }
+
     fn load_weights(&mut self, path: &Path) -> Result<ModelMeta> {
         let is_gguf = path.is_file() && path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_lowercase() == "gguf").unwrap_or(false);
 
@@ -481,8 +435,8 @@ impl LlmBackend for CandleBackend {
         };
         self.device = dev.clone();
 
-        // Query free VRAM for cache budget (leave 2.5 GB headroom for activations/KV cache)
-        let vram_headroom_bytes: u64 = 2_500 * 1024 * 1024;
+        // Query free VRAM for cache budget (leave 2.0 GB headroom for activations/KV cache)
+        let vram_headroom_bytes: u64 = 2_000 * 1024 * 1024;
         let free_vram = Self::query_free_vram_bytes();
         self.gpu_cache_budget = free_vram.saturating_sub(vram_headroom_bytes);
         tracing::info!(
@@ -634,12 +588,58 @@ impl LlmBackend for CandleBackend {
                 return Err(anyhow!("No safetensors files found in {:?}", path));
             }
 
-            // Load SafeTensors files directly into weights map in F16 on selected device
+            // Load all SafeTensors tensors to CPU memory in F16 first
+            let mut cpu_tensors = HashMap::new();
             for sf_file in sf_files {
                 let loaded = candle_core::safetensors::load(&sf_file, &Device::Cpu)?;
                 for (name, tensor) in loaded {
-                    let casted = tensor.to_dtype(DType::F16)?.to_device(&dev)?;
-                    weights.insert(name, casted);
+                    let casted = tensor.to_dtype(DType::F16)?;
+                    cpu_tensors.insert(name, casted);
+                }
+            }
+
+            // Sort weight names layer-wise to prioritize caching the earlier layers
+            let mut names: Vec<String> = cpu_tensors.keys().cloned().collect();
+            names.sort_by(|a, b| {
+                let get_layer = |name: &str| -> usize {
+                    if name.starts_with("model.layers.") {
+                        let remain = &name["model.layers.".len()..];
+                        if let Some(pos) = remain.find('.') {
+                            if let Ok(idx) = remain[..pos].parse::<usize>() {
+                                return idx;
+                            }
+                        }
+                    }
+                    if name == "model.embed_tokens.weight" {
+                        0
+                    } else {
+                        999 // put other weights last
+                    }
+                };
+                get_layer(a).cmp(&get_layer(b))
+            });
+
+            let mut simulated_used = 0u64;
+            for name in names {
+                if let Some(t) = cpu_tensors.remove(&name) {
+                    let tensor_bytes = t.shape().elem_count() as u64 * 2;
+                    if simulated_used + tensor_bytes <= self.gpu_cache_budget {
+                        // Move to GPU
+                        match t.to_device(&self.device) {
+                            Ok(gpu_t) => {
+                                weights.insert(name.clone(), gpu_t);
+                                simulated_used += tensor_bytes;
+                                self.gpu_cache_bytes.fetch_add(tensor_bytes, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                // Fallback to CPU if GPU transfer fails
+                                weights.insert(name.clone(), t);
+                            }
+                        }
+                    } else {
+                        // Keep on CPU
+                        weights.insert(name.clone(), t);
+                    }
                 }
             }
 
@@ -679,6 +679,68 @@ impl LlmBackend for CandleBackend {
         self.graph = Some(graph);
         self.meta = Some(meta.clone());
         self.kv_cache = Some(Mutex::new(kv_cache));
+
+        // Eagerly pre-dequantize all weights in parallel/sequence into deq_cache to eliminate TTFT latency
+        if !self.quantized_weights.is_empty() {
+            println!("Eagerly dequantizing and caching {} GGUF weights...", self.quantized_weights.len());
+            let mut local_cache = HashMap::new();
+            let mut simulated_used = 0u64;
+            
+            // Sort weight names layer-wise to prioritize caching the earlier layers
+            let mut names: Vec<String> = self.quantized_weights.keys().cloned().collect();
+            names.sort_by(|a, b| {
+                let get_layer = |name: &str| -> usize {
+                    if name.starts_with("model.layers.") {
+                        let remain = &name["model.layers.".len()..];
+                        if let Some(pos) = remain.find('.') {
+                            if let Ok(idx) = remain[..pos].parse::<usize>() {
+                                return idx;
+                            }
+                        }
+                    }
+                    if name == "model.embed_tokens.weight" {
+                        0
+                    } else {
+                        999 // put other weights (like lm_head or output norm) last
+                    }
+                };
+                get_layer(a).cmp(&get_layer(b))
+            });
+
+            for name in &names {
+                if let Some(qt) = self.quantized_weights.get(name) {
+                    let tensor_bytes = qt.shape().elem_count() as u64 * 2;
+                    if simulated_used + tensor_bytes <= self.gpu_cache_budget {
+                        simulated_used += tensor_bytes;
+                        if let Err(e) = self.get_weight(name, &mut local_cache) {
+                            println!("Warning: Eager dequantize failed for {}: {:?}", name, e);
+                            // Fallback to CPU dequantize if GPU fails
+                            if let Ok(t) = qt.dequantize(&Device::Cpu) {
+                                if let Ok(t) = t.to_dtype(DType::F16) {
+                                    local_cache.insert(name.clone(), t);
+                                }
+                            }
+                        }
+                    } else {
+                        // Dequantize to CPU directly for offloaded weights (never touch GPU)
+                        if let Ok(t) = qt.dequantize(&Device::Cpu) {
+                            if let Ok(t) = t.to_dtype(DType::F16) {
+                                local_cache.insert(name.clone(), t);
+                            }
+                        } else {
+                            println!("Warning: Eager CPU dequantize failed for {}", name);
+                        }
+                    }
+                }
+            }
+            println!("Eager dequantization loop done. local_cache len: {}. model.embed_tokens.weight cached: {}", local_cache.len(), local_cache.contains_key("model.embed_tokens.weight"));
+            // Now transfer all local_cache entries to the Mutex deq_cache
+            if let Ok(mut cache) = self.deq_cache.lock() {
+                *cache = local_cache;
+            }
+            let cached_gpu = self.gpu_cache_bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / (1024.0 * 1024.0 * 1024.0);
+            println!("Eager dequantization finished. Cached GPU weights: {:.2} GB", cached_gpu);
+        }
 
         if meta.has_vision_encoder {
             // Model-agnostic mmproj discovery: strip the last extension component
@@ -800,20 +862,28 @@ impl LlmBackend for CandleBackend {
                     let ids = ctx.get(input_ids)?;
                     let table = self.get_weight(weight, &mut local_cache)?;
                     let (b_sz, seq_len) = ids.dims2()?;
-                    let ids_flat = ids.flatten_all()?;
-                    let out_flat = table.index_select(&ids_flat, 0)?;
-                    let out = out_flat.reshape((b_sz, seq_len, table.dim(1)?))?;
+                    let out = if table.device().is_cpu() {
+                        let ids_cpu = ids.to_device(&Device::Cpu)?;
+                        let ids_flat = ids_cpu.flatten_all()?;
+                        let out_flat = table.index_select(&ids_flat, 0)?;
+                        let out_cpu = out_flat.reshape((b_sz, seq_len, table.dim(1)?))?;
+                        out_cpu.to_device(&self.device)?
+                    } else {
+                        let ids_flat = ids.flatten_all()?;
+                        let out_flat = table.index_select(&ids_flat, 0)?;
+                        out_flat.reshape((b_sz, seq_len, table.dim(1)?))?
+                    };
                     ctx.insert(output.clone(), out);
                 }
                 Operator::RMSNorm { input, weight, output, eps } => {
                     let in_t = ctx.get(input)?;
-                    let w_t = self.get_weight(weight, &mut local_cache)?;
+                    let w_t = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
                     let out = RmsNorm::new(w_t, *eps as f64).forward(&in_t)?;
                     ctx.insert(output.clone(), out);
                 }
                 Operator::MatMul { input, weight, bias, output } => {
                     let in_t = ctx.get(input)?;
-                    let w_t = self.get_weight(weight, &mut local_cache)?;
+                    let w_t = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
 
                     // Auto-transpose: weight stored row-major [out_features, in_features]
                     let last_dim = in_t.dim(in_t.rank() - 1)?;
@@ -836,7 +906,7 @@ impl LlmBackend for CandleBackend {
 
                     let mut out = out;
                     if let Some(bias_name) = bias {
-                        let b_t = self.get_weight(bias_name, &mut local_cache)?;
+                        let b_t = self.get_weight(bias_name, &mut local_cache)?.to_device(in_t.device())?;
                         out = out.broadcast_add(&b_t)?;
                     }
                     ctx.insert(output.clone(), out);
@@ -871,76 +941,43 @@ impl LlmBackend for CandleBackend {
                     let v_4d = v_t.reshape((b_sz, seq_len, *n_kv_heads, *head_dim))?;
 
                     let q_dev = q_4d.device();
-                    let k_flat = k_4d.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-                    let v_flat = v_4d.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-
-                    let block_size = kv_cache.block_size;
-                    let stride_t = n_kv_heads * head_dim;
-                    let stride_i = seq_len * stride_t;
-
-                    for (i, &seq_id) in batch.seq_ids.iter().enumerate() {
-                        let blocks = &batch.block_tables[i];
-                        let start_offset = batch.cu_seqlens[i] as usize;
-                        let end_offset = batch.cu_seqlens[i+1] as usize;
-                        let num_tokens = end_offset - start_offset;
-
-                        let seq_len_before = kv_cache.get_seq_len(seq_id);
-
-                        for t in 0..num_tokens {
-                            let curr_token_idx = seq_len_before + t;
-                            let block_idx = curr_token_idx / block_size;
-                            let slot_idx = curr_token_idx % block_size;
-
-                            if block_idx >= blocks.len() {
-                                return Err(anyhow!("Block table overflow for seq {}: block_idx {}, table len {}", seq_id, block_idx, blocks.len()));
-                            }
-                            let physical_block = blocks[block_idx] as usize;
-
-                            let start_idx = i * stride_i + t * stride_t;
-                            let len = n_kv_heads * head_dim;
-                            let k_slice = &k_flat[start_idx..start_idx + len];
-                            let v_slice = &v_flat[start_idx..start_idx + len];
-
-                            kv_cache.write_slice_k(*layer_idx, physical_block, slot_idx, k_slice);
-                            kv_cache.write_slice_v(*layer_idx, physical_block, slot_idx, v_slice);
-                        }
-                    }
+                    let mut gpu_cache = self.gpu_kv_cache.lock().map_err(|_| anyhow!("gpu_kv_cache poisoned"))?;
 
                     let mut att_outputs = Vec::with_capacity(b_sz);
 
                     for (i, &seq_id) in batch.seq_ids.iter().enumerate() {
-                        let start_offset = batch.cu_seqlens[i] as usize;
-                        let end_offset = batch.cu_seqlens[i+1] as usize;
-                        let num_tokens = end_offset - start_offset;
+                        let k_i = k_4d.narrow(0, i, 1)?; // shape: (1, seq_len, n_kv_heads, head_dim)
+                        let v_i = v_4d.narrow(0, i, 1)?; // shape: (1, seq_len, n_kv_heads, head_dim)
 
-                        let seq_len_before = kv_cache.get_seq_len(seq_id);
-                        let total_seq_len = seq_len_before + num_tokens;
-                        let blocks = &batch.block_tables[i];
+                        let (k_hist_t, v_hist_t) = if let Some((old_k, old_v)) = gpu_cache.get(&(*layer_idx, seq_id)) {
+                            let new_k = Tensor::cat(&[old_k, &k_i], 1)?;
+                            let new_v = Tensor::cat(&[old_v, &v_i], 1)?;
+                            (new_k, new_v)
+                        } else {
+                            (k_i, v_i)
+                        };
 
-                        let mut k_hist = Vec::with_capacity(total_seq_len * n_kv_heads * head_dim);
-                        let mut v_hist = Vec::with_capacity(total_seq_len * n_kv_heads * head_dim);
+                        // Store the updated history
+                        gpu_cache.insert((*layer_idx, seq_id), (k_hist_t.clone(), v_hist_t.clone()));
 
-                        for t in 0..total_seq_len {
-                            let block_idx = t / block_size;
-                            let slot_idx = t % block_size;
-                            let physical_block = blocks[block_idx] as usize;
+                        // Squeeze batch dimension for attention computation
+                        let k_hist_squeezed = k_hist_t.squeeze(0)?; // shape: (total_seq_len, n_kv_heads, head_dim)
+                        let v_hist_squeezed = v_hist_t.squeeze(0)?; // shape: (total_seq_len, n_kv_heads, head_dim)
 
-                            k_hist.extend_from_slice(kv_cache.get_slice_k(*layer_idx, physical_block, slot_idx));
-                            v_hist.extend_from_slice(kv_cache.get_slice_v(*layer_idx, physical_block, slot_idx));
-                        }
-
-                        let k_hist_t = Tensor::from_vec(k_hist, (total_seq_len, *n_kv_heads, *head_dim), q_dev)?.to_dtype(q_t.dtype())?;
-                        let v_hist_t = Tensor::from_vec(v_hist, (total_seq_len, *n_kv_heads, *head_dim), q_dev)?.to_dtype(q_t.dtype())?;
+                        let total_seq_len = k_hist_squeezed.dim(0)?;
 
                         let q_i = q_4d.narrow(0, i, 1)?.squeeze(0)?;
-                        let q_i = q_i.transpose(0, 1)?.contiguous()?; // (n_heads, num_tokens, head_dim)
+                        let q_i = q_i.transpose(0, 1)?.contiguous()?; // (n_heads, seq_len, head_dim)
                         
                         let n_rep = n_heads / n_kv_heads;
-                        let k_hist_t = repeat_kv(k_hist_t.transpose(0, 1)?, n_rep)?.contiguous()?;
-                        let v_hist_t = repeat_kv(v_hist_t.transpose(0, 1)?, n_rep)?.contiguous()?;
+                        let k_hist_rep = repeat_kv(k_hist_squeezed.transpose(0, 1)?, n_rep)?.contiguous()?;
+                        let v_hist_rep = repeat_kv(v_hist_squeezed.transpose(0, 1)?, n_rep)?.contiguous()?;
 
-                        let scores = q_i.matmul(&k_hist_t.transpose(1, 2)?.contiguous()?)?;
+                        let scores = q_i.matmul(&k_hist_rep.transpose(1, 2)?.contiguous()?)?;
                         let scores_scaled = (scores / (*head_dim as f64).sqrt())?;
+
+                        let num_tokens = seq_len;
+                        let seq_len_before = total_seq_len - num_tokens;
 
                         let scores = if num_tokens > 1 {
                             let mut mask_vec = vec![0.0f32; num_tokens * total_seq_len];
@@ -958,9 +995,9 @@ impl LlmBackend for CandleBackend {
                         };
 
                         let probs = candle_nn::ops::softmax(&scores, candle_core::D::Minus1)?;
-                        let out_i = probs.matmul(&v_hist_t)?;
-                        let out_i = out_i.transpose(0, 1)?.contiguous()?; // (num_tokens, n_heads, head_dim)
-                        let out_i = out_i.reshape((num_tokens, n_heads * head_dim))?;
+                        let out_i = probs.matmul(&v_hist_rep)?;
+                        let out_i = out_i.transpose(0, 1)?.contiguous()?; // (seq_len, n_heads, head_dim)
+                        let out_i = out_i.reshape((seq_len, n_heads * head_dim))?;
                         att_outputs.push(out_i);
                     }
 
