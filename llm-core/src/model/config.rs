@@ -66,8 +66,28 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
     let mut is_deepstack_layers = None;
     let mut projector_type = None;
 
-    if let Some(vc) = val.get("vision_config").or_else(|| val.get("vision_config_dict")) {
-        has_vision_encoder = true;
+    let modalities = ["vision_config", "vision_config_dict", "audio_config", "audio_config_dict", "image_config", "multimodal_config"];
+    let mut config_block = None;
+    for m in modalities {
+        if let Some(block) = val.get(m) {
+            config_block = Some(block);
+            has_vision_encoder = true;
+            break;
+        }
+    }
+
+    if !has_vision_encoder {
+        if let Some(obj) = val.as_object() {
+            for key in obj.keys() {
+                if key.starts_with("vision_") || key.starts_with("image_") || key.starts_with("audio_") || key.starts_with("video_") || key.starts_with("multimodal_") {
+                    has_vision_encoder = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(vc) = config_block {
         vision_hidden_dim = vc.get("hidden_size").or_else(|| vc.get("hidden_dim")).and_then(|v| v.as_u64()).map(|v| v as usize);
         vision_patch_size = vc.get("patch_size").and_then(|v| v.as_u64()).map(|v| v as usize);
         vision_image_size = vc.get("image_size").and_then(|v| v.as_u64()).map(|v| v as usize);
@@ -80,8 +100,7 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
             arr.iter().map(|item| item.as_bool().unwrap_or(false)).collect::<Vec<bool>>()
         });
         projector_type = vc.get("projector_type").and_then(|v| v.as_str()).map(|s| s.to_string());
-    } else if val.get("model_type").and_then(|v| v.as_str()).map(|s| s.contains("vl") || s.contains("llava") || s.contains("fuyu") || s.contains("vision") || s.contains("chameleon")).unwrap_or(false) {
-        has_vision_encoder = true;
+    } else if has_vision_encoder {
         vision_hidden_dim = val.get("vision_hidden_size").or_else(|| val.get("vision_hidden_dim")).and_then(|v| v.as_u64()).map(|v| v as usize);
         vision_patch_size = val.get("vision_patch_size").and_then(|v| v.as_u64()).map(|v| v as usize);
         vision_image_size = val.get("vision_image_size").and_then(|v| v.as_u64()).map(|v| v as usize);
