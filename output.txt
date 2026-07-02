@@ -1,0 +1,84 @@
+Loading tokenizer from /home/mukundan/learning/llm/gemma4_tokenizer.json...
+Loading model from /home/mukundan/learning/llm/gemma-4-E2B-it-Q4_K_M.gguf...
+Eagerly dequantizing and caching 601 GGUF weights...
+Eager dequantization loop done. local_cache len: 601. model.embed_tokens.weight cached: true
+Eager dequantization finished. Cached GPU weights: 4.28 GB
+Model loaded in 19.29s (vocab_size: 262144, hidden_dim: 1536)
+Prompt (10 tokens): "Hello"
+Prompt token IDs: [2, 105, 2364, 107, 9259, 106, 107, 105, 4368, 107]
+Sending inference request...
+Graph OP idx=0: Embed { input_ids: "input_ids", weight: "model.embed_tokens.weight", output: "text_embeddings" }
+Graph OP idx=1: RMSNorm { input: "text_embeddings", weight: "model.layers.0.input_layernorm.weight", output: "layer_0_pre_norm", eps: 1e-6 }
+Graph OP idx=2: MatMul { input: "layer_0_pre_norm", weight: "model.layers.0.self_attn.q_proj.weight", bias: None, output: "layer_0_q_proj" }
+Graph OP idx=3: MatMul { input: "layer_0_pre_norm", weight: "model.layers.0.self_attn.k_proj.weight", bias: None, output: "layer_0_k_proj" }
+Graph OP idx=4: MatMul { input: "layer_0_pre_norm", weight: "model.layers.0.self_attn.v_proj.weight", bias: None, output: "layer_0_v_proj" }
+Graph OP idx=5: RMSNorm { input: "layer_0_q_proj", weight: "model.layers.0.attn_q_norm.weight", output: "layer_0_q_normed", eps: 1e-6 }
+Graph OP idx=6: RMSNorm { input: "layer_0_k_proj", weight: "model.layers.0.attn_k_norm.weight", output: "layer_0_k_normed", eps: 1e-6 }
+Graph OP idx=7: Rope { q: "layer_0_q_normed", k: "layer_0_k_normed", output_q: "layer_0_q_rope", output_k: "layer_0_k_rope", layer_idx: 0, rope_theta: 10000.0 }
+Graph OP idx=8: PagedAttention { q: "layer_0_q_rope", k: "layer_0_k_rope", v: "layer_0_v_proj", output: "layer_0_attn_out", layer_idx: 0, n_heads: 8, n_kv_heads: 1, head_dim: 256 }
+Graph OP idx=9: MatMul { input: "layer_0_attn_out", weight: "model.layers.0.self_attn.o_proj.weight", bias: None, output: "layer_0_o_proj" }
+Graph OP idx=10: RMSNorm { input: "layer_0_o_proj", weight: "model.layers.0.post_attention_norm.weight", output: "layer_0_o_proj_normed", eps: 1e-6 }
+Graph OP idx=11: Add { lhs: "text_embeddings", rhs: "layer_0_o_proj_normed", output: "layer_0_post_attn" }
+Graph OP idx=12: RMSNorm { input: "layer_0_post_attn", weight: "model.layers.0.post_attention_layernorm.weight", output: "layer_0_post_norm", eps: 1e-6 }
+Graph OP idx=13: MatMul { input: "layer_0_post_norm", weight: "model.layers.0.mlp.gate_proj.weight", bias: None, output: "layer_0_gate_proj" }
+Graph OP idx=14: MatMul { input: "layer_0_post_norm", weight: "model.layers.0.mlp.up_proj.weight", bias: None, output: "layer_0_up_proj" }
+Graph OP idx=15: Activation { input: "layer_0_gate_proj", output: "layer_0_act", act: GeLU }
+Graph OP idx=16: Mul { lhs: "layer_0_act", rhs: "layer_0_up_proj", output: "layer_0_mlp_inter" }
+Graph OP idx=17: MatMul { input: "layer_0_mlp_inter", weight: "model.layers.0.mlp.down_proj.weight", bias: None, output: "layer_0_mlp_out" }
+Graph OP idx=18: RMSNorm { input: "layer_0_mlp_out", weight: "model.layers.0.post_ffw_norm.weight", output: "layer_0_mlp_out_normed", eps: 1e-6 }
+Graph OP idx=19: Add { lhs: "layer_0_post_attn", rhs: "layer_0_mlp_out_normed", output: "layer_0_out" }
+Graph OP idx=20: RMSNorm { input: "layer_0_out", weight: "model.layers.1.input_layernorm.weight", output: "layer_1_pre_norm", eps: 1e-6 }
+Graph OP idx=21: MatMul { input: "layer_1_pre_norm", weight: "model.layers.1.self_attn.q_proj.weight", bias: None, output: "layer_1_q_proj" }
+Graph OP idx=22: MatMul { input: "layer_1_pre_norm", weight: "model.layers.1.self_attn.k_proj.weight", bias: None, output: "layer_1_k_proj" }
+Graph OP idx=23: MatMul { input: "layer_1_pre_norm", weight: "model.layers.1.self_attn.v_proj.weight", bias: None, output: "layer_1_v_proj" }
+Graph OP idx=24: RMSNorm { input: "layer_1_q_proj", weight: "model.layers.1.attn_q_norm.weight", output: "layer_1_q_normed", eps: 1e-6 }
+Graph OP idx=25: RMSNorm { input: "layer_1_k_proj", weight: "model.layers.1.attn_k_norm.weight", output: "layer_1_k_normed", eps: 1e-6 }
+Graph OP idx=26: Rope { q: "layer_1_q_normed", k: "layer_1_k_normed", output_q: "layer_1_q_rope", output_k: "layer_1_k_rope", layer_idx: 1, rope_theta: 10000.0 }
+Graph OP idx=27: PagedAttention { q: "layer_1_q_rope", k: "layer_1_k_rope", v: "layer_1_v_proj", output: "layer_1_attn_out", layer_idx: 1, n_heads: 8, n_kv_heads: 1, head_dim: 256 }
+Graph OP idx=28: MatMul { input: "layer_1_attn_out", weight: "model.layers.1.self_attn.o_proj.weight", bias: None, output: "layer_1_o_proj" }
+Graph OP idx=29: RMSNorm { input: "layer_1_o_proj", weight: "model.layers.1.post_attention_norm.weight", output: "layer_1_o_proj_normed", eps: 1e-6 }
+Graph OP idx=30: Add { lhs: "layer_0_out", rhs: "layer_1_o_proj_normed", output: "layer_1_post_attn" }
+Graph OP idx=31: RMSNorm { input: "layer_1_post_attn", weight: "model.layers.1.post_attention_layernorm.weight", output: "layer_1_post_norm", eps: 1e-6 }
+Graph OP idx=32: MatMul { input: "layer_1_post_norm", weight: "model.layers.1.mlp.gate_proj.weight", bias: None, output: "layer_1_gate_proj" }
+Graph OP idx=33: MatMul { input: "layer_1_post_norm", weight: "model.layers.1.mlp.up_proj.weight", bias: None, output: "layer_1_up_proj" }
+Graph OP idx=34: Activation { input: "layer_1_gate_proj", output: "layer_1_act", act: GeLU }
+Graph OP idx=35: Mul { lhs: "layer_1_act", rhs: "layer_1_up_proj", output: "layer_1_mlp_inter" }
+Graph OP idx=36: MatMul { input: "layer_1_mlp_inter", weight: "model.layers.1.mlp.down_proj.weight", bias: None, output: "layer_1_mlp_out" }
+Graph OP idx=37: RMSNorm { input: "layer_1_mlp_out", weight: "model.layers.1.post_ffw_norm.weight", output: "layer_1_mlp_out_normed", eps: 1e-6 }
+Graph OP idx=38: Add { lhs: "layer_1_post_attn", rhs: "layer_1_mlp_out_normed", output: "layer_1_out" }
+Graph OP idx=39: RMSNorm { input: "layer_1_out", weight: "model.layers.2.input_layernorm.weight", output: "layer_2_pre_norm", eps: 1e-6 }
+Graph OP idx=40: MatMul { input: "layer_2_pre_norm", weight: "model.layers.2.self_attn.q_proj.weight", bias: None, output: "layer_2_q_proj" }
+Graph OP idx=41: MatMul { input: "layer_2_pre_norm", weight: "model.layers.2.self_attn.k_proj.weight", bias: None, output: "layer_2_k_proj" }
+Graph OP idx=42: MatMul { input: "layer_2_pre_norm", weight: "model.layers.2.self_attn.v_proj.weight", bias: None, output: "layer_2_v_proj" }
+Graph OP idx=43: RMSNorm { input: "layer_2_q_proj", weight: "model.layers.2.attn_q_norm.weight", output: "layer_2_q_normed", eps: 1e-6 }
+Graph OP idx=44: RMSNorm { input: "layer_2_k_proj", weight: "model.layers.2.attn_k_norm.weight", output: "layer_2_k_normed", eps: 1e-6 }
+Graph OP idx=45: Rope { q: "layer_2_q_normed", k: "layer_2_k_normed", output_q: "layer_2_q_rope", output_k: "layer_2_k_rope", layer_idx: 2, rope_theta: 10000.0 }
+Graph OP idx=46: PagedAttention { q: "layer_2_q_rope", k: "layer_2_k_rope", v: "layer_2_v_proj", output: "layer_2_attn_out", layer_idx: 2, n_heads: 8, n_kv_heads: 1, head_dim: 256 }
+Graph OP idx=47: MatMul { input: "layer_2_attn_out", weight: "model.layers.2.self_attn.o_proj.weight", bias: None, output: "layer_2_o_proj" }
+Graph OP idx=48: RMSNorm { input: "layer_2_o_proj", weight: "model.layers.2.post_attention_norm.weight", output: "layer_2_o_proj_normed", eps: 1e-6 }
+Graph OP idx=49: Add { lhs: "layer_1_out", rhs: "layer_2_o_proj_normed", output: "layer_2_post_attn" }
+Graph OP idx=50: RMSNorm { input: "layer_2_post_attn", weight: "model.layers.2.post_attention_layernorm.weight", output: "layer_2_post_norm", eps: 1e-6 }
+Graph OP idx=51: MatMul { input: "layer_2_post_norm", weight: "model.layers.2.mlp.gate_proj.weight", bias: None, output: "layer_2_gate_proj" }
+Graph OP idx=52: MatMul { input: "layer_2_post_norm", weight: "model.layers.2.mlp.up_proj.weight", bias: None, output: "layer_2_up_proj" }
+Graph OP idx=53: Activation { input: "layer_2_gate_proj", output: "layer_2_act", act: GeLU }
+Graph OP idx=54: Mul { lhs: "layer_2_act", rhs: "layer_2_up_proj", output: "layer_2_mlp_inter" }
+Graph OP idx=55: MatMul { input: "layer_2_mlp_inter", weight: "model.layers.2.mlp.down_proj.weight", bias: None, output: "layer_2_mlp_out" }
+Graph OP idx=56: RMSNorm { input: "layer_2_mlp_out", weight: "model.layers.2.post_ffw_norm.weight", output: "layer_2_mlp_out_normed", eps: 1e-6 }
+Graph OP idx=57: Add { lhs: "layer_2_post_attn", rhs: "layer_2_mlp_out_normed", output: "layer_2_out" }
+Graph OP idx=58: RMSNorm { input: "layer_2_out", weight: "model.layers.3.input_layernorm.weight", output: "layer_3_pre_norm", eps: 1e-6 }
+Graph OP idx=59: MatMul { input: "layer_3_pre_norm", weight: "model.layers.3.self_attn.q_proj.weight", bias: None, output: "layer_3_q_proj" }
+Assistant: ifulifulDocumentDocumentDocumentDocumentDocumentarge площа площаaciaaciaðaरसारसारसातुमतुमernyernyरसाernyernyernyernyernyernyernyernyerny antir antir antir antir antir antir antir antir antir antir antir antir antir unimaginable unimaginable unimaginable antir antir antir antir
+Generated token IDs: [3140, 3140, 15124, 15124, 15124, 15124, 15124, 1997, 46244, 46244, 14632, 14632, 131588, 32886, 32886, 32886, 97934, 97934, 194983, 194983, 32886, 194983, 194983, 194983, 194983, 194983, 194983, 194983, 194983, 194983, 232325, 232325, 232325, 232325, 232325, 232325, 232325, 232325, 232325, 232325, 232325, 232325, 232325, 150298, 150298, 150298, 232325, 232325, 232325, 232325]
+
+
+--------------------------------------
+Benchmark Results (llm-rs):
+--------------------------------------
+Time to First Token (TTFT): 215.17ms
+Prefill Speed: 46.47 tokens/sec
+Decode Duration: 1.64s
+Decode Speed: 29.92 tokens/sec
+Total Generation Time: 1.85s
+Total Tokens Generated: 50
+Overall Speed: 26.98 tokens/sec
+--------------------------------------

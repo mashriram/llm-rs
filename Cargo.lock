@@ -2067,6 +2067,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "candle-core",
  "clap",
  "http",
  "llm-core",
@@ -2074,6 +2075,7 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "tokenizers",
  "tokio",
  "tokio-stream",
  "tower",

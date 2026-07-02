@@ -30,6 +30,32 @@ pub fn build_graph(meta: &ModelMeta, group: &TensorGroupMap) -> ComputeGraph {
         "text_embeddings".to_string()
     };
 
+    if let Some(scale) = meta.embed_scale {
+        let scaled_out = format!("{}_scaled", current_hidden);
+        graph.add_op(Operator::Scale {
+            input: current_hidden,
+            scale,
+            output: scaled_out.clone(),
+        });
+        current_hidden = scaled_out;
+    }
+
+    let has_ple = meta.ple_dim.is_some()
+        && group.per_layer_token_embd.is_some()
+        && group.per_layer_model_proj.is_some()
+        && group.per_layer_proj_norm.is_some();
+
+    if has_ple {
+        graph.add_op(Operator::PleInput {
+            input_ids: "input_ids".to_string(),
+            text_embeddings: "text_embeddings".to_string(),
+            per_layer_token_embd: group.per_layer_token_embd.clone().unwrap(),
+            per_layer_model_proj: group.per_layer_model_proj.clone().unwrap(),
+            per_layer_proj_norm: group.per_layer_proj_norm.clone().unwrap(),
+            output: "per_layer_combined".to_string(),
+        });
+    }
+
     // 2. Decode layers
     for layer in &group.layers {
         let l_idx = layer.index;
@@ -48,32 +74,37 @@ pub fn build_graph(meta: &ModelMeta, group: &TensorGroupMap) -> ComputeGraph {
         });
 
         // QKV projections
+        let is_shared = meta.is_kv_shared(l_idx);
+
         let q_out = format!("layer_{}_q_proj", l_idx);
         let k_out = format!("layer_{}_k_proj", l_idx);
         let v_out = format!("layer_{}_v_proj", l_idx);
 
         let q_proj_w = layer.q_proj.clone().unwrap_or_else(|| format!("model.layers.{}.self_attn.q_proj.weight", l_idx));
-        let k_proj_w = layer.k_proj.clone().unwrap_or_else(|| format!("model.layers.{}.self_attn.k_proj.weight", l_idx));
-        let v_proj_w = layer.v_proj.clone().unwrap_or_else(|| format!("model.layers.{}.self_attn.v_proj.weight", l_idx));
-
         graph.add_op(Operator::MatMul {
             input: pre_norm_out.clone(),
             weight: q_proj_w,
             bias: layer.q_bias.clone(),
             output: q_out.clone(),
         });
-        graph.add_op(Operator::MatMul {
-            input: pre_norm_out.clone(),
-            weight: k_proj_w,
-            bias: layer.k_bias.clone(),
-            output: k_out.clone(),
-        });
-        graph.add_op(Operator::MatMul {
-            input: pre_norm_out.clone(),
-            weight: v_proj_w,
-            bias: layer.v_bias.clone(),
-            output: v_out.clone(),
-        });
+
+        if !is_shared {
+            let k_proj_w = layer.k_proj.clone().unwrap_or_else(|| format!("model.layers.{}.self_attn.k_proj.weight", l_idx));
+            let v_proj_w = layer.v_proj.clone().unwrap_or_else(|| format!("model.layers.{}.self_attn.v_proj.weight", l_idx));
+
+            graph.add_op(Operator::MatMul {
+                input: pre_norm_out.clone(),
+                weight: k_proj_w,
+                bias: layer.k_bias.clone(),
+                output: k_out.clone(),
+            });
+            graph.add_op(Operator::MatMul {
+                input: pre_norm_out.clone(),
+                weight: v_proj_w,
+                bias: layer.v_bias.clone(),
+                output: v_out.clone(),
+            });
+        }
 
         // Apply QK Norms if present (e.g. Qwen3-VL)
         let q_post_norm = if let Some(q_norm_w) = &layer.q_norm {
@@ -89,17 +120,21 @@ pub fn build_graph(meta: &ModelMeta, group: &TensorGroupMap) -> ComputeGraph {
             q_out
         };
 
-        let k_post_norm = if let Some(k_norm_w) = &layer.k_norm {
-            let out = format!("layer_{}_k_normed", l_idx);
-            graph.add_op(Operator::RMSNorm {
-                input: k_out,
-                weight: k_norm_w.clone(),
-                output: out.clone(),
-                eps: 1e-6,
-            });
-            out
+        let k_post_norm = if !is_shared {
+            if let Some(k_norm_w) = &layer.k_norm {
+                let out = format!("layer_{}_k_normed", l_idx);
+                graph.add_op(Operator::RMSNorm {
+                    input: k_out,
+                    weight: k_norm_w.clone(),
+                    output: out.clone(),
+                    eps: 1e-6,
+                });
+                out
+            } else {
+                k_out
+            }
         } else {
-            k_out
+            "".to_string()
         };
 
         // Rotary Position Embedding
@@ -112,22 +147,40 @@ pub fn build_graph(meta: &ModelMeta, group: &TensorGroupMap) -> ComputeGraph {
             false
         };
 
-        if skip_rope {
-            graph.add_op(Operator::RopeSkip {
-                q: q_post_norm,
-                k: k_post_norm,
-                output_q: q_rope.clone(),
-                output_k: k_rope.clone(),
-            });
+        if is_shared {
+            if skip_rope {
+                graph.add_op(Operator::RopeQ {
+                    q: q_post_norm,
+                    output_q: q_rope.clone(),
+                    layer_idx: l_idx,
+                    rope_theta: 0.0,
+                });
+            } else {
+                graph.add_op(Operator::RopeQ {
+                    q: q_post_norm,
+                    output_q: q_rope.clone(),
+                    layer_idx: l_idx,
+                    rope_theta: meta.get_rope_theta(l_idx),
+                });
+            }
         } else {
-            graph.add_op(Operator::Rope {
-                q: q_post_norm,
-                k: k_post_norm,
-                output_q: q_rope.clone(),
-                output_k: k_rope.clone(),
-                layer_idx: l_idx,
-                rope_theta: meta.rope_theta,
-            });
+            if skip_rope {
+                graph.add_op(Operator::RopeSkip {
+                    q: q_post_norm,
+                    k: k_post_norm,
+                    output_q: q_rope.clone(),
+                    output_k: k_rope.clone(),
+                });
+            } else {
+                graph.add_op(Operator::Rope {
+                    q: q_post_norm,
+                    k: k_post_norm,
+                    output_q: q_rope.clone(),
+                    output_k: k_rope.clone(),
+                    layer_idx: l_idx,
+                    rope_theta: meta.get_rope_theta(l_idx),
+                });
+            }
         }
 
         // Paged Attention
@@ -153,11 +206,24 @@ pub fn build_graph(meta: &ModelMeta, group: &TensorGroupMap) -> ComputeGraph {
             output: o_out.clone(),
         });
 
+        let o_out_normed = if let Some(post_attn_norm_w) = &layer.post_attention_norm {
+            let out = format!("layer_{}_o_proj_normed", l_idx);
+            graph.add_op(Operator::RMSNorm {
+                input: o_out,
+                weight: post_attn_norm_w.clone(),
+                output: out.clone(),
+                eps: meta.rms_norm_eps,
+            });
+            out
+        } else {
+            o_out
+        };
+
         // Residual Add
         let post_attn = format!("layer_{}_post_attn", l_idx);
         graph.add_op(Operator::Add {
             lhs: layer_input,
-            rhs: o_out,
+            rhs: o_out_normed,
             output: post_attn.clone(),
         });
 
@@ -239,13 +305,58 @@ pub fn build_graph(meta: &ModelMeta, group: &TensorGroupMap) -> ComputeGraph {
             });
         }
 
+        let mlp_out_normed = if let Some(post_ffw_norm_w) = &layer.post_ffw_norm {
+            let out = format!("layer_{}_mlp_out_normed", l_idx);
+            graph.add_op(Operator::RMSNorm {
+                input: mlp_out,
+                weight: post_ffw_norm_w.clone(),
+                output: out.clone(),
+                eps: meta.rms_norm_eps,
+            });
+            out
+        } else {
+            mlp_out
+        };
+
         // Residual Add
+        let mlp_to_add = if let Some(scale_w) = &layer.layer_output_scale {
+            let scaled_out = format!("layer_{}_mlp_scaled", l_idx);
+            graph.add_op(Operator::TensorScale {
+                input: mlp_out_normed,
+                scale_tensor: scale_w.clone(),
+                output: scaled_out.clone(),
+            });
+            scaled_out
+        } else {
+            mlp_out_normed
+        };
+
         let mut layer_output = format!("layer_{}_out", l_idx);
         graph.add_op(Operator::Add {
             lhs: post_attn,
-            rhs: mlp_out,
+            rhs: mlp_to_add,
             output: layer_output.clone(),
         });
+
+        if has_ple {
+            if let (Some(gate_w), Some(proj_w), Some(norm_w)) = (
+                &layer.per_layer_input_gate,
+                &layer.per_layer_projection,
+                &layer.post_per_layer_input_norm,
+            ) {
+                let ple_out = format!("layer_{}_ple_out", l_idx);
+                graph.add_op(Operator::PleLayer {
+                    input: layer_output.clone(),
+                    per_layer_input: "per_layer_combined".to_string(),
+                    layer_idx: l_idx,
+                    per_layer_input_gate: gate_w.clone(),
+                    per_layer_projection: proj_w.clone(),
+                    post_per_layer_input_norm: norm_w.clone(),
+                    output: ple_out.clone(),
+                });
+                layer_output = ple_out;
+            }
+        }
 
         if meta.has_vision_encoder {
             if let Some(ds_flags) = &meta.is_deepstack_layers {
@@ -279,12 +390,24 @@ pub fn build_graph(meta: &ModelMeta, group: &TensorGroupMap) -> ComputeGraph {
     } else {
         group.lm_head.clone().unwrap_or(embed_weight)
     };
+    let mut lm_head_output = "logits".to_string();
+    if meta.final_logit_softcapping.is_some() {
+        lm_head_output = "raw_logits".to_string();
+    }
     graph.add_op(Operator::MatMul {
         input: "final_norm_out".to_string(),
         weight: lm_head_w,
         bias: None,
-        output: "logits".to_string(),
+        output: lm_head_output.clone(),
     });
+
+    if let Some(cap) = meta.final_logit_softcapping {
+        graph.add_op(Operator::Softcap {
+            input: lm_head_output,
+            output: "logits".to_string(),
+            cap,
+        });
+    }
 
     graph
 }

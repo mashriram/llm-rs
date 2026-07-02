@@ -56,6 +56,16 @@ impl DummyBackend {
                 spatial_merge_size: None,
                 is_deepstack_layers: None,
                 projector_type: None,
+                shared_kv_layers: None,
+                sliding_window_pattern: None,
+                sliding_window: None,
+                key_length: None,
+                key_length_swa: None,
+                rope_theta_swa: None,
+                final_logit_softcapping: None,
+                is_gemma: false,
+                ple_dim: None,
+                embed_scale: None,
             }
         }
     }
@@ -206,6 +216,281 @@ fn test_gemma3_config_validation() {
 }
 
 #[test]
+fn test_gemma4_agnostic_metadata() {
+    let path = std::env::temp_dir().join("gemma4_e2b_config.json");
+    let config_json = r#"{
+        "vocab_size": 256000,
+        "hidden_size": 1024,
+        "num_hidden_layers": 12,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "intermediate_size": 4096,
+        "max_position_embeddings": 131072,
+        "rope_theta": 10000.0,
+        "model_type": "gemma4_audio",
+        "architectures": ["Gemma4ForConditionalGeneration"],
+        "audio_config": {
+            "hidden_size": 512,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4
+        }
+    }"#;
+    std::fs::write(&path, config_json).unwrap();
+    let meta = parse_metadata(&path).unwrap();
+    assert_eq!(meta.vocab_size, 256000);
+    assert_eq!(meta.hidden_dim, 1024);
+    assert_eq!(meta.n_layers, 12);
+    assert_eq!(meta.n_heads, 8);
+    assert_eq!(meta.n_kv_heads, 4);
+    assert_eq!(meta.head_dim, 128);
+    assert_eq!(meta.intermediate_dim, 4096);
+    assert_eq!(meta.max_seq_len, 131072);
+    assert!(meta.has_vision_encoder);
+}
+
+#[test]
+fn test_graph_builder_softcap() {
+    use llm_core::graph::builder::build_graph;
+    use llm_core::graph::scan::TensorGroupMap;
+    use llm_core::graph::ops::Operator;
+
+    let meta = ModelMeta {
+        vocab_size: 32000,
+        hidden_dim: 4096,
+        n_layers: 2,
+        n_heads: 32,
+        n_kv_heads: 8,
+        head_dim: 128,
+        intermediate_dim: 11008,
+        max_seq_len: 2048,
+        rope_theta: 10000.0,
+        weight_dtype: WeightDtype::F16,
+        rms_norm_eps: 1e-5,
+        tie_word_embeddings: false,
+        hidden_act: llm_core::types::HiddenAct::SiLU,
+        no_rope_layers: vec![false; 2],
+        has_vision_encoder: false,
+        vision_hidden_dim: None,
+        vision_patch_size: None,
+        vision_image_size: None,
+        vision_num_layers: None,
+        vision_num_heads: None,
+        vision_projection_dim: None,
+        spatial_merge_size: None,
+        is_deepstack_layers: None,
+        projector_type: None,
+        shared_kv_layers: None,
+        sliding_window_pattern: None,
+        sliding_window: None,
+        key_length: None,
+        key_length_swa: None,
+        rope_theta_swa: None,
+        final_logit_softcapping: Some(30.0),
+        is_gemma: false,
+        ple_dim: None,
+        embed_scale: None,
+    };
+
+    let group = TensorGroupMap {
+        embed_tokens: Some("model.embed_tokens.weight".to_string()),
+        lm_head: Some("lm_head.weight".to_string()),
+        final_norm: Some("model.norm.weight".to_string()),
+        per_layer_token_embd: None,
+        per_layer_model_proj: None,
+        per_layer_proj_norm: None,
+        layers: vec![],
+    };
+
+    let graph = build_graph(&meta, &group);
+    
+    let ops_len = graph.ops.len();
+    assert!(ops_len >= 2);
+    
+    match &graph.ops[ops_len - 1] {
+        Operator::Softcap { input, output, cap } => {
+            assert_eq!(input, "raw_logits");
+            assert_eq!(output, "logits");
+            assert_eq!(*cap, 30.0);
+        }
+        _ => panic!("Expected Softcap as the last operator"),
+    }
+
+    match &graph.ops[ops_len - 2] {
+        Operator::MatMul { input, weight, output, .. } => {
+            assert_eq!(input, "final_norm_out");
+            assert_eq!(weight, "lm_head.weight");
+            assert_eq!(output, "raw_logits");
+        }
+        _ => panic!("Expected MatMul as the second to last operator"),
+    }
+}
+
+
+#[test]
+fn test_graph_builder_gemma4_ple() {
+    use llm_core::graph::builder::build_graph;
+    use llm_core::graph::scan::{TensorGroupMap, LayerTensors};
+    use llm_core::graph::ops::Operator;
+
+    let meta = ModelMeta {
+        vocab_size: 262144,
+        hidden_dim: 1536,
+        n_layers: 2,
+        n_heads: 8,
+        n_kv_heads: 1,
+        head_dim: 128,
+        intermediate_dim: 6144,
+        max_seq_len: 2048,
+        rope_theta: 10000.0,
+        weight_dtype: WeightDtype::F16,
+        rms_norm_eps: 1e-6,
+        tie_word_embeddings: true,
+        hidden_act: llm_core::types::HiddenAct::GeLU,
+        no_rope_layers: vec![false; 2],
+        has_vision_encoder: false,
+        vision_hidden_dim: None,
+        vision_patch_size: None,
+        vision_image_size: None,
+        vision_num_layers: None,
+        vision_num_heads: None,
+        vision_projection_dim: None,
+        spatial_merge_size: None,
+        is_deepstack_layers: None,
+        projector_type: None,
+        shared_kv_layers: None,
+        sliding_window_pattern: None,
+        sliding_window: None,
+        key_length: None,
+        key_length_swa: None,
+        rope_theta_swa: None,
+        final_logit_softcapping: None,
+        is_gemma: true,
+        ple_dim: Some(256),
+        embed_scale: Some(39.191835),
+    };
+
+    let layers = vec![
+        LayerTensors {
+            index: 0,
+            input_layernorm: Some("model.layers.0.input_layernorm.weight".to_string()),
+            q_proj: Some("model.layers.0.self_attn.q_proj.weight".to_string()),
+            q_bias: None,
+            k_proj: Some("model.layers.0.self_attn.k_proj.weight".to_string()),
+            k_bias: None,
+            v_proj: Some("model.layers.0.self_attn.v_proj.weight".to_string()),
+            v_bias: None,
+            q_norm: None,
+            k_norm: None,
+            o_proj: Some("model.layers.0.self_attn.o_proj.weight".to_string()),
+            o_bias: None,
+            post_attention_layernorm: Some("model.layers.0.post_attention_layernorm.weight".to_string()),
+            post_attention_norm: None,
+            post_ffw_norm: None,
+            gate_proj: Some("model.layers.0.mlp.gate_proj.weight".to_string()),
+            gate_bias: None,
+            up_proj: Some("model.layers.0.mlp.up_proj.weight".to_string()),
+            up_bias: None,
+            down_proj: Some("model.layers.0.mlp.down_proj.weight".to_string()),
+            down_bias: None,
+            per_layer_input_gate: Some("model.layers.0.per_layer_input_gate.weight".to_string()),
+            per_layer_projection: Some("model.layers.0.per_layer_projection.weight".to_string()),
+            post_per_layer_input_norm: Some("model.layers.0.post_per_layer_input_norm.weight".to_string()),
+            layer_output_scale: Some("model.layers.0.layer_output_scale.weight".to_string()),
+        }
+    ];
+
+    let group = TensorGroupMap {
+        embed_tokens: Some("model.embed_tokens.weight".to_string()),
+        lm_head: Some("lm_head.weight".to_string()),
+        final_norm: Some("model.norm.weight".to_string()),
+        per_layer_token_embd: Some("per_layer_token_embd.weight".to_string()),
+        per_layer_model_proj: Some("per_layer_model_proj.weight".to_string()),
+        per_layer_proj_norm: Some("per_layer_proj_norm.weight".to_string()),
+        layers,
+    };
+
+    let graph = build_graph(&meta, &group);
+
+    let mut has_scale = false;
+    let mut has_ple_input = false;
+    let mut has_tensor_scale = false;
+    let mut has_ple_layer = false;
+
+    for op in &graph.ops {
+        match op {
+            Operator::Scale { scale, .. } => {
+                if (*scale - 39.191835).abs() < 1e-4 {
+                    has_scale = true;
+                }
+            }
+            Operator::PleInput { .. } => {
+                has_ple_input = true;
+            }
+            Operator::TensorScale { scale_tensor, .. } => {
+                if scale_tensor == "model.layers.0.layer_output_scale.weight" {
+                    has_tensor_scale = true;
+                }
+            }
+            Operator::PleLayer { layer_idx, .. } => {
+                if *layer_idx == 0 {
+                    has_ple_layer = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(has_scale, "Should scale embedding");
+    assert!(has_ple_input, "Should build PLE input tensor");
+    assert!(has_tensor_scale, "Should apply layer output scaling");
+    assert!(has_ple_layer, "Should apply PLE layer gating and projection");
+}
+
+
+#[test]
+fn test_smollm3_agnostic_metadata() {
+    let path = std::env::temp_dir().join("smollm3_3b_config.json");
+    let config_json = r#"{
+        "vocab_size": 49152,
+        "hidden_size": 2048,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 64,
+        "intermediate_size": 5632,
+        "max_position_embeddings": 8192,
+        "rope_theta": 10000.0,
+        "model_type": "smollm3_vl",
+        "vision_config": {
+            "hidden_size": 768,
+            "patch_size": 14,
+            "image_size": 336,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 12,
+            "projection_dim": 512
+        }
+    }"#;
+    std::fs::write(&path, config_json).unwrap();
+    let meta = parse_metadata(&path).unwrap();
+    assert_eq!(meta.vocab_size, 49152);
+    assert_eq!(meta.hidden_dim, 2048);
+    assert_eq!(meta.n_layers, 24);
+    assert_eq!(meta.n_heads, 32);
+    assert_eq!(meta.n_kv_heads, 8);
+    assert_eq!(meta.head_dim, 64);
+    assert_eq!(meta.intermediate_dim, 5632);
+    assert_eq!(meta.max_seq_len, 8192);
+    assert!(meta.has_vision_encoder);
+    assert_eq!(meta.vision_hidden_dim, Some(768));
+    assert_eq!(meta.vision_patch_size, Some(14));
+    assert_eq!(meta.vision_image_size, Some(336));
+    assert_eq!(meta.vision_num_layers, Some(12));
+    assert_eq!(meta.vision_num_heads, Some(12));
+    assert_eq!(meta.vision_projection_dim, Some(512));
+}
+
+#[test]
 fn test_nn_module_paged_kv_cache() {
     let config = KvCacheConfig {
         n_layers: 32,
@@ -250,6 +535,16 @@ fn test_llama2_group_quantization() {
         spatial_merge_size: None,
         is_deepstack_layers: None,
         projector_type: None,
+        shared_kv_layers: None,
+        sliding_window_pattern: None,
+        sliding_window: None,
+        key_length: None,
+        key_length_swa: None,
+        rope_theta_swa: None,
+        final_logit_softcapping: None,
+        is_gemma: false,
+        ple_dim: None,
+        embed_scale: None,
     };
     assert!(matches!(meta.weight_dtype, WeightDtype::Q4_K));
 }
@@ -281,6 +576,16 @@ fn test_llama2_no_quantization() {
         spatial_merge_size: None,
         is_deepstack_layers: None,
         projector_type: None,
+        shared_kv_layers: None,
+        sliding_window_pattern: None,
+        sliding_window: None,
+        key_length: None,
+        key_length_swa: None,
+        rope_theta_swa: None,
+        final_logit_softcapping: None,
+        is_gemma: false,
+        ple_dim: None,
+        embed_scale: None,
     };
     assert!(matches!(meta.weight_dtype, WeightDtype::F16));
 }

@@ -42,6 +42,16 @@ impl LlmBackend for MockBackend {
             spatial_merge_size: None,
             is_deepstack_layers: None,
             projector_type: None,
+            shared_kv_layers: None,
+            sliding_window_pattern: None,
+            sliding_window: None,
+            key_length: None,
+            key_length_swa: None,
+            rope_theta_swa: None,
+            final_logit_softcapping: None,
+            is_gemma: false,
+            ple_dim: None,
+            embed_scale: None,
         })
     }
 

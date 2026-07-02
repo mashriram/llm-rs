@@ -89,6 +89,16 @@ impl DummyBackend {
                 spatial_merge_size: None,
                 is_deepstack_layers: None,
                 projector_type: None,
+                shared_kv_layers: None,
+                sliding_window_pattern: None,
+                sliding_window: None,
+                key_length: None,
+                key_length_swa: None,
+                rope_theta_swa: None,
+                final_logit_softcapping: None,
+                is_gemma: false,
+                ple_dim: None,
+                embed_scale: None,
             },
             call_count: std::sync::atomic::AtomicU32::new(0),
         }
@@ -228,6 +238,20 @@ fn test_graph_chained_ops() {
     let z = x.add(&y).unwrap();
     let out: Vec<f32> = z.mul(&w).unwrap().to_vec1().unwrap();
     assert_eq!(out, vec![8.0f32, 12.0f32], "(1+3)*2=8, (2+4)*2=12");
+}
+
+#[test]
+fn test_softcap_operator() {
+    let dev = Device::Cpu;
+    let input = Tensor::new(&[10.0f32, -20.0f32, 0.0f32], &dev).unwrap();
+    let cap = 30.0f32;
+    let scaled = (input / cap as f64).unwrap();
+    let tanhed = scaled.tanh().unwrap();
+    let output = (tanhed * cap as f64).unwrap().to_vec1::<f32>().unwrap();
+    
+    assert!((output[0] - (30.0f64 * (10.0f64 / 30.0f64).tanh()) as f32).abs() < 1e-4);
+    assert!((output[1] - (30.0f64 * (-20.0f64 / 30.0f64).tanh()) as f32).abs() < 1e-4);
+    assert!((output[2] - 0.0).abs() < 1e-4);
 }
 
 #[test]
@@ -453,6 +477,16 @@ fn test_weight_dtype_q4k_matches_variant() {
         spatial_merge_size: None,
         is_deepstack_layers: None,
         projector_type: None,
+        shared_kv_layers: None,
+        sliding_window_pattern: None,
+        sliding_window: None,
+        key_length: None,
+        key_length_swa: None,
+        rope_theta_swa: None,
+        final_logit_softcapping: None,
+        is_gemma: false,
+        ple_dim: None,
+        embed_scale: None,
     };
     assert!(matches!(meta.weight_dtype, WeightDtype::Q4_K));
     // Must NOT match F16
@@ -480,6 +514,16 @@ fn test_weight_dtype_f16_matches_variant() {
         spatial_merge_size: None,
         is_deepstack_layers: None,
         projector_type: None,
+        shared_kv_layers: None,
+        sliding_window_pattern: None,
+        sliding_window: None,
+        key_length: None,
+        key_length_swa: None,
+        rope_theta_swa: None,
+        final_logit_softcapping: None,
+        is_gemma: false,
+        ple_dim: None,
+        embed_scale: None,
     };
     assert!(matches!(meta.weight_dtype, WeightDtype::F16));
     assert!(!matches!(meta.weight_dtype, WeightDtype::Q8_0));

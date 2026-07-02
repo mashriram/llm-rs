@@ -45,7 +45,78 @@ pub struct ModelMeta {
     pub spatial_merge_size: Option<usize>,
     pub is_deepstack_layers: Option<Vec<bool>>,
     pub projector_type: Option<String>,
+    pub shared_kv_layers: Option<usize>,
+    pub sliding_window_pattern: Option<Vec<bool>>,
+    pub sliding_window: Option<usize>,
+    pub key_length: Option<usize>,
+    pub key_length_swa: Option<usize>,
+    pub rope_theta_swa: Option<f32>,
+    pub final_logit_softcapping: Option<f32>,
+    pub is_gemma: bool,
+    pub ple_dim: Option<usize>,
+    pub embed_scale: Option<f32>,
 }
+
+impl ModelMeta {
+    pub fn is_kv_shared(&self, l_idx: usize) -> bool {
+        if let Some(shared_kv_layers) = self.shared_kv_layers {
+            l_idx >= self.n_layers.saturating_sub(shared_kv_layers)
+        } else {
+            false
+        }
+    }
+
+    pub fn get_kv_source_layer(&self, l_idx: usize) -> usize {
+        if !self.is_kv_shared(l_idx) {
+            return l_idx;
+        }
+        
+        let is_swa = self.is_swa_layer(l_idx);
+        let first_shared_idx = self.n_layers.saturating_sub(self.shared_kv_layers.unwrap_or(0));
+        
+        for prev_idx in (0..first_shared_idx).rev() {
+            if self.is_swa_layer(prev_idx) == is_swa {
+                return prev_idx;
+            }
+        }
+        
+        0
+    }
+
+    pub fn is_swa_layer(&self, l_idx: usize) -> bool {
+        if let Some(ref pattern) = self.sliding_window_pattern {
+            if l_idx < pattern.len() {
+                return pattern[l_idx];
+            }
+        }
+        false
+    }
+
+    pub fn get_head_dim(&self, l_idx: usize) -> usize {
+        if self.is_swa_layer(l_idx) {
+            self.key_length_swa.unwrap_or(256)
+        } else {
+            self.key_length.unwrap_or(self.head_dim)
+        }
+    }
+
+    pub fn get_rope_theta(&self, l_idx: usize) -> f32 {
+        if self.is_swa_layer(l_idx) {
+            self.rope_theta_swa.unwrap_or(10000.0)
+        } else {
+            self.rope_theta
+        }
+    }
+
+    pub fn get_sliding_window_len(&self, l_idx: usize) -> Option<usize> {
+        if self.is_swa_layer(l_idx) {
+            Some(self.sliding_window.unwrap_or(4096))
+        } else {
+            None
+        }
+    }
+}
+
 
 /// Weight quantization format. Maps to MLC-LLM's dtype strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

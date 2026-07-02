@@ -111,6 +111,24 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
         projector_type = val.get("projector_type").and_then(|v| v.as_str()).map(|s| s.to_string());
     }
 
+    let final_logit_softcapping = val.get("final_logit_softcapping").and_then(|v| v.as_f64()).map(|v| v as f32);
+
+    let model_type = val.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
+    let is_gemma = model_type == "gemma" || model_type == "gemma2" || model_type == "gemma4" ||
+        val.get("architectures")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().any(|arch| {
+                let arch_str = arch.as_str().unwrap_or("");
+                arch_str.contains("Gemma")
+            })).unwrap_or(false);
+
+    let ple_dim = val.get("hidden_size_per_layer_input").and_then(|v| v.as_u64()).map(|v| v as usize);
+    let embed_scale = if is_gemma {
+        Some((hidden_size as f32).sqrt())
+    } else {
+        None
+    };
+
     Ok(ModelMeta {
         vocab_size,
         hidden_dim: hidden_size,
@@ -136,5 +154,15 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
         spatial_merge_size,
         is_deepstack_layers,
         projector_type,
+        shared_kv_layers: None,
+        sliding_window_pattern: None,
+        sliding_window: None,
+        key_length: None,
+        key_length_swa: None,
+        rope_theta_swa: None,
+        final_logit_softcapping,
+        is_gemma,
+        ple_dim,
+        embed_scale,
     })
 }

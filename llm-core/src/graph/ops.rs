@@ -27,6 +27,12 @@ pub enum Operator {
         layer_idx: usize,
         rope_theta: f32,
     },
+    RopeQ {
+        q: String,
+        output_q: String,
+        layer_idx: usize,
+        rope_theta: f32,
+    },
     RopeSkip {
         q: String,
         k: String,
@@ -70,6 +76,38 @@ pub enum Operator {
     DeepStackFuse {
         input: String,
         layer_idx: usize,
+        output: String,
+    },
+    Softcap {
+        input: String,
+        output: String,
+        cap: f32,
+    },
+    Scale {
+        input: String,
+        scale: f32,
+        output: String,
+    },
+    TensorScale {
+        input: String,
+        scale_tensor: String,
+        output: String,
+    },
+    PleInput {
+        input_ids: String,
+        text_embeddings: String,
+        per_layer_token_embd: String,
+        per_layer_model_proj: String,
+        per_layer_proj_norm: String,
+        output: String,
+    },
+    PleLayer {
+        input: String,
+        per_layer_input: String,
+        layer_idx: usize,
+        per_layer_input_gate: String,
+        per_layer_projection: String,
+        post_per_layer_input_norm: String,
         output: String,
     },
 }

@@ -16,11 +16,12 @@ use crate::backends::vision::VisionEncoder;
 struct RmsNorm {
     weight: Tensor,
     eps: f64,
+    is_gemma: bool,
 }
 
 impl RmsNorm {
-    fn new(weight: Tensor, eps: f64) -> Self {
-        Self { weight, eps }
+    fn new(weight: Tensor, eps: f64, is_gemma: bool) -> Self {
+        Self { weight, eps, is_gemma }
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -30,6 +31,12 @@ impl RmsNorm {
         let w_len = self.weight.dim(0)?;
         let last_dim = x_f32.dim(x_f32.rank() - 1)?;
         
+        let w_scaled = if self.is_gemma {
+            self.weight.affine(1.0, 1.0)?
+        } else {
+            self.weight.clone()
+        };
+
         if last_dim != w_len && last_dim % w_len == 0 {
             let rank = x_f32.rank();
             let reshaped = if rank == 3 {
@@ -48,7 +55,7 @@ impl RmsNorm {
             let x_norm_f32 = reshaped.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
             let x_norm = x_norm_f32.to_dtype(orig_dtype)?;
             
-            let out_reshaped = x_norm.broadcast_mul(&self.weight)?;
+            let out_reshaped = x_norm.broadcast_mul(&w_scaled)?;
             let out = if rank == 3 {
                 let (b, s, _, _) = out_reshaped.dims4()?;
                 out_reshaped.reshape((b, s, last_dim))?
@@ -59,13 +66,16 @@ impl RmsNorm {
             Ok(out)
         } else {
             let variance = x_f32.sqr()?.mean_keepdim(x_f32.rank() - 1)?;
-            let x_norm_f32 = x_f32.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+            let denom = (variance + self.eps)?.sqrt()?;
+            let x_norm_f32 = x_f32.broadcast_div(&denom)?;
             let x_norm = x_norm_f32.to_dtype(orig_dtype)?;
-            let out = x_norm.broadcast_mul(&self.weight)?;
+            let out = x_norm.broadcast_mul(&w_scaled)?;
             Ok(out)
         }
     }
 }
+
+
 
 fn apply_rope(
     q: &Tensor, // (b_sz, seq_len, n_heads, head_dim)
@@ -74,69 +84,91 @@ fn apply_rope(
     kv_cache: &RawKvCache,
     rope_theta: f32,
 ) -> Result<(Tensor, Tensor)> {
+    if rope_theta == 0.0 {
+        return Ok((q.clone(), k.clone()));
+    }
     let dev = q.device();
-    let (b_sz, seq_len, n_heads, head_dim) = q.dims4()?;
-    let (_, _, n_kv_heads, _) = k.dims4()?;
+    let (b_sz, seq_len, _n_heads, head_dim) = q.dims4()?;
     
-    let mut q_vec = q.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let mut k_vec = k.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let half_dim = head_dim / 2;
     
-    let q_stride_seq = n_heads * head_dim;
-    let q_stride_batch = seq_len * q_stride_seq;
-    
-    let k_stride_seq = n_kv_heads * head_dim;
-    let k_stride_batch = seq_len * k_stride_seq;
-    
+    let inv_freq_vec: Vec<f32> = (0..half_dim)
+        .map(|i| 1.0 / rope_theta.powf((2 * i) as f32 / head_dim as f32))
+        .collect();
+    let inv_freq = Tensor::from_vec(inv_freq_vec, (1, half_dim), dev)?;
+
+    let mut pos_vec = Vec::with_capacity(b_sz * seq_len);
     for b in 0..b_sz {
         let seq_id = batch.seq_ids[b];
         let seq_len_before = kv_cache.get_seq_len(seq_id);
-        
         for t in 0..seq_len {
-            let pos = (seq_len_before + t) as f32;
-            
-            // Apply to Q
-            for h in 0..n_heads {
-                let base_idx = b * q_stride_batch + t * q_stride_seq + h * head_dim;
-                let half_dim = head_dim / 2;
-                for i in 0..half_dim {
-                    let idx_1 = base_idx + i;
-                    let idx_2 = base_idx + i + half_dim;
-                    
-                    let theta = pos / (rope_theta).powf((2 * i) as f32 / head_dim as f32);
-                    let cos_theta = theta.cos();
-                    let sin_theta = theta.sin();
-                    
-                    let q1 = q_vec[idx_1];
-                    let q2 = q_vec[idx_2];
-                    q_vec[idx_1] = q1 * cos_theta - q2 * sin_theta;
-                    q_vec[idx_2] = q1 * sin_theta + q2 * cos_theta;
-                }
-            }
-            
-            // Apply to K
-            for h in 0..n_kv_heads {
-                let base_idx = b * k_stride_batch + t * k_stride_seq + h * head_dim;
-                let half_dim = head_dim / 2;
-                for i in 0..half_dim {
-                    let idx_1 = base_idx + i;
-                    let idx_2 = base_idx + i + half_dim;
-                    
-                    let theta = pos / (rope_theta).powf((2 * i) as f32 / head_dim as f32);
-                    let cos_theta = theta.cos();
-                    let sin_theta = theta.sin();
-                    
-                    let k1 = k_vec[idx_1];
-                    let k2 = k_vec[idx_2];
-                    k_vec[idx_1] = k1 * cos_theta - k2 * sin_theta;
-                    k_vec[idx_2] = k1 * sin_theta + k2 * cos_theta;
-                }
-            }
+            pos_vec.push((seq_len_before + t) as f32);
         }
     }
-    
-    let q_out = Tensor::from_vec(q_vec, (b_sz, seq_len, n_heads, head_dim), dev)?.to_dtype(q.dtype())?;
-    let k_out = Tensor::from_vec(k_vec, (b_sz, seq_len, n_kv_heads, head_dim), dev)?.to_dtype(k.dtype())?;
+    let pos = Tensor::from_vec(pos_vec, (b_sz * seq_len, 1), dev)?;
+    let freqs = pos.matmul(&inv_freq)?;
+
+    let cos = freqs.cos()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim))?;
+    let sin = freqs.sin()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim))?;
+
+    let q1 = q.narrow(candle_core::D::Minus1, 0, half_dim)?;
+    let q2 = q.narrow(candle_core::D::Minus1, half_dim, half_dim)?;
+
+    let q_out_1 = (q1.broadcast_mul(&cos)? - q2.broadcast_mul(&sin)?)?;
+    let q_out_2 = (q1.broadcast_mul(&sin)? + q2.broadcast_mul(&cos)?)?;
+    let q_out = Tensor::cat(&[q_out_1, q_out_2], candle_core::D::Minus1)?;
+
+    let k1 = k.narrow(candle_core::D::Minus1, 0, half_dim)?;
+    let k2 = k.narrow(candle_core::D::Minus1, half_dim, half_dim)?;
+
+    let k_out_1 = (k1.broadcast_mul(&cos)? - k2.broadcast_mul(&sin)?)?;
+    let k_out_2 = (k1.broadcast_mul(&sin)? + k2.broadcast_mul(&cos)?)?;
+    let k_out = Tensor::cat(&[k_out_1, k_out_2], candle_core::D::Minus1)?;
+
     Ok((q_out, k_out))
+}
+
+fn apply_rope_q(
+    q: &Tensor, // (b_sz, seq_len, n_heads, head_dim)
+    batch: &BatchInput,
+    kv_cache: &RawKvCache,
+    rope_theta: f32,
+) -> Result<Tensor> {
+    if rope_theta == 0.0 {
+        return Ok(q.clone());
+    }
+    let dev = q.device();
+    let (b_sz, seq_len, _n_heads, head_dim) = q.dims4()?;
+    
+    let half_dim = head_dim / 2;
+    
+    let inv_freq_vec: Vec<f32> = (0..half_dim)
+        .map(|i| 1.0 / rope_theta.powf((2 * i) as f32 / head_dim as f32))
+        .collect();
+    let inv_freq = Tensor::from_vec(inv_freq_vec, (1, half_dim), dev)?;
+
+    let mut pos_vec = Vec::with_capacity(b_sz * seq_len);
+    for b in 0..b_sz {
+        let seq_id = batch.seq_ids[b];
+        let seq_len_before = kv_cache.get_seq_len(seq_id);
+        for t in 0..seq_len {
+            pos_vec.push((seq_len_before + t) as f32);
+        }
+    }
+    let pos = Tensor::from_vec(pos_vec, (b_sz * seq_len, 1), dev)?;
+    let freqs = pos.matmul(&inv_freq)?;
+
+    let cos = freqs.cos()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim))?;
+    let sin = freqs.sin()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim))?;
+
+    let q1 = q.narrow(candle_core::D::Minus1, 0, half_dim)?;
+    let q2 = q.narrow(candle_core::D::Minus1, half_dim, half_dim)?;
+
+    let q_out_1 = (q1.broadcast_mul(&cos)? - q2.broadcast_mul(&sin)?)?;
+    let q_out_2 = (q1.broadcast_mul(&sin)? + q2.broadcast_mul(&cos)?)?;
+    let q_out = Tensor::cat(&[q_out_1, q_out_2], candle_core::D::Minus1)?;
+
+    Ok(q_out)
 }
 
 fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
@@ -388,6 +420,23 @@ impl CandleBackend {
             Some(candle_core::quantized::gguf_file::Value::I32(v)) => Some(*v as u32),
             Some(candle_core::quantized::gguf_file::Value::U64(v)) => Some(*v as u32),
             Some(candle_core::quantized::gguf_file::Value::I64(v)) => Some(*v as u32),
+            Some(candle_core::quantized::gguf_file::Value::Array(arr)) => {
+                if let Some(first) = arr.first() {
+                    match first {
+                        candle_core::quantized::gguf_file::Value::U8(v) => Some(*v as u32),
+                        candle_core::quantized::gguf_file::Value::I8(v) => Some(*v as u32),
+                        candle_core::quantized::gguf_file::Value::U16(v) => Some(*v as u32),
+                        candle_core::quantized::gguf_file::Value::I16(v) => Some(*v as u32),
+                        candle_core::quantized::gguf_file::Value::U32(v) => Some(*v),
+                        candle_core::quantized::gguf_file::Value::I32(v) => Some(*v as u32),
+                        candle_core::quantized::gguf_file::Value::U64(v) => Some(*v as u32),
+                        candle_core::quantized::gguf_file::Value::I64(v) => Some(*v as u32),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -396,8 +445,41 @@ impl CandleBackend {
         match metadata.get(key) {
             Some(candle_core::quantized::gguf_file::Value::F32(v)) => Some(*v),
             Some(candle_core::quantized::gguf_file::Value::F64(v)) => Some(*v as f32),
+            Some(candle_core::quantized::gguf_file::Value::Array(arr)) => {
+                if let Some(first) = arr.first() {
+                    match first {
+                        candle_core::quantized::gguf_file::Value::F32(v) => Some(*v),
+                        candle_core::quantized::gguf_file::Value::F64(v) => Some(*v as f32),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
+    }
+
+    fn find_metadata_key(metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>, suffix: &str) -> Option<String> {
+        if metadata.contains_key(suffix) {
+            return Some(suffix.to_string());
+        }
+        for key in metadata.keys() {
+            if key == suffix || key.ends_with(&format!(".{}", suffix)) {
+                return Some(key.clone());
+            }
+        }
+        None
+    }
+
+    fn get_metadata_u32_agnostic(metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>, suffix: &str) -> Option<u32> {
+        let key = Self::find_metadata_key(metadata, suffix)?;
+        Self::get_metadata_u32(metadata, &key)
+    }
+
+    fn get_metadata_f32_agnostic(metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>, suffix: &str) -> Option<f32> {
+        let key = Self::find_metadata_key(metadata, suffix)?;
+        Self::get_metadata_f32(metadata, &key)
     }
 }
 
@@ -437,7 +519,11 @@ impl LlmBackend for CandleBackend {
 
         // Query free VRAM for cache budget (leave 2.0 GB headroom for activations/KV cache)
         let vram_headroom_bytes: u64 = 2_000 * 1024 * 1024;
-        let free_vram = Self::query_free_vram_bytes();
+        let mut free_vram = Self::query_free_vram_bytes();
+        if free_vram == 0 && dev.is_cuda() {
+            tracing::info!("nvidia-smi query returned 0, but CUDA device is active. Falling back to 6.0 GB estimated free VRAM.");
+            free_vram = 6_000 * 1024 * 1024;
+        }
         self.gpu_cache_budget = free_vram.saturating_sub(vram_headroom_bytes);
         tracing::info!(
             "GPU cache budget: {:.1} GB (free VRAM: {:.1} GB)",
@@ -464,31 +550,37 @@ impl LlmBackend for CandleBackend {
                 _ => 151936,
             };
 
-            let n_layers = Self::get_metadata_u32(&model.metadata, &format!("{}.block_count", arch))
+            let n_layers = Self::get_metadata_u32_agnostic(&model.metadata, "block_count")
                 .ok_or_else(|| anyhow!("Missing block_count in GGUF metadata"))? as usize;
 
-            let hidden_dim = Self::get_metadata_u32(&model.metadata, &format!("{}.embedding_length", arch))
+            let hidden_dim = Self::get_metadata_u32_agnostic(&model.metadata, "embedding_length")
                 .ok_or_else(|| anyhow!("Missing embedding_length in GGUF metadata"))? as usize;
 
-            let intermediate_dim = Self::get_metadata_u32(&model.metadata, &format!("{}.feed_forward_length", arch))
+            let intermediate_dim = Self::get_metadata_u32_agnostic(&model.metadata, "feed_forward_length")
                 .ok_or_else(|| anyhow!("Missing feed_forward_length in GGUF metadata"))? as usize;
 
-            let n_heads = Self::get_metadata_u32(&model.metadata, &format!("{}.attention.head_count", arch))
+            let n_heads = Self::get_metadata_u32_agnostic(&model.metadata, "attention.head_count")
                 .ok_or_else(|| anyhow!("Missing head_count in GGUF metadata"))? as usize;
 
-            let n_kv_heads = Self::get_metadata_u32(&model.metadata, &format!("{}.attention.head_count_kv", arch))
+            let n_kv_heads = Self::get_metadata_u32_agnostic(&model.metadata, "attention.head_count_kv")
                 .unwrap_or(n_heads as u32) as usize;
 
-            let max_seq_len = Self::get_metadata_u32(&model.metadata, &format!("{}.context_length", arch))
+            let max_seq_len = Self::get_metadata_u32_agnostic(&model.metadata, "context_length")
                 .unwrap_or(4096) as usize;
 
-            let rope_theta = Self::get_metadata_f32(&model.metadata, &format!("{}.rope.freq_base", arch))
+            let rope_theta = Self::get_metadata_f32_agnostic(&model.metadata, "rope.freq_base")
                 .unwrap_or(10000.0);
 
-            let head_dim = Self::get_metadata_u32(&model.metadata, &format!("{}.attention.key_length", arch))
-                .unwrap_or((hidden_dim / n_heads) as u32) as usize;
+            let head_dim = if let Some(info) = model.tensor_infos.get("blk.0.attn_q.weight") {
+                info.shape.dims()[0] / n_heads
+            } else if let Some(info) = model.tensor_infos.get("blk.0.attn_q") {
+                info.shape.dims()[0] / n_heads
+            } else {
+                Self::get_metadata_u32_agnostic(&model.metadata, "attention.key_length")
+                    .unwrap_or((hidden_dim / n_heads) as u32) as usize
+            };
 
-            let rms_norm_eps = Self::get_metadata_f32(&model.metadata, &format!("{}.attention.layer_norm_rms_epsilon", arch))
+            let rms_norm_eps = Self::get_metadata_f32_agnostic(&model.metadata, "attention.layer_norm_rms_epsilon")
                 .unwrap_or(1e-6);
 
             let eos_token_id = Self::get_metadata_u32(&model.metadata, "tokenizer.ggml.eos_token_id")
@@ -531,6 +623,48 @@ impl LlmBackend for CandleBackend {
                 _ => None,
             };
 
+            let shared_kv_layers = Self::get_metadata_u32_agnostic(&model.metadata, "attention.shared_kv_layers")
+                .map(|v| v as usize);
+
+            let sliding_window_pattern = match Self::find_metadata_key(&model.metadata, "attention.sliding_window_pattern") {
+                Some(key) => match model.metadata.get(&key) {
+                    Some(candle_core::quantized::gguf_file::Value::Array(arr)) => {
+                        Some(arr.iter().map(|v| match v {
+                            candle_core::quantized::gguf_file::Value::Bool(b) => *b,
+                            _ => false,
+                        }).collect())
+                    }
+                    _ => None,
+                },
+                None => None,
+            };
+
+            let sliding_window = Self::get_metadata_u32_agnostic(&model.metadata, "attention.sliding_window")
+                .map(|v| v as usize);
+
+            let key_length = Self::get_metadata_u32_agnostic(&model.metadata, "attention.key_length")
+                .map(|v| v as usize);
+
+            let key_length_swa = Self::get_metadata_u32_agnostic(&model.metadata, "attention.key_length_swa")
+                .map(|v| v as usize);
+
+            let rope_theta_swa = Self::get_metadata_f32_agnostic(&model.metadata, "rope.freq_base_swa");
+
+            let final_logit_softcapping = Self::get_metadata_f32_agnostic(&model.metadata, "final_logit_softcapping");
+
+            let ple_dim = Self::get_metadata_u32_agnostic(&model.metadata, "embedding_length_per_layer_input")
+                .map(|v| v as usize);
+
+            let is_gemma = arch == "gemma" || arch == "gemma2" || arch == "gemma4";
+            let hidden_act = if is_gemma { HiddenAct::GeLU } else { HiddenAct::SiLU };
+            let tie_word_embeddings = is_gemma;
+
+            let embed_scale = if is_gemma {
+                Some((hidden_dim as f32).sqrt())
+            } else {
+                None
+            };
+
             ModelMeta {
                 vocab_size,
                 hidden_dim,
@@ -543,8 +677,8 @@ impl LlmBackend for CandleBackend {
                 rope_theta,
                 weight_dtype: WeightDtype::F32,
                 rms_norm_eps,
-                tie_word_embeddings: false,
-                hidden_act: HiddenAct::SiLU,
+                tie_word_embeddings,
+                hidden_act,
                 no_rope_layers: vec![false; n_layers],
                 has_vision_encoder,
                 vision_hidden_dim,
@@ -556,6 +690,16 @@ impl LlmBackend for CandleBackend {
                 spatial_merge_size,
                 is_deepstack_layers,
                 projector_type,
+                shared_kv_layers,
+                sliding_window_pattern,
+                sliding_window,
+                key_length,
+                key_length_swa,
+                rope_theta_swa,
+                final_logit_softcapping,
+                is_gemma,
+                ple_dim,
+                embed_scale,
             }
         } else {
             let config_path = path.join("config.json");
@@ -809,6 +953,12 @@ impl LlmBackend for CandleBackend {
         let kv_cache_mutex = self.kv_cache.as_ref().ok_or_else(|| anyhow!("KV Cache not initialized"))?;
         let mut kv_cache = kv_cache_mutex.lock().map_err(|_| anyhow!("KV Cache mutex poisoned"))?;
 
+        if batch.seq_ids[0] == 1 && kv_cache.get_seq_len(batch.seq_ids[0]) == 0 {
+            for (idx, op) in graph.ops.iter().enumerate().take(60) {
+                println!("Graph OP idx={}: {:?}", idx, op);
+            }
+        }
+
         // Initialize execution context
         let mut ctx = ExecContext::new();
 
@@ -841,6 +991,7 @@ impl LlmBackend for CandleBackend {
                 Operator::RMSNorm { input, .. } => vec![input.clone()],
                 Operator::MatMul { input, .. } => vec![input.clone()],
                 Operator::Rope { q, k, .. } => vec![q.clone(), k.clone()],
+                Operator::RopeQ { q, .. } => vec![q.clone()],
                 Operator::RopeSkip { q, k, .. } => vec![q.clone(), k.clone()],
                 Operator::PagedAttention { q, k, v, .. } => vec![q.clone(), k.clone(), v.clone()],
                 Operator::Activation { input, .. } => vec![input.clone()],
@@ -849,6 +1000,11 @@ impl LlmBackend for CandleBackend {
                 Operator::VisualEmbed { pixel_values, .. } => vec![pixel_values.clone()],
                 Operator::SpliceTensors { text_embeds, visual_embeds, .. } => vec![text_embeds.clone(), visual_embeds.clone()],
                 Operator::DeepStackFuse { input, .. } => vec![input.clone(), "visual_embeddings".to_string()],
+                Operator::Softcap { input, .. } => vec![input.clone()],
+                Operator::Scale { input, .. } => vec![input.clone()],
+                Operator::TensorScale { input, .. } => vec![input.clone()],
+                Operator::PleInput { input_ids, text_embeddings, .. } => vec![input_ids.clone(), text_embeddings.clone()],
+                Operator::PleLayer { input, per_layer_input, .. } => vec![input.clone(), per_layer_input.clone()],
             };
             for input in inputs {
                 last_use.insert(input, idx);
@@ -878,7 +1034,9 @@ impl LlmBackend for CandleBackend {
                 Operator::RMSNorm { input, weight, output, eps } => {
                     let in_t = ctx.get(input)?;
                     let w_t = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
-                    let out = RmsNorm::new(w_t, *eps as f64).forward(&in_t)?;
+                    let is_gemma = self.meta.as_ref().map(|m| m.is_gemma).unwrap_or(false);
+                    let is_gemma_hf = is_gemma && self.quantized_weights.is_empty();
+                    let out = RmsNorm::new(w_t, *eps as f64, is_gemma_hf).forward(&in_t)?;
                     ctx.insert(output.clone(), out);
                 }
                 Operator::MatMul { input, weight, bias, output } => {
@@ -911,17 +1069,38 @@ impl LlmBackend for CandleBackend {
                     }
                     ctx.insert(output.clone(), out);
                 }
-                Operator::Rope { q, k, output_q, output_k, layer_idx: _, rope_theta } => {
+                Operator::Rope { q, k, output_q, output_k, layer_idx, rope_theta } => {
                     let q_t = ctx.get(q)?;
                     let k_t = ctx.get(k)?;
-                    let (b_sz, seq_len, _) = q_t.dims3()?;
-                    let q_4d = q_t.reshape((b_sz, seq_len, meta.n_heads, meta.head_dim))?;
-                    let k_4d = k_t.reshape((b_sz, seq_len, meta.n_kv_heads, meta.head_dim))?;
+                    let (b_sz, seq_len, q_dim) = q_t.dims3()?;
+                    let (_, _, k_dim) = k_t.dims3()?;
+
+                    let head_dim = meta.get_head_dim(*layer_idx);
+                    let layer_n_heads = q_dim / head_dim;
+                    let layer_n_kv_heads = k_dim / head_dim;
+                    let layer_head_dim = head_dim;
+                    let layer_k_head_dim = head_dim;
+
+                    let q_4d = q_t.reshape((b_sz, seq_len, layer_n_heads, layer_head_dim))?;
+                    let k_4d = k_t.reshape((b_sz, seq_len, layer_n_kv_heads, layer_k_head_dim))?;
                     let (q_out_4d, k_out_4d) = apply_rope(&q_4d, &k_4d, batch, &kv_cache, *rope_theta)?;
-                    let q_out = q_out_4d.reshape((b_sz, seq_len, meta.n_heads * meta.head_dim))?;
-                    let k_out = k_out_4d.reshape((b_sz, seq_len, meta.n_kv_heads * meta.head_dim))?;
+                    let q_out = q_out_4d.reshape((b_sz, seq_len, layer_n_heads * layer_head_dim))?;
+                    let k_out = k_out_4d.reshape((b_sz, seq_len, layer_n_kv_heads * layer_k_head_dim))?;
                     ctx.insert(output_q.clone(), q_out);
                     ctx.insert(output_k.clone(), k_out);
+                }
+                Operator::RopeQ { q, output_q, layer_idx, rope_theta } => {
+                    let q_t = ctx.get(q)?;
+                    let (b_sz, seq_len, q_dim) = q_t.dims3()?;
+
+                    let head_dim = meta.get_head_dim(*layer_idx);
+                    let layer_n_heads = q_dim / head_dim;
+                    let layer_head_dim = head_dim;
+
+                    let q_4d = q_t.reshape((b_sz, seq_len, layer_n_heads, layer_head_dim))?;
+                    let q_out_4d = apply_rope_q(&q_4d, batch, &kv_cache, *rope_theta)?;
+                    let q_out = q_out_4d.reshape((b_sz, seq_len, layer_n_heads * layer_head_dim))?;
+                    ctx.insert(output_q.clone(), q_out);
                 }
                 Operator::RopeSkip { q, k, output_q, output_k } => {
                     let q_t = ctx.get(q)?;
@@ -929,16 +1108,30 @@ impl LlmBackend for CandleBackend {
                     ctx.insert(output_q.clone(), q_t.clone());
                     ctx.insert(output_k.clone(), k_t.clone());
                 }
-                Operator::PagedAttention { q, k, v, output, layer_idx, n_heads, n_kv_heads, head_dim } => {
+                Operator::PagedAttention { q, k, v, output, layer_idx, n_heads: _, n_kv_heads: _, head_dim: _ } => {
                     let q_t = ctx.get(q)?;
-                    let k_t = ctx.get(k)?;
-                    let v_t = ctx.get(v)?;
 
-                    let (b_sz, seq_len, _) = q_t.dims3()?;
+                    let (b_sz, seq_len, q_dim) = q_t.dims3()?;
                     
-                    let q_4d = q_t.reshape((b_sz, seq_len, *n_heads, *head_dim))?;
-                    let k_4d = k_t.reshape((b_sz, seq_len, *n_kv_heads, *head_dim))?;
-                    let v_4d = v_t.reshape((b_sz, seq_len, *n_kv_heads, *head_dim))?;
+                    let head_dim = meta.get_head_dim(*layer_idx);
+                    let layer_n_heads = q_dim / head_dim;
+                    let layer_head_dim = head_dim;
+                    
+                    let q_4d = q_t.reshape((b_sz, seq_len, layer_n_heads, layer_head_dim))?;
+
+                    let is_shared = meta.is_kv_shared(*layer_idx);
+
+                    let (k_4d, v_4d, _) = if !is_shared {
+                        let k_t = ctx.get(k)?;
+                        let v_t = ctx.get(v)?;
+                        let (_, _, k_dim) = k_t.dims3()?;
+                        let n_kv_heads = k_dim / head_dim;
+                        let k_4d = k_t.reshape((b_sz, seq_len, n_kv_heads, layer_head_dim))?;
+                        let v_4d = v_t.reshape((b_sz, seq_len, n_kv_heads, layer_head_dim))?;
+                        (Some(k_4d), Some(v_4d), n_kv_heads)
+                    } else {
+                        (None, None, meta.n_kv_heads)
+                    };
 
                     let q_dev = q_4d.device();
                     let mut gpu_cache = self.gpu_kv_cache.lock().map_err(|_| anyhow!("gpu_kv_cache poisoned"))?;
@@ -946,35 +1139,57 @@ impl LlmBackend for CandleBackend {
                     let mut att_outputs = Vec::with_capacity(b_sz);
 
                     for (i, &seq_id) in batch.seq_ids.iter().enumerate() {
-                        let k_i = k_4d.narrow(0, i, 1)?; // shape: (1, seq_len, n_kv_heads, head_dim)
-                        let v_i = v_4d.narrow(0, i, 1)?; // shape: (1, seq_len, n_kv_heads, head_dim)
-
-                        let (k_hist_t, v_hist_t) = if let Some((old_k, old_v)) = gpu_cache.get(&(*layer_idx, seq_id)) {
-                            let new_k = Tensor::cat(&[old_k, &k_i], 1)?;
-                            let new_v = Tensor::cat(&[old_v, &v_i], 1)?;
-                            (new_k, new_v)
+                        let (mut k_hist_t, mut v_hist_t) = if is_shared {
+                            let src_layer = meta.get_kv_source_layer(*layer_idx);
+                            gpu_cache.get(&(src_layer, seq_id))
+                                .cloned()
+                                .ok_or_else(|| anyhow!("Shared KV cache not found for layer {} from source layer {}", layer_idx, src_layer))?
                         } else {
-                            (k_i, v_i)
+                            let k_4d_val = k_4d.as_ref().unwrap();
+                            let v_4d_val = v_4d.as_ref().unwrap();
+                            let k_i = k_4d_val.narrow(0, i, 1)?;
+                            let v_i = v_4d_val.narrow(0, i, 1)?;
+
+                            let (new_k, new_v) = if let Some((old_k, old_v)) = gpu_cache.get(&(*layer_idx, seq_id)) {
+                                let new_k = Tensor::cat(&[old_k, &k_i], 1)?;
+                                let new_v = Tensor::cat(&[old_v, &v_i], 1)?;
+                                (new_k, new_v)
+                            } else {
+                                (k_i, v_i)
+                            };
+
+                            gpu_cache.insert((*layer_idx, seq_id), (new_k.clone(), new_v.clone()));
+                            (new_k, new_v)
                         };
 
-                        // Store the updated history
-                        gpu_cache.insert((*layer_idx, seq_id), (k_hist_t.clone(), v_hist_t.clone()));
+                        if let Some(window_len) = meta.get_sliding_window_len(*layer_idx) {
+                            let total_len = k_hist_t.dim(1)?;
+                            if total_len > window_len {
+                                let start_idx = total_len - window_len;
+                                k_hist_t = k_hist_t.narrow(1, start_idx, window_len)?;
+                                v_hist_t = v_hist_t.narrow(1, start_idx, window_len)?;
+                                if !is_shared {
+                                    gpu_cache.insert((*layer_idx, seq_id), (k_hist_t.clone(), v_hist_t.clone()));
+                                }
+                            }
+                        }
 
                         // Squeeze batch dimension for attention computation
                         let k_hist_squeezed = k_hist_t.squeeze(0)?; // shape: (total_seq_len, n_kv_heads, head_dim)
                         let v_hist_squeezed = v_hist_t.squeeze(0)?; // shape: (total_seq_len, n_kv_heads, head_dim)
 
                         let total_seq_len = k_hist_squeezed.dim(0)?;
+                        let layer_n_kv_heads = k_hist_squeezed.dim(1)?;
 
                         let q_i = q_4d.narrow(0, i, 1)?.squeeze(0)?;
                         let q_i = q_i.transpose(0, 1)?.contiguous()?; // (n_heads, seq_len, head_dim)
                         
-                        let n_rep = n_heads / n_kv_heads;
+                        let n_rep = layer_n_heads / layer_n_kv_heads;
                         let k_hist_rep = repeat_kv(k_hist_squeezed.transpose(0, 1)?, n_rep)?.contiguous()?;
                         let v_hist_rep = repeat_kv(v_hist_squeezed.transpose(0, 1)?, n_rep)?.contiguous()?;
 
                         let scores = q_i.matmul(&k_hist_rep.transpose(1, 2)?.contiguous()?)?;
-                        let scores_scaled = (scores / (*head_dim as f64).sqrt())?;
+                        let scores_scaled = (scores / (layer_head_dim as f64).sqrt())?;
 
                         let num_tokens = seq_len;
                         let seq_len_before = total_seq_len - num_tokens;
@@ -997,7 +1212,7 @@ impl LlmBackend for CandleBackend {
                         let probs = candle_nn::ops::softmax(&scores, candle_core::D::Minus1)?;
                         let out_i = probs.matmul(&v_hist_rep)?;
                         let out_i = out_i.transpose(0, 1)?.contiguous()?; // (seq_len, n_heads, head_dim)
-                        let out_i = out_i.reshape((seq_len, n_heads * head_dim))?;
+                        let out_i = out_i.reshape((seq_len, layer_n_heads * layer_head_dim))?;
                         att_outputs.push(out_i);
                     }
 
@@ -1070,7 +1285,119 @@ impl LlmBackend for CandleBackend {
                         ctx.insert(output.clone(), in_t.clone());
                     }
                 }
+                Operator::Softcap { input, output, cap } => {
+                    let in_t = ctx.get(input)?;
+                    let scaled = (in_t / *cap as f64)?;
+                    let tanhed = scaled.tanh()?;
+                    let out = (tanhed * *cap as f64)?;
+                    ctx.insert(output.clone(), out);
+                }
+                Operator::Scale { input, scale, output } => {
+                    let in_t = ctx.get(input)?;
+                    let out = (in_t * (*scale as f64))?;
+                    ctx.insert(output.clone(), out);
+                }
+                Operator::TensorScale { input, scale_tensor, output } => {
+                    let in_t = ctx.get(input)?;
+                    let scale = self.get_weight(scale_tensor, &mut local_cache)?.to_device(in_t.device())?;
+                    let out = in_t.broadcast_mul(&scale)?;
+                    ctx.insert(output.clone(), out);
+                }
+                Operator::PleInput {
+                    input_ids,
+                    text_embeddings,
+                    per_layer_token_embd,
+                    per_layer_model_proj,
+                    per_layer_proj_norm,
+                    output,
+                } => {
+                    let ids = ctx.get(input_ids)?;
+                    let table = self.get_weight(per_layer_token_embd, &mut local_cache)?;
+                    let (b_sz, seq_len) = ids.dims2()?;
+                    let num_tokens = b_sz * seq_len;
+                    
+                    let n_layers = self.meta.as_ref().map(|m| m.n_layers).unwrap_or(35);
+                    let ple_dim = self.meta.as_ref().and_then(|m| m.ple_dim).unwrap_or(256);
+                    let hidden_dim = self.meta.as_ref().map(|m| m.hidden_dim).unwrap_or(1536);
+
+                    // Host-side slicing / index selection:
+                    let lookup_out = if table.device().is_cpu() {
+                        let ids_cpu = ids.to_device(&Device::Cpu)?;
+                        let ids_flat = ids_cpu.flatten_all()?;
+                        let out_flat = table.index_select(&ids_flat, 0)?;
+                        let out_cpu = out_flat.reshape((num_tokens, n_layers * ple_dim))?;
+                        out_cpu.to_device(&self.device)?
+                    } else {
+                        let ids_flat = ids.flatten_all()?;
+                        let out_flat = table.index_select(&ids_flat, 0)?;
+                        out_flat.reshape((num_tokens, n_layers * ple_dim))?
+                    };
+
+                    let token_identity = lookup_out.reshape((num_tokens, n_layers, ple_dim))?;
+                    let token_identity = (token_identity * ((ple_dim as f64).sqrt()))?;
+
+                    // Context-aware projection:
+                    let text_emb = ctx.get(text_embeddings)?;
+                    let text_emb_flat = text_emb.reshape((num_tokens, hidden_dim))?;
+                    let model_proj_w = self.get_weight(per_layer_model_proj, &mut local_cache)?.to_device(&self.device)?;
+                    let context_proj = text_emb_flat.matmul(&model_proj_w.t()?)?;
+                    let context_proj = (context_proj / ((hidden_dim as f64).sqrt()))?;
+                    let context_aware = context_proj.reshape((num_tokens, n_layers, ple_dim))?;
+
+                    // Combined:
+                    let combined = ((token_identity + context_aware)? * (1.0 / 2.0f64.sqrt()))?;
+
+                    // RMSNorm on the last dimension (ple_dim):
+                    let norm_w = self.get_weight(per_layer_proj_norm, &mut local_cache)?.to_device(&self.device)?;
+                    let is_gemma = self.meta.as_ref().map(|m| m.is_gemma).unwrap_or(false);
+                    let is_gemma_hf = is_gemma && self.quantized_weights.is_empty();
+                    let out = RmsNorm::new(norm_w, 1e-6, is_gemma_hf).forward(&combined)?;
+
+                    ctx.insert(output.clone(), out);
+                }
+                Operator::PleLayer {
+                    input,
+                    per_layer_input,
+                    layer_idx,
+                    per_layer_input_gate,
+                    per_layer_projection,
+                    post_per_layer_input_norm,
+                    output,
+                } => {
+                    let in_t = ctx.get(input)?;
+                    let (b_sz, seq_len, hidden_dim) = in_t.dims3()?;
+                    let num_tokens = b_sz * seq_len;
+                    let in_flat = in_t.reshape((num_tokens, hidden_dim))?;
+
+                    let ple_in = ctx.get(per_layer_input)?;
+                    let ple_slice = ple_in.narrow(1, *layer_idx, 1)?.reshape((num_tokens, ()))?;
+
+                    let gate_w = self.get_weight(per_layer_input_gate, &mut local_cache)?.to_device(in_t.device())?;
+                    let gate_input = in_flat.matmul(&gate_w.t()?)?;
+
+                    let act_fn = self.meta.as_ref().map(|m| m.hidden_act).unwrap_or(HiddenAct::SiLU);
+                    let gate_active = match act_fn {
+                        HiddenAct::SiLU => (&gate_input * &candle_nn::ops::sigmoid(&gate_input)?)?,
+                        HiddenAct::GeLU => gate_input.gelu()?,
+                    };
+
+                    let gated = gate_active.broadcast_mul(&ple_slice)?;
+
+                    let proj_w = self.get_weight(per_layer_projection, &mut local_cache)?.to_device(in_t.device())?;
+                    let proj_out = gated.matmul(&proj_w.t()?)?;
+
+                    let norm_w = self.get_weight(post_per_layer_input_norm, &mut local_cache)?.to_device(in_t.device())?;
+                    let is_gemma = self.meta.as_ref().map(|m| m.is_gemma).unwrap_or(false);
+                    let is_gemma_hf = is_gemma && self.quantized_weights.is_empty();
+                    let proj_normed = RmsNorm::new(norm_w, 1e-6, is_gemma_hf).forward(&proj_out)?;
+
+                    let proj_normed_3d = proj_normed.reshape((b_sz, seq_len, hidden_dim))?;
+                    let out = (in_t + proj_normed_3d)?;
+                    ctx.insert(output.clone(), out);
+                }
             }
+
+
 
             // Evict tensors that are no longer needed
             let mut to_remove = Vec::new();
@@ -1103,6 +1430,8 @@ impl LlmBackend for CandleBackend {
         for i in 0..b_sz {
             let seq_logits_t = logits.narrow(0, i, 1)?.narrow(1, seq_len - 1, 1)?.squeeze(0)?.squeeze(0)?;
             let seq_logits = seq_logits_t.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+
+
 
             let mut max_idx = 0;
             let mut max_val_ref = seq_logits[0];
