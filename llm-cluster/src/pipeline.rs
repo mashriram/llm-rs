@@ -3,7 +3,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use serde::{Serialize, Deserialize};
 use anyhow::{Result, Context};
-use tracing::{info, error};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ActivationMessage {

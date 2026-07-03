@@ -142,7 +142,7 @@ impl VisionEncoder {
             .ok_or_else(|| anyhow!("vision.patch_embed.weight weight not found"))?;
         let patch_emb_b = self.weights.get("vision.patch_embed.bias");
 
-        let mut x = pixel_values.conv2d(patch_emb_w, self.patch_size, 0, 1, 1)?;
+        let mut x = pixel_values.conv2d(patch_emb_w, 0, self.patch_size, 1, 1)?;
 
         if let Some(bias) = patch_emb_b {
             let bias_reshaped = bias.reshape((1, self.hidden_dim, 1, 1))?;
@@ -171,7 +171,7 @@ impl VisionEncoder {
             // Direct projection
             if let Some(mm_0_w) = self.weights.get("projector.0.weight") {
                 let mm_0_b = self.weights.get("projector.0.bias");
-                x = x.matmul(&mm_0_w.t()?)?;
+                x = matmul_3d_2d(&x, &mm_0_w.t()?)?;
                 if let Some(b) = mm_0_b {
                     x = x.broadcast_add(b)?;
                 }
@@ -198,24 +198,24 @@ impl VisionEncoder {
             let qkv_b = self.weights.get(&format!("vision.layers.{}.attn_qkv.bias", i))
                 .ok_or_else(|| anyhow!("vision.layers.{}.attn_qkv.bias not found", i))?;
 
-            let qkv = x_ln1.matmul(&qkv_w.t()?)?.broadcast_add(qkv_b)?;
+            let qkv = matmul_3d_2d(&x_ln1, &qkv_w.t()?)?.broadcast_add(qkv_b)?;
             let qkv_chunks = qkv.chunk(3, 2)?;
             let q = qkv_chunks[0].reshape((1, num_patches, self.num_heads, head_dim))?.permute((0, 2, 1, 3))?;
             let k = qkv_chunks[1].reshape((1, num_patches, self.num_heads, head_dim))?.permute((0, 2, 1, 3))?;
             let v = qkv_chunks[2].reshape((1, num_patches, self.num_heads, head_dim))?.permute((0, 2, 1, 3))?;
 
-            let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+            let attn_weights = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
             let attn_probs = candle_nn::ops::softmax(&attn_weights, candle_core::D::Minus1)?;
-            let attn_out = attn_probs.matmul(&v)?;
+            let attn_out = attn_probs.matmul(&v.contiguous()?)?;
 
-            let attn_out = attn_out.permute((0, 2, 1, 3))?.reshape((1, num_patches, self.hidden_dim))?;
+            let attn_out = attn_out.permute((0, 2, 1, 3))?.contiguous()?.reshape((1, num_patches, self.hidden_dim))?;
 
             // Output projection
             let out_w = self.weights.get(&format!("vision.layers.{}.attn_out.weight", i))
                 .ok_or_else(|| anyhow!("vision.layers.{}.attn_out.weight not found", i))?;
             let out_b = self.weights.get(&format!("vision.layers.{}.attn_out.bias", i))
                 .ok_or_else(|| anyhow!("vision.layers.{}.attn_out.bias not found", i))?;
-            let attn_out = attn_out.matmul(&out_w.t()?)?.broadcast_add(out_b)?;
+            let attn_out = matmul_3d_2d(&attn_out, &out_w.t()?)?.broadcast_add(out_b)?;
 
             x = (x + attn_out)?;
 
@@ -236,9 +236,9 @@ impl VisionEncoder {
             let ffn_down_b = self.weights.get(&format!("vision.layers.{}.ffn_down.bias", i))
                 .ok_or_else(|| anyhow!("vision.layers.{}.ffn_down.bias not found", i))?;
 
-            let mlp = x_ln2.matmul(&ffn_up_w.t()?)?.broadcast_add(ffn_up_b)?;
+            let mlp = matmul_3d_2d(&x_ln2, &ffn_up_w.t()?)?.broadcast_add(ffn_up_b)?;
             let mlp = mlp.gelu()?;
-            let mlp = mlp.matmul(&ffn_down_w.t()?)?.broadcast_add(ffn_down_b)?;
+            let mlp = matmul_3d_2d(&mlp, &ffn_down_w.t()?)?.broadcast_add(ffn_down_b)?;
 
             x = (x + mlp)?;
 
@@ -260,9 +260,9 @@ impl VisionEncoder {
                     .ok_or_else(|| anyhow!("deepstack.{}.fc2.bias not found", i))?;
 
                 let ds_x = candle_nn::ops::layer_norm(&merged, ds_norm_w, ds_norm_b, 1e-6)?;
-                let ds_x = ds_x.matmul(&ds_fc1_w.t()?)?.broadcast_add(ds_fc1_b)?;
+                let ds_x = matmul_3d_2d(&ds_x, &ds_fc1_w.t()?)?.broadcast_add(ds_fc1_b)?;
                 let ds_x = ds_x.gelu()?;
-                let ds_x = ds_x.matmul(&ds_fc2_w.t()?)?.broadcast_add(ds_fc2_b)?;
+                let ds_x = matmul_3d_2d(&ds_x, &ds_fc2_w.t()?)?.broadcast_add(ds_fc2_b)?;
 
                 deepstack_outputs.push(ds_x);
             }
@@ -288,9 +288,9 @@ impl VisionEncoder {
         let mm_2_b = self.weights.get("projector.2.bias")
             .ok_or_else(|| anyhow!("projector.2.bias not found"))?;
 
-        let proj = merged.matmul(&mm_0_w.t()?)?.broadcast_add(mm_0_b)?;
+        let proj = matmul_3d_2d(&merged, &mm_0_w.t()?)?.broadcast_add(mm_0_b)?;
         let proj = proj.gelu()?;
-        let proj = proj.matmul(&mm_2_w.t()?)?.broadcast_add(mm_2_b)?;
+        let proj = matmul_3d_2d(&proj, &mm_2_w.t()?)?.broadcast_add(mm_2_b)?;
 
         if !deepstack_outputs.is_empty() {
             let mut all_tensors = vec![proj];
@@ -494,3 +494,8 @@ pub fn load_image(path: &Path, image_size: usize, device: &Device) -> Result<Ten
     let t = Tensor::from_vec(data, (1, 3, image_size, image_size), device)?;
     Ok(t)
 }
+
+fn matmul_3d_2d(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+    Ok(lhs.contiguous()?.matmul(&rhs.unsqueeze(0)?.contiguous()?)?)
+}
+

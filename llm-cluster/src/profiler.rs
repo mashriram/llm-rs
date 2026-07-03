@@ -21,8 +21,8 @@ pub fn profile_node() -> Result<NodeCapability> {
 
     // 2. Estimate CPU GFLOPS via a dummy matrix multiplication benchmark
     let n = 256;
-    let mut a = vec![1.0f32; n * n];
-    let mut b = vec![2.0f32; n * n];
+    let a = vec![1.0f32; n * n];
+    let b = vec![2.0f32; n * n];
     let mut c = vec![0.0f32; n * n];
 
     let start = Instant::now();

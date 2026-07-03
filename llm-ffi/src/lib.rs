@@ -1,6 +1,5 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::sync::Arc;
 use libc::c_void;
 
 use llm_core::backends::candle::CandleBackend;

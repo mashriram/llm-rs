@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use clap::{Parser, Subcommand};
 use tokio::time::sleep;
-use tracing::{info, error};
+use tracing::info;
 
 use profiler::{profile_node, NodeCapability};
 use recovery::ClusterHealthMonitor;

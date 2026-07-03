@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use anyhow::Result;
-use tracing::{warn, info};
+use tracing::warn;
 
 pub struct ClusterHealthMonitor {
     heartbeats: HashMap<String, Instant>,

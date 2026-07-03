@@ -401,8 +401,13 @@ pub fn build_graph(meta: &ModelMeta, group: &TensorGroupMap) -> ComputeGraph {
     });
 
     // 4. LM Head
+    // For tied embeddings, the lm_head uses the same matrix as embed_tokens but we register
+    // a separate "lm_head.weight" entry (CUDA QMatMul) to avoid CPU→GPU transfer every decode step.
+    // For non-tied models, use the explicit lm_head weight if present, else fall back to embed_weight.
     let lm_head_w = if meta.tie_word_embeddings {
-        embed_weight
+        // "lm_head.weight" is loaded onto CUDA as a QMatMul in candle.rs for tied-embedding models.
+        // If it doesn't exist (e.g. explicit_dequantize mode), fall back to embed_weight.
+        "lm_head.weight".to_string()
     } else {
         group.lm_head.clone().unwrap_or(embed_weight)
     };

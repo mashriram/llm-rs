@@ -55,6 +55,12 @@ pub struct ModelMeta {
     pub is_gemma: bool,
     pub ple_dim: Option<usize>,
     pub embed_scale: Option<f32>,
+    /// GGUF general.architecture value (e.g. "gemma4", "qwen3vl", "smollm3")
+    pub arch: String,
+    /// Raw Jinja2 chat template string from tokenizer.chat_template GGUF metadata
+    pub chat_template: Option<String>,
+    /// EOS token string (e.g. "<|im_end|>", "<end_of_turn>")
+    pub eos_token_str: Option<String>,
 }
 
 impl ModelMeta {

@@ -164,5 +164,8 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
         is_gemma,
         ple_dim,
         embed_scale,
+        arch: model_type.to_string(),
+        chat_template: None,  // Will be populated from tokenizer_config.json in candle.rs
+        eos_token_str: if is_gemma { Some("<end_of_turn>".to_string()) } else { None },
     })
 }

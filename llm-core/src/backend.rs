@@ -37,6 +37,12 @@ pub trait LlmBackend: Send + Sync {
     fn eos_token_id(&self) -> u32 {
         2
     }
+
+    /// Set whether the backend should explicitly dequantize weights to F16.
+    fn set_explicit_dequantize(&mut self, _val: bool) {}
+
+    /// Set whether the backend should load embedding tables directly into VRAM.
+    fn set_use_vram_embeddings(&mut self, _val: bool) {}
 }
 
 /// A reusable DummyBackend for testing.
@@ -88,6 +94,9 @@ impl DummyBackend {
                 is_gemma: false,
                 ple_dim: None,
                 embed_scale: None,
+                arch: "llama".to_string(),
+                chat_template: None,
+                eos_token_str: None,
             }
         }
     }

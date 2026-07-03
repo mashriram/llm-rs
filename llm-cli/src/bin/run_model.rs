@@ -26,6 +26,12 @@ struct Args {
 
     #[arg(long, default_value_t = 1.0)]
     repetition_penalty: f32,
+
+    #[arg(long, default_value_t = false)]
+    explicit_dequantize: bool,
+
+    #[arg(long, default_value_t = false)]
+    use_vram_embeddings: bool,
 }
 
 #[tokio::main]
@@ -38,6 +44,12 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Loading model from {}...", args.model_path);
     let mut backend = Box::new(CandleBackend::new());
+    if args.explicit_dequantize {
+        backend.set_explicit_dequantize(true);
+    }
+    if args.use_vram_embeddings {
+        backend.set_use_vram_embeddings(true);
+    }
     let start_load = Instant::now();
     let meta = backend.load_weights(std::path::Path::new(&args.model_path))?;
     println!(

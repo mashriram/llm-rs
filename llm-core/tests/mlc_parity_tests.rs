@@ -64,6 +64,9 @@ fn test_loader_parity() {
         is_gemma: false,
         ple_dim: None,
         embed_scale: None,
+        arch: "llama".to_string(),
+        chat_template: None,
+        eos_token_str: None,
     };
 
     assert_eq!(meta.vocab_size, 32000);

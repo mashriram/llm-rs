@@ -66,6 +66,9 @@ impl DummyBackend {
                 is_gemma: false,
                 ple_dim: None,
                 embed_scale: None,
+                arch: "dummy".to_string(),
+                chat_template: None,
+                eos_token_str: None,
             }
         }
     }
@@ -290,6 +293,9 @@ fn test_graph_builder_softcap() {
         is_gemma: false,
         ple_dim: None,
         embed_scale: None,
+        arch: "llama".to_string(),
+        chat_template: None,
+        eos_token_str: None,
     };
 
     let group = TensorGroupMap {
@@ -368,6 +374,9 @@ fn test_graph_builder_gemma4_ple() {
         is_gemma: true,
         ple_dim: Some(256),
         embed_scale: Some(39.191835),
+        arch: "gemma4".to_string(),
+        chat_template: None,
+        eos_token_str: None,
     };
 
     let layers = vec![
@@ -545,6 +554,9 @@ fn test_llama2_group_quantization() {
         is_gemma: false,
         ple_dim: None,
         embed_scale: None,
+        arch: "llama".to_string(),
+        chat_template: None,
+        eos_token_str: None,
     };
     assert!(matches!(meta.weight_dtype, WeightDtype::Q4_K));
 }
@@ -586,6 +598,9 @@ fn test_llama2_no_quantization() {
         is_gemma: false,
         ple_dim: None,
         embed_scale: None,
+        arch: "llama".to_string(),
+        chat_template: None,
+        eos_token_str: None,
     };
     assert!(matches!(meta.weight_dtype, WeightDtype::F16));
 }

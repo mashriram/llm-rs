@@ -47,6 +47,9 @@ impl LlmBackend for MockBackend {
             is_gemma: false,
             ple_dim: None,
             embed_scale: None,
+            arch: "mock".to_string(),
+            chat_template: None,
+            eos_token_str: None,
         })
     }
 

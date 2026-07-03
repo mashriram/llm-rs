@@ -2,7 +2,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::collections::HashMap;
 use anyhow::{Result, anyhow, Context};
-use candle_core::{Device, Tensor, DType};
+use candle_core::{Device, Tensor, DType, Module};
+use candle_core::quantized::QMatMul;
 
 fn print_stats(name: &str, t: &Tensor) -> Result<()> {
     let t_f32 = t.to_dtype(DType::F32)?;
@@ -337,11 +338,18 @@ pub struct CandleBackend {
     device: Device,
     vision_encoder: Option<VisionEncoder>,
     visual_embeddings: Mutex<Option<Tensor>>,
+    last_image_path: Mutex<Option<String>>,
+    last_pixel_values: Mutex<Option<Tensor>>,
     gpu_kv_cache: Mutex<HashMap<(usize, SeqId), (Tensor, Tensor)>>,
+    explicit_dequantize: bool,
+    use_vram_embeddings: bool,
+    qmatmul_cache: std::sync::Mutex<HashMap<String, QMatMul>>,
 }
 
 impl CandleBackend {
     pub fn new() -> Self {
+        let explicit_dequantize = std::env::var("LLM_EXPLICIT_DEQUANTIZE").is_ok();
+        let use_vram_embeddings = std::env::var("LLM_USE_VRAM_EMBEDDINGS").is_ok();
         Self {
             weights: HashMap::new(),
             quantized_weights: HashMap::new(),
@@ -362,7 +370,12 @@ impl CandleBackend {
             device: Device::Cpu,
             vision_encoder: None,
             visual_embeddings: Mutex::new(None),
+            last_image_path: Mutex::new(None),
+            last_pixel_values: Mutex::new(None),
             gpu_kv_cache: Mutex::new(HashMap::new()),
+            explicit_dequantize,
+            use_vram_embeddings,
+            qmatmul_cache: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -380,8 +393,24 @@ impl CandleBackend {
         if let Some(t) = local_cache.get(name) {
             return Ok(t.clone());
         }
+        // 2b. Already in deq_cache (e.g. eagerly dequantized non-matmul weights on startup)
+        if let Ok(cache) = self.deq_cache.lock() {
+            if let Some(t) = cache.get(name) {
+                local_cache.insert(name.to_string(), t.clone());
+                return Ok(t.clone());
+            }
+        }
         // 3. Dequantize from QTensor (done only ONCE per weight name if cached, or on-the-fly if not)
         if let Some(qt) = self.quantized_weights.get(name) {
+            if !self.explicit_dequantize {
+                let t = qt.dequantize(&self.device)
+                    .with_context(|| format!("dequantize {} to {:?}", name, self.device))?;
+                let t = t.to_dtype(DType::F16)?;
+                let mut cache = self.deq_cache.lock().map_err(|_| anyhow!("deq_cache poisoned"))?;
+                cache.insert(name.to_string(), t.clone());
+                local_cache.insert(name.to_string(), t.clone());
+                return Ok(t);
+            }
             let tensor_bytes = qt.shape().elem_count() as u64 * 2; // F16 = 2 bytes
 
             let mut cache = self.deq_cache.lock().map_err(|_| anyhow!("deq_cache poisoned"))?;
@@ -403,6 +432,22 @@ impl CandleBackend {
                 cache.insert(name.to_string(), t.clone());
                 local_cache.insert(name.to_string(), t.clone());
                 return Ok(t);
+            }
+        }
+        // Fallback: lm_head.weight alias → use model.embed_tokens.weight (for explicit_dequantize or safetensors paths)
+        if name == "lm_head.weight" {
+            let embed_name = "model.embed_tokens.weight";
+            if let Some(t) = self.weights.get(embed_name) {
+                let t = t.to_device(&self.device)?;
+                local_cache.insert(name.to_string(), t.clone());
+                return Ok(t);
+            }
+            if let Ok(cache) = self.deq_cache.lock() {
+                if let Some(t) = cache.get(embed_name) {
+                    let t = t.to_device(&self.device)?;
+                    local_cache.insert(name.to_string(), t.clone());
+                    return Ok(t);
+                }
             }
         }
         Err(anyhow!("Weight not found: {}", name))
@@ -523,16 +568,25 @@ impl LlmBackend for CandleBackend {
         }
     }
 
+    fn set_explicit_dequantize(&mut self, val: bool) {
+        self.explicit_dequantize = val;
+    }
+
+    fn set_use_vram_embeddings(&mut self, val: bool) {
+        self.use_vram_embeddings = val;
+    }
+
     fn load_weights(&mut self, path: &Path) -> Result<ModelMeta> {
         let is_gguf = path.is_file() && path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_lowercase() == "gguf").unwrap_or(false);
 
-        // Always try CUDA first; GGUF weights stay quantized on CPU.
-        // For safetensors, we load to CPU first and move to GPU layer by layer.
+        // Auto-detect hardware accelerator: CUDA first, then Metal, falling back to CPU
         let dev = if candle_core::utils::cuda_is_available() {
             Device::new_cuda(0).unwrap_or_else(|e| {
                 tracing::warn!("CUDA init failed ({e}), falling back to CPU");
                 Device::Cpu
             })
+        } else if let Ok(metal_dev) = Device::new_metal(0) {
+            metal_dev
         } else {
             Device::Cpu
         };
@@ -560,6 +614,59 @@ impl LlmBackend for CandleBackend {
                 .context(format!("Failed to open GGUF file: {:?}", path))?;
             let model = candle_core::quantized::gguf_file::Content::read(&mut file)
                 .context("Failed to read GGUF content")?;
+
+            // Discover and load mmproj metadata if a matching mmproj file exists
+            let mut mmproj_metadata = HashMap::new();
+            let base = path.to_string_lossy();
+            let stem = if let Some(pos) = base.rfind('.') {
+                let without_ext = &base[..pos];
+                if let Some(q_pos) = without_ext.rfind('.') {
+                    without_ext[..q_pos].to_string()
+                } else {
+                    without_ext.to_string()
+                }
+            } else {
+                base.to_string()
+            };
+            let suffixes = [
+                "-mmproj-f16.gguf",
+                ".mmproj.gguf",
+                "-mmproj.gguf",
+                ".BF16-mmproj.gguf",
+                "-mmproj-f32.gguf",
+            ];
+            let mut mmproj_path = None;
+            for suffix in &suffixes {
+                let candidate = format!("{}{}", stem, suffix);
+                if std::path::Path::new(&candidate).exists() {
+                    mmproj_path = Some(std::path::PathBuf::from(candidate));
+                    break;
+                }
+            }
+            if mmproj_path.is_none() {
+                if let Some(parent) = path.parent() {
+                    if let Ok(entries) = std::fs::read_dir(parent) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_file() {
+                                let name = p.file_name().unwrap_or_default().to_string_lossy();
+                                if name.contains("mmproj") && name.ends_with(".gguf") {
+                                    mmproj_path = Some(p);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(ref mp_path) = mmproj_path {
+                tracing::info!("Discovered mmproj file at {:?}; loading its metadata...", mp_path);
+                if let Ok(mut mp_file) = std::fs::File::open(mp_path) {
+                    if let Ok(mp_model) = candle_core::quantized::gguf_file::Content::read(&mut mp_file) {
+                        mmproj_metadata = mp_model.metadata;
+                    }
+                }
+            }
 
             let arch = match model.metadata.get("general.architecture") {
                 Some(candle_core::quantized::gguf_file::Value::String(s)) => s.as_str(),
@@ -608,28 +715,84 @@ impl LlmBackend for CandleBackend {
                 .unwrap_or(2);
             self.eos_token_id = eos_token_id;
 
-            tracing::info!("Loading {} GGUF tensors as QTensor (lazy GPU dequantize)", model.tensor_infos.len());
-            let cpu = Device::Cpu;
+            tracing::info!("Loading {} GGUF tensors as QTensor", model.tensor_infos.len());
+            let tie_word_embeddings = arch == "gemma" || arch == "gemma2" || arch == "gemma4"; // pre-check, refined below
+            let mut remaining_vram_budget = self.gpu_cache_budget;
             for name in model.tensor_infos.keys() {
-                let qt = model.tensor(&mut file, name, &cpu)
+                let name_lower = name.to_lowercase();
+                let is_token_embd = name == "token_embd.weight";
+                let is_non_matmul = name_lower.contains("embed") 
+                    || name_lower.contains("embd")
+                    || name_lower.contains("norm") 
+                    || name_lower.contains("bias") 
+                    || name_lower.contains("scale")
+                    || name_lower.contains("freq")
+                    || name_lower.contains("rotors")
+                    || name_lower.contains("rot");
+                let mut fit_in_vram = false;
+                if is_non_matmul && !name_lower.contains("freq") && !name_lower.contains("rot") && self.device.is_cuda() {
+                    if let Some(info) = model.tensor_infos.get(name) {
+                        let size_bytes = (info.shape.dims().iter().product::<usize>() as u64) * 2;
+                        if remaining_vram_budget >= size_bytes {
+                            remaining_vram_budget -= size_bytes;
+                            fit_in_vram = true;
+                        }
+                    }
+                }
+                let load_device = if self.explicit_dequantize {
+                    Device::Cpu
+                } else if is_non_matmul {
+                    if fit_in_vram || self.use_vram_embeddings {
+                        self.device.clone()
+                    } else {
+                        Device::Cpu
+                    }
+                } else {
+                    self.device.clone()
+                };
+                let qt = model.tensor(&mut file, name, &load_device)
                     .with_context(|| format!("Failed to read tensor {}", name))?;
                 let hf_name = map_gguf_name(name);
                 quantized_weights.insert(hf_name, qt);
+
+                // For tied-embedding architectures (Gemma), also load the token embedding on CUDA
+                // so the lm_head MatMul can use it as a QMatMul without CPU→GPU copy every decode step.
+                if is_token_embd && tie_word_embeddings && !self.explicit_dequantize {
+                    if let Ok(qt_cuda) = model.tensor(&mut file, name, &self.device) {
+                        quantized_weights.insert("lm_head.weight".to_string(), qt_cuda);
+                    }
+                }
             }
 
-            let has_vision_encoder = match model.metadata.get("clip.has_vision_encoder") {
+            let has_vision_encoder = match model.metadata.get("clip.has_vision_encoder")
+                .or_else(|| mmproj_metadata.get("clip.has_vision_encoder")) {
                 Some(candle_core::quantized::gguf_file::Value::Bool(b)) => *b,
                 _ => false,
             };
-            let vision_hidden_dim = Self::get_metadata_u32(&model.metadata, "clip.vision.embedding_length").map(|v| v as usize);
-            let vision_patch_size = Self::get_metadata_u32(&model.metadata, "clip.vision.patch_size").map(|v| v as usize);
-            let vision_image_size = Self::get_metadata_u32(&model.metadata, "clip.vision.image_size").map(|v| v as usize);
-            let vision_num_layers = Self::get_metadata_u32(&model.metadata, "clip.vision.block_count").map(|v| v as usize);
-            let vision_num_heads = Self::get_metadata_u32(&model.metadata, "clip.vision.attention.head_count").map(|v| v as usize);
-            let vision_projection_dim = Self::get_metadata_u32(&model.metadata, "clip.vision.projection_dim").map(|v| v as usize);
-            let spatial_merge_size = Self::get_metadata_u32(&model.metadata, "clip.vision.spatial_merge_size").map(|v| v as usize);
+            let vision_hidden_dim = Self::get_metadata_u32(&model.metadata, "clip.vision.embedding_length")
+                .or_else(|| Self::get_metadata_u32(&mmproj_metadata, "clip.vision.embedding_length"))
+                .map(|v| v as usize);
+            let vision_patch_size = Self::get_metadata_u32(&model.metadata, "clip.vision.patch_size")
+                .or_else(|| Self::get_metadata_u32(&mmproj_metadata, "clip.vision.patch_size"))
+                .map(|v| v as usize);
+            let vision_image_size = Self::get_metadata_u32(&model.metadata, "clip.vision.image_size")
+                .or_else(|| Self::get_metadata_u32(&mmproj_metadata, "clip.vision.image_size"))
+                .map(|v| v as usize);
+            let vision_num_layers = Self::get_metadata_u32(&model.metadata, "clip.vision.block_count")
+                .or_else(|| Self::get_metadata_u32(&mmproj_metadata, "clip.vision.block_count"))
+                .map(|v| v as usize);
+            let vision_num_heads = Self::get_metadata_u32(&model.metadata, "clip.vision.attention.head_count")
+                .or_else(|| Self::get_metadata_u32(&mmproj_metadata, "clip.vision.attention.head_count"))
+                .map(|v| v as usize);
+            let vision_projection_dim = Self::get_metadata_u32(&model.metadata, "clip.vision.projection_dim")
+                .or_else(|| Self::get_metadata_u32(&mmproj_metadata, "clip.vision.projection_dim"))
+                .map(|v| v as usize);
+            let spatial_merge_size = Self::get_metadata_u32(&model.metadata, "clip.vision.spatial_merge_size")
+                .or_else(|| Self::get_metadata_u32(&mmproj_metadata, "clip.vision.spatial_merge_size"))
+                .map(|v| v as usize);
 
-            let is_deepstack_layers = match model.metadata.get("clip.vision.is_deepstack_layers") {
+            let is_deepstack_layers = match model.metadata.get("clip.vision.is_deepstack_layers")
+                .or_else(|| mmproj_metadata.get("clip.vision.is_deepstack_layers")) {
                 Some(candle_core::quantized::gguf_file::Value::Array(arr)) => {
                     Some(arr.iter().map(|v| match v {
                         candle_core::quantized::gguf_file::Value::Bool(b) => *b,
@@ -639,7 +802,8 @@ impl LlmBackend for CandleBackend {
                 _ => None,
             };
 
-            let projector_type = match model.metadata.get("clip.projector_type") {
+            let projector_type = match model.metadata.get("clip.projector_type")
+                .or_else(|| mmproj_metadata.get("clip.projector_type")) {
                 Some(candle_core::quantized::gguf_file::Value::String(s)) => Some(s.clone()),
                 _ => None,
             };
@@ -686,6 +850,28 @@ impl LlmBackend for CandleBackend {
                 None
             };
 
+            // Model-agnostic chat template - loaded directly from GGUF metadata
+            let chat_template = match model.metadata.get("tokenizer.chat_template") {
+                Some(candle_core::quantized::gguf_file::Value::String(s)) => Some(s.clone()),
+                _ => None,
+            };
+
+            // EOS token string for chat formatting (e.g. "<|im_end|>" or "<end_of_turn>")
+            let eos_token_str = if is_gemma {
+                Some("<end_of_turn>".to_string())
+            } else {
+                // Try to infer from chat_template
+                chat_template.as_deref().and_then(|t| {
+                    if t.contains("<|im_end|>") {
+                        Some("<|im_end|>".to_string())
+                    } else if t.contains("</s>") {
+                        Some("</s>".to_string())
+                    } else {
+                        None
+                    }
+                })
+            };
+
             ModelMeta {
                 vocab_size,
                 hidden_dim,
@@ -721,6 +907,9 @@ impl LlmBackend for CandleBackend {
                 is_gemma,
                 ple_dim,
                 embed_scale,
+                arch: arch.to_string(),
+                chat_template,
+                eos_token_str,
             }
         } else {
             let config_path = path.join("config.json");
@@ -809,6 +998,21 @@ impl LlmBackend for CandleBackend {
             }
 
             meta.weight_dtype = WeightDtype::F16;
+            // Defaults for safetensors path - try to read tokenizer_config.json for chat_template
+            if meta.arch.is_empty() {
+                meta.arch = "unknown".to_string();
+            }
+            if meta.chat_template.is_none() {
+                // Try to load chat_template from tokenizer_config.json alongside model
+                let tc_path = path.join("tokenizer_config.json");
+                if let Ok(tc_content) = std::fs::read_to_string(&tc_path) {
+                    if let Ok(tc_json) = serde_json::from_str::<serde_json::Value>(&tc_content) {
+                        if let Some(tmpl) = tc_json.get("chat_template").and_then(|v| v.as_str()) {
+                            meta.chat_template = Some(tmpl.to_string());
+                        }
+                    }
+                }
+            }
             meta
         };
 
@@ -847,64 +1051,149 @@ impl LlmBackend for CandleBackend {
 
         // Eagerly pre-dequantize all weights in parallel/sequence into deq_cache to eliminate TTFT latency
         if !self.quantized_weights.is_empty() {
-            println!("Eagerly dequantizing and caching {} GGUF weights...", self.quantized_weights.len());
-            let mut local_cache = HashMap::new();
-            let mut simulated_used = 0u64;
-            
-            // Sort weight names layer-wise to prioritize caching the earlier layers
-            let mut names: Vec<String> = self.quantized_weights.keys().cloned().collect();
-            names.sort_by(|a, b| {
-                let get_layer = |name: &str| -> usize {
-                    if name.starts_with("model.layers.") {
-                        let remain = &name["model.layers.".len()..];
-                        if let Some(pos) = remain.find('.') {
-                            if let Ok(idx) = remain[..pos].parse::<usize>() {
-                                return idx;
+            if self.explicit_dequantize {
+                println!("Eagerly dequantizing and caching {} GGUF weights...", self.quantized_weights.len());
+                let mut local_cache = HashMap::new();
+                let mut simulated_used = 0u64;
+                
+                // Sort weight names layer-wise to prioritize caching the earlier layers
+                let mut names: Vec<String> = self.quantized_weights.keys().cloned().collect();
+                names.sort_by(|a, b| {
+                    let get_layer = |name: &str| -> usize {
+                        if name.starts_with("model.layers.") {
+                            let remain = &name["model.layers.".len()..];
+                            if let Some(pos) = remain.find('.') {
+                                if let Ok(idx) = remain[..pos].parse::<usize>() {
+                                    return idx;
+                                }
                             }
                         }
-                    }
-                    if name == "model.embed_tokens.weight" {
-                        0
-                    } else {
-                        999 // put other weights (like lm_head or output norm) last
-                    }
-                };
-                get_layer(a).cmp(&get_layer(b))
-            });
+                        if name == "model.embed_tokens.weight" {
+                            0
+                        } else {
+                            999 // put other weights (like lm_head or output norm) last
+                        }
+                    };
+                    get_layer(a).cmp(&get_layer(b))
+                });
 
-            for name in &names {
-                if let Some(qt) = self.quantized_weights.get(name) {
-                    let tensor_bytes = qt.shape().elem_count() as u64 * 2;
-                    if simulated_used + tensor_bytes <= self.gpu_cache_budget {
-                        simulated_used += tensor_bytes;
-                        if let Err(e) = self.get_weight(name, &mut local_cache) {
-                            println!("Warning: Eager dequantize failed for {}: {:?}", name, e);
-                            // Fallback to CPU dequantize if GPU fails
+                for name in &names {
+                    if let Some(qt) = self.quantized_weights.get(name) {
+                        let tensor_bytes = qt.shape().elem_count() as u64 * 2;
+                        if simulated_used + tensor_bytes <= self.gpu_cache_budget {
+                            simulated_used += tensor_bytes;
+                            if let Err(e) = self.get_weight(name, &mut local_cache) {
+                                println!("Warning: Eager dequantize failed for {}: {:?}", name, e);
+                                // Fallback to CPU dequantize if GPU fails
+                                if let Ok(t) = qt.dequantize(&Device::Cpu) {
+                                    if let Ok(t) = t.to_dtype(DType::F16) {
+                                        local_cache.insert(name.clone(), t);
+                                    }
+                                }
+                            }
+                        } else {
+                            // Dequantize to CPU directly for offloaded weights (never touch GPU)
                             if let Ok(t) = qt.dequantize(&Device::Cpu) {
                                 if let Ok(t) = t.to_dtype(DType::F16) {
                                     local_cache.insert(name.clone(), t);
                                 }
+                            } else {
+                                println!("Warning: Eager CPU dequantize failed for {}", name);
                             }
-                        }
-                    } else {
-                        // Dequantize to CPU directly for offloaded weights (never touch GPU)
-                        if let Ok(t) = qt.dequantize(&Device::Cpu) {
-                            if let Ok(t) = t.to_dtype(DType::F16) {
-                                local_cache.insert(name.clone(), t);
-                            }
-                        } else {
-                            println!("Warning: Eager CPU dequantize failed for {}", name);
                         }
                     }
                 }
+                println!("Eager dequantization loop done. local_cache len: {}. model.embed_tokens.weight cached: {}", local_cache.len(), local_cache.contains_key("model.embed_tokens.weight"));
+                // Now transfer all local_cache entries to the Mutex deq_cache
+                if let Ok(mut cache) = self.deq_cache.lock() {
+                    *cache = local_cache.clone();
+                }
+                
+                let mut gpu_count = 0;
+                let mut gpu_bytes = 0u64;
+                let mut cpu_count = 0;
+                let mut cpu_bytes = 0u64;
+
+                for tensor in local_cache.values() {
+                    let bytes = tensor.shape().elem_count() as u64 * 2; // F16 = 2 bytes
+                    if tensor.device().is_cuda() {
+                        gpu_count += 1;
+                        gpu_bytes += bytes;
+                    } else {
+                        cpu_count += 1;
+                        cpu_bytes += bytes;
+                    }
+                }
+
+                println!("Eager dequantization finished.");
+                println!("  - GPU (CUDA): {} weights ({:.2} GB / {:.2} MB)", gpu_count, gpu_bytes as f64 / 1e9, gpu_bytes as f64 / (1024.0 * 1024.0));
+                println!("  - CPU (Offloaded): {} weights ({:.2} GB / {:.2} MB)", cpu_count, cpu_bytes as f64 / 1e9, cpu_bytes as f64 / (1024.0 * 1024.0));
+                if cpu_count > 0 {
+                    println!("Note: Model is not fully loadable on CUDA. Offloaded {:.1}% of weights to CPU.", (cpu_count as f64 / (gpu_count + cpu_count) as f64) * 100.0);
+                } else {
+                    println!("Success: Model is fully loaded on CUDA.");
+                }
+            } else {
+                println!("Eagerly caching quantized weights and dequantizing embedding/norm weights...");
+                let mut local_deq = HashMap::new();
+                let mut local_qmatmul = HashMap::new();
+                
+                let keys: Vec<String> = self.quantized_weights.keys().cloned().collect();
+                for name in keys {
+                    if let Some(qt) = self.quantized_weights.remove(&name) {
+                        let name_lower = name.to_lowercase();
+                        let is_embedding = name_lower.contains("embed") || name_lower.contains("embd");
+                        let is_non_matmul = is_embedding
+                            || name_lower.contains("norm") 
+                            || name_lower.contains("bias") 
+                            || name_lower.contains("scale")
+                            || name_lower.contains("freq")
+                            || name_lower.contains("rotors")
+                            || name_lower.contains("rot");
+
+                        if is_non_matmul {
+                            let target_dev = qt.device().clone();
+                            match qt.dequantize(&target_dev) {
+                                Ok(t) => {
+                                    match t.to_dtype(DType::F16) {
+                                        Ok(t_f16) => {
+                                            local_deq.insert(name.clone(), t_f16.clone());
+                                        }
+                                        Err(e) => {
+                                            println!("Error: Failed to cast dequantized tensor {} to F16: {:?}", name, e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("Error: Failed to dequantize tensor {} on CPU: {:?}", name, e);
+                                }
+                            }
+                        } else {
+                            // qt is already loaded on self.device, directly initialize QMatMul
+                            match QMatMul::from_qtensor(qt) {
+                                Ok(qmatmul) => {
+                                    local_qmatmul.insert(name.clone(), qmatmul);
+                                }
+                                Err(e) => {
+                                    println!("Warning: QMatMul::from_qtensor failed for {}: {:?}", name, e);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Ok(mut cache) = self.deq_cache.lock() {
+                    *cache = local_deq;
+                }
+                if let Ok(mut cache) = self.qmatmul_cache.lock() {
+                    *cache = local_qmatmul;
+                }
+                let gpu_deq_bytes = self.deq_cache.lock().unwrap().values().map(|t| t.shape().elem_count() as u64 * 2).sum::<u64>();
+                println!("Quantized weight loading finished.");
+                println!("  - Cached standard GPU/device tensors (embed/norm): {} weights ({:.2} MB)", 
+                         self.deq_cache.lock().unwrap().len(), 
+                         gpu_deq_bytes as f64 / (1024.0 * 1024.0));
+                println!("  - Cached QMatMul layers: {} weights", self.qmatmul_cache.lock().unwrap().len());
             }
-            println!("Eager dequantization loop done. local_cache len: {}. model.embed_tokens.weight cached: {}", local_cache.len(), local_cache.contains_key("model.embed_tokens.weight"));
-            // Now transfer all local_cache entries to the Mutex deq_cache
-            if let Ok(mut cache) = self.deq_cache.lock() {
-                *cache = local_cache;
-            }
-            let cached_gpu = self.gpu_cache_bytes.load(std::sync::atomic::Ordering::Relaxed) as f64 / (1024.0 * 1024.0 * 1024.0);
-            println!("Eager dequantization finished. Cached GPU weights: {:.2} GB", cached_gpu);
         }
 
         if meta.has_vision_encoder {
@@ -999,8 +1288,32 @@ impl LlmBackend for CandleBackend {
 
         // Feed pixel_values if vision encoder is present
         if meta.has_vision_encoder {
-            // Retrieve pixel values. We will supply them through a dummy tensor if not preloaded.
-            let pixel_val = Tensor::zeros((1, 3, 224, 224), DType::F16, &dev)?;
+            let img_size = self.vision_encoder.as_ref().map(|e| e.image_size).unwrap_or(768);
+            let active_path = crate::backends::ACTIVE_IMAGE_PATH.lock().unwrap().clone();
+            let mut cache = self.last_pixel_values.lock().unwrap();
+            let mut last_path = self.last_image_path.lock().unwrap();
+            let needs_load = match (&active_path, &*last_path, &*cache) {
+                (Some(curr), Some(prev), Some(_)) if curr == prev => false,
+                _ => true,
+            };
+            let pixel_val = if needs_load {
+                let loaded = if let Some(ref path_str) = active_path {
+                    match crate::backends::vision::load_image(Path::new(path_str), img_size, &dev) {
+                        Ok(t) => t.to_dtype(DType::F16)?,
+                        Err(e) => {
+                            tracing::warn!("Failed to load image from {path_str}: {e}, using zeros");
+                            Tensor::zeros((1, 3, img_size, img_size), DType::F16, &dev)?
+                        }
+                    }
+                } else {
+                    Tensor::zeros((1, 3, img_size, img_size), DType::F16, &dev)?
+                };
+                *cache = Some(loaded.clone());
+                *last_path = active_path.clone();
+                loaded
+            } else {
+                cache.as_ref().unwrap().clone()
+            };
             ctx.insert("pixel_values".to_string(), pixel_val);
         }
 
@@ -1056,31 +1369,44 @@ impl LlmBackend for CandleBackend {
                     let in_t = ctx.get(input)?;
                     let w_t = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
                     let is_gemma = self.meta.as_ref().map(|m| m.is_gemma).unwrap_or(false);
-                    let is_gemma_hf = is_gemma && self.quantized_weights.is_empty();
+                    let is_gemma_hf = is_gemma && !self.weights.is_empty();
                     let out = RmsNorm::new(w_t, *eps as f64, is_gemma_hf).forward(&in_t)?;
                     ctx.insert(output.clone(), out);
                 }
                 Operator::MatMul { input, weight, bias, output } => {
                     let in_t = ctx.get(input)?;
-                    let w_t = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
-
-                    // Auto-transpose: weight stored row-major [out_features, in_features]
-                    let last_dim = in_t.dim(in_t.rank() - 1)?;
-                    let w_t_final = if w_t.rank() == 2 && last_dim == w_t.dim(1)? {
-                        w_t.transpose(0, 1)?
+                    let qmatmul_opt = if self.explicit_dequantize {
+                        None
                     } else {
-                        w_t
+                        let cache = self.qmatmul_cache.lock().map_err(|_| anyhow!("qmatmul_cache poisoned"))?;
+                        cache.get(weight).cloned()
                     };
 
-                    let rank_in = in_t.rank();
-                    let out = if rank_in == 3 {
-                        let (b, m, k) = in_t.dims3()?;
-                        let in_t_2d = in_t.reshape((b * m, k))?;
-                        let res_2d = in_t_2d.matmul(&w_t_final)?;
-                        let n = res_2d.dim(1)?;
-                        res_2d.reshape((b, m, n))?
+                    let out = if let Some(qmatmul) = qmatmul_opt {
+                        let in_t_f32 = in_t.to_dtype(DType::F32)?;
+                        let out_f32 = qmatmul.forward(&in_t_f32)?;
+                        out_f32.to_dtype(in_t.dtype())?
                     } else {
-                        in_t.matmul(&w_t_final)?
+                        let w_t = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
+
+                        // Auto-transpose: weight stored row-major [out_features, in_features]
+                        let last_dim = in_t.dim(in_t.rank() - 1)?;
+                        let w_t_final = if w_t.rank() == 2 && last_dim == w_t.dim(1)? {
+                            w_t.transpose(0, 1)?
+                        } else {
+                            w_t
+                        };
+
+                        let rank_in = in_t.rank();
+                        if rank_in == 3 {
+                            let (b, m, k) = in_t.dims3()?;
+                            let in_t_2d = in_t.reshape((b * m, k))?;
+                            let res_2d = in_t_2d.matmul(&w_t_final)?;
+                            let n = res_2d.dim(1)?;
+                            res_2d.reshape((b, m, n))?
+                        } else {
+                            in_t.matmul(&w_t_final)?
+                        }
                     };
 
                     let mut out = out;
@@ -1088,6 +1414,7 @@ impl LlmBackend for CandleBackend {
                         let b_t = self.get_weight(bias_name, &mut local_cache)?.to_device(in_t.device())?;
                         out = out.broadcast_add(&b_t)?;
                     }
+
                     ctx.insert(output.clone(), out);
                 }
                 Operator::Rope { q, k, output_q, output_k, layer_idx, rope_theta } => {
@@ -1266,9 +1593,23 @@ impl LlmBackend for CandleBackend {
                     ctx.insert(output.clone(), lhs_t.broadcast_add(&rhs_t)?);
                 }
                 Operator::VisualEmbed { pixel_values, output } => {
-                    let p_val = ctx.get(pixel_values)?;
+                    let active_path = crate::backends::ACTIVE_IMAGE_PATH.lock().unwrap().clone();
                     let out = if let Some(ref enc) = self.vision_encoder {
-                        enc.encode(&p_val)?
+                        let mut cache = self.visual_embeddings.lock().unwrap();
+                        let mut last_path = self.last_image_path.lock().unwrap();
+                        let needs_encode = match (&active_path, &*last_path, &*cache) {
+                            (Some(curr), Some(prev), Some(_)) if curr == prev => false,
+                            _ => true,
+                        };
+                        if needs_encode {
+                            let p_val = ctx.get(pixel_values)?;
+                            let encoded = enc.encode(&p_val)?;
+                            *cache = Some(encoded.clone());
+                            *last_path = active_path.clone();
+                            encoded
+                        } else {
+                            cache.as_ref().unwrap().clone()
+                        }
                     } else if let Some(ref preloaded) = *self.visual_embeddings.lock().unwrap() {
                         preloaded.clone()
                     } else {
@@ -1279,8 +1620,13 @@ impl LlmBackend for CandleBackend {
                 Operator::SpliceTensors { text_embeds, visual_embeds, output } => {
                     let t_emb = ctx.get(text_embeds)?;
                     let v_emb = ctx.get(visual_embeds)?;
+                    let v_emb_narrowed = if v_emb.dim(2)? > t_emb.dim(2)? {
+                        v_emb.narrow(2, 0, t_emb.dim(2)?)?
+                    } else {
+                        v_emb.clone()
+                    };
                     let token_ids = &batch.token_ids;
-                    let out = splice_visual_embeddings(&t_emb, &v_emb, token_ids, 151652, 151653)?;
+                    let out = splice_visual_embeddings(&t_emb, &v_emb_narrowed, token_ids, 151652, 151653)?;
                     ctx.insert(output.clone(), out);
                 }
                 Operator::DeepStackFuse { input, layer_idx, output } => {
@@ -1367,15 +1713,28 @@ impl LlmBackend for CandleBackend {
                     // Context-aware projection:
                     let text_emb = ctx.get(text_embeddings)?;
                     let text_emb_flat = text_emb.reshape((num_tokens, hidden_dim))?.contiguous()?;
-                    let model_proj_w = self.get_weight(per_layer_model_proj, &mut local_cache)?.to_device(&self.device)?;
-                    let context_proj = text_emb_flat.matmul(&model_proj_w.t()?)?;
+                    let qmatmul_opt = if self.explicit_dequantize {
+                        None
+                    } else {
+                        let cache = self.qmatmul_cache.lock().map_err(|_| anyhow!("qmatmul_cache poisoned"))?;
+                        cache.get(per_layer_model_proj).cloned()
+                    };
+
+                    let context_proj = if let Some(qmatmul) = qmatmul_opt {
+                        let text_emb_flat_f32 = text_emb_flat.to_dtype(DType::F32)?;
+                        let out_f32 = qmatmul.forward(&text_emb_flat_f32)?;
+                        out_f32.to_dtype(text_emb_flat.dtype())?
+                    } else {
+                        let model_proj_w = self.get_weight(per_layer_model_proj, &mut local_cache)?.to_device(&self.device)?;
+                        text_emb_flat.matmul(&model_proj_w.t()?)?
+                    };
                     let context_proj = (context_proj / ((hidden_dim as f64).sqrt()))?;
                     let context_proj_reshaped = context_proj.reshape((num_tokens, n_layers, ple_dim))?.contiguous()?;
 
                     // Apply RMSNorm specifically to the context projection
                     let norm_w = self.get_weight(per_layer_proj_norm, &mut local_cache)?.to_device(&self.device)?;
                     let is_gemma = self.meta.as_ref().map(|m| m.is_gemma).unwrap_or(false);
-                    let is_gemma_hf = is_gemma && self.quantized_weights.is_empty();
+                    let is_gemma_hf = is_gemma && !self.weights.is_empty();
                     let context_aware = RmsNorm::new(norm_w, 1e-6, is_gemma_hf).forward(&context_proj_reshaped)?;
 
                     print_stats("PleInput token_identity", &token_identity)?;
@@ -1406,8 +1765,21 @@ impl LlmBackend for CandleBackend {
                     let ple_in = ctx.get(per_layer_input)?;
                     let ple_slice = ple_in.narrow(1, *layer_idx, 1)?.reshape((num_tokens, ()))?.contiguous()?;
 
-                    let gate_w = self.get_weight(per_layer_input_gate, &mut local_cache)?.to_device(in_t.device())?;
-                    let gate_input = in_flat.matmul(&gate_w.t()?)?;
+                    let qmatmul_gate_opt = if self.explicit_dequantize {
+                        None
+                    } else {
+                        let cache = self.qmatmul_cache.lock().map_err(|_| anyhow!("qmatmul_cache poisoned"))?;
+                        cache.get(per_layer_input_gate).cloned()
+                    };
+
+                    let gate_input = if let Some(qmatmul) = qmatmul_gate_opt {
+                        let in_flat_f32 = in_flat.to_dtype(DType::F32)?;
+                        let out_f32 = qmatmul.forward(&in_flat_f32)?;
+                        out_f32.to_dtype(in_flat.dtype())?
+                    } else {
+                        let gate_w = self.get_weight(per_layer_input_gate, &mut local_cache)?.to_device(in_t.device())?;
+                        in_flat.matmul(&gate_w.t()?)?
+                    };
 
                     let act_fn = self.meta.as_ref().map(|m| m.hidden_act).unwrap_or(HiddenAct::SiLU);
                     let gate_active = match act_fn {
@@ -1417,12 +1789,25 @@ impl LlmBackend for CandleBackend {
 
                     let gated = gate_active.broadcast_mul(&ple_slice)?;
 
-                    let proj_w = self.get_weight(per_layer_projection, &mut local_cache)?.to_device(in_t.device())?;
-                    let proj_out = gated.matmul(&proj_w.t()?)?;
+                    let qmatmul_proj_opt = if self.explicit_dequantize {
+                        None
+                    } else {
+                        let cache = self.qmatmul_cache.lock().map_err(|_| anyhow!("qmatmul_cache poisoned"))?;
+                        cache.get(per_layer_projection).cloned()
+                    };
+
+                    let proj_out = if let Some(qmatmul) = qmatmul_proj_opt {
+                        let gated_f32 = gated.to_dtype(DType::F32)?;
+                        let out_f32 = qmatmul.forward(&gated_f32)?;
+                        out_f32.to_dtype(gated.dtype())?
+                    } else {
+                        let proj_w = self.get_weight(per_layer_projection, &mut local_cache)?.to_device(in_t.device())?;
+                        gated.matmul(&proj_w.t()?)?
+                    };
 
                     let norm_w = self.get_weight(post_per_layer_input_norm, &mut local_cache)?.to_device(in_t.device())?;
                     let is_gemma = self.meta.as_ref().map(|m| m.is_gemma).unwrap_or(false);
-                    let is_gemma_hf = is_gemma && self.quantized_weights.is_empty();
+                    let is_gemma_hf = is_gemma && !self.weights.is_empty();
                     let proj_normed = RmsNorm::new(norm_w, 1e-6, is_gemma_hf).forward(&proj_out)?;
 
                     let proj_normed_3d = proj_normed.reshape((b_sz, seq_len, hidden_dim))?.contiguous()?;

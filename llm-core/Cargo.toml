@@ -18,6 +18,7 @@ sysinfo = { workspace = true }
 rand = { workspace = true }
 half = { workspace = true }
 image = { workspace = true }
+symphonia = { workspace = true }
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
@@ -29,3 +30,17 @@ path = "/home/mukundan/.gemini/antigravity/brain/0fb9c17f-d6a6-4fe2-b8d6-fdc16e1
 [[bin]]
 name = "test_gguf"
 path = "/home/mukundan/.gemini/antigravity/brain/0fb9c17f-d6a6-4fe2-b8d6-fdc16e15cd81/scratch/test_gguf.rs"
+
+[[bin]]
+name = "test_gguf_metadata"
+path = "/home/mukundan/.gemini/antigravity/brain/0fb9c17f-d6a6-4fe2-b8d6-fdc16e15cd81/scratch/test_gguf_metadata.rs"
+
+
+
+
+
+
+
+
+
+

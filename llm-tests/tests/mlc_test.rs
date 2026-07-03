@@ -99,6 +99,9 @@ impl DummyBackend {
                 is_gemma: false,
                 ple_dim: None,
                 embed_scale: None,
+                arch: "dummy".to_string(),
+                chat_template: None,
+                eos_token_str: None,
             },
             call_count: std::sync::atomic::AtomicU32::new(0),
         }
@@ -487,6 +490,9 @@ fn test_weight_dtype_q4k_matches_variant() {
         is_gemma: false,
         ple_dim: None,
         embed_scale: None,
+        arch: "llama".to_string(),
+        chat_template: None,
+        eos_token_str: None,
     };
     assert!(matches!(meta.weight_dtype, WeightDtype::Q4_K));
     // Must NOT match F16
@@ -524,6 +530,9 @@ fn test_weight_dtype_f16_matches_variant() {
         is_gemma: false,
         ple_dim: None,
         embed_scale: None,
+        arch: "llama".to_string(),
+        chat_template: None,
+        eos_token_str: None,
     };
     assert!(matches!(meta.weight_dtype, WeightDtype::F16));
     assert!(!matches!(meta.weight_dtype, WeightDtype::Q8_0));

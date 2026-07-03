@@ -16,6 +16,9 @@ async fn main() -> anyhow::Result<()> {
     
     println!("Loading model from {}...", model_path);
     let mut backend = Box::new(CandleBackend::new());
+    if std::env::var("LLM_EXPLICIT_DEQUANTIZE").is_ok() {
+        backend.set_explicit_dequantize(true);
+    }
     let start_load = Instant::now();
     let meta = backend.load_weights(std::path::Path::new(model_path))?;
     println!("Model loaded in {:.2?} (vocab_size: {}, hidden_dim: {})", start_load.elapsed(), meta.vocab_size, meta.hidden_dim);
