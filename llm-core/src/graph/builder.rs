@@ -48,7 +48,7 @@ pub fn build_graph(meta: &ModelMeta, group: &TensorGroupMap) -> ComputeGraph {
     if has_ple {
         graph.add_op(Operator::PleInput {
             input_ids: "input_ids".to_string(),
-            text_embeddings: "text_embeddings".to_string(),
+            text_embeddings: current_hidden.clone(),
             per_layer_token_embd: group.per_layer_token_embd.clone().unwrap(),
             per_layer_model_proj: group.per_layer_model_proj.clone().unwrap(),
             per_layer_proj_norm: group.per_layer_proj_norm.clone().unwrap(),
@@ -320,13 +320,17 @@ pub fn build_graph(meta: &ModelMeta, group: &TensorGroupMap) -> ComputeGraph {
 
         // Residual Add
         let mlp_to_add = if let Some(scale_w) = &layer.layer_output_scale {
-            let scaled_out = format!("layer_{}_mlp_scaled", l_idx);
-            graph.add_op(Operator::TensorScale {
-                input: mlp_out_normed,
-                scale_tensor: scale_w.clone(),
-                output: scaled_out.clone(),
-            });
-            scaled_out
+            if meta.ple_dim.is_some() {
+                mlp_out_normed
+            } else {
+                let scaled_out = format!("layer_{}_mlp_scaled", l_idx);
+                graph.add_op(Operator::TensorScale {
+                    input: mlp_out_normed,
+                    scale_tensor: scale_w.clone(),
+                    output: scaled_out.clone(),
+                });
+                scaled_out
+            }
         } else {
             mlp_out_normed
         };
@@ -355,6 +359,18 @@ pub fn build_graph(meta: &ModelMeta, group: &TensorGroupMap) -> ComputeGraph {
                     output: ple_out.clone(),
                 });
                 layer_output = ple_out;
+            }
+        }
+
+        if meta.ple_dim.is_some() {
+            if let Some(scale_w) = &layer.layer_output_scale {
+                let scaled_out = format!("layer_{}_out_scaled", l_idx);
+                graph.add_op(Operator::TensorScale {
+                    input: layer_output.clone(),
+                    scale_tensor: scale_w.clone(),
+                    output: scaled_out.clone(),
+                });
+                layer_output = scaled_out;
             }
         }
 

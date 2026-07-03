@@ -17,6 +17,15 @@ struct Args {
 
     #[arg(long, default_value = "Explain the theory of relativity in 2 sentences.")]
     prompt: String,
+
+    #[arg(long, default_value_t = 0.0)]
+    temperature: f32,
+
+    #[arg(long, default_value_t = 1.0)]
+    top_p: f32,
+
+    #[arg(long, default_value_t = 1.0)]
+    repetition_penalty: f32,
 }
 
 #[tokio::main]
@@ -59,10 +68,10 @@ async fn main() -> anyhow::Result<()> {
         prompt_tokens,
         max_new_tokens: 50,
         sample_params: SampleParams {
-            temperature: 0.0,
-            top_p: 1.0,
+            temperature: args.temperature,
+            top_p: args.top_p,
             top_k: 0,
-            repetition_penalty: 1.0,
+            repetition_penalty: args.repetition_penalty,
             max_new_tokens: 50,
         },
     };

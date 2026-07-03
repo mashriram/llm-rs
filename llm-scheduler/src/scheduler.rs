@@ -130,10 +130,13 @@ impl Scheduler {
         let mut finished_seqs = Vec::new();
 
         for (i, seq_id) in batch_output.seq_ids.iter().enumerate() {
-            let next_token = batch_output.next_tokens[i];
-            
             // Find the active sequence in our running queue
             if let Some(seq) = self.running_queue.iter_mut().find(|s| s.seq_id == *seq_id) {
+                let next_token = if let Some(ref logits_vec) = batch_output.logits {
+                    self.backend.sample(&logits_vec[i], &seq.sample_params, &seq.token_history)?
+                } else {
+                    batch_output.next_tokens[i]
+                };
                 // Append next token to history
                 seq.token_history.push(next_token);
                 seq.tokens_generated += 1;
@@ -187,8 +190,11 @@ impl Scheduler {
                 let _ = self.block_allocator.free(block);
             }
             self.prefix_cache.recycle_sequence(seq.seq_id);
-            self.backend.clear_sequence(seq.seq_id);
         }
+    }
+
+    pub fn running_sequence_ids(&self) -> Vec<SeqId> {
+        self.running_queue.iter().map(|s| s.seq_id).collect()
     }
 
     pub fn running_tasks(&self) -> usize {

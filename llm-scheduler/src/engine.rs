@@ -91,6 +91,10 @@ impl ServingEngine {
                     }
                     Err(e) => {
                         error!("Error during scheduler step: {:?}", e);
+                        for seq_id in scheduler.running_sequence_ids() {
+                            let event = TokenEvent { seq_id, token_id: 0, is_eos: true };
+                            let _ = event_tx.send(event);
+                        }
                         scheduler.abort_all_running();
                     }
                 }

@@ -4,6 +4,17 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow, Context};
 use candle_core::{Device, Tensor, DType};
 
+fn print_stats(name: &str, t: &Tensor) -> Result<()> {
+    let t_f32 = t.to_dtype(DType::F32)?;
+    let mean_f32 = t_f32.mean_all()?.to_scalar::<f32>()?;
+    let sq_f32 = t_f32.sqr()?.mean_all()?.to_scalar::<f32>()?;
+    let var = sq_f32 - mean_f32 * mean_f32;
+    let std = var.max(0.0).sqrt();
+    let _max = t_f32.flatten_all()?.maximum(0)?.to_dtype(DType::F32)?.mean_all()?.to_scalar::<f32>()?; // simple approx for max
+    println!("  [STATS] {}: shape={:?} mean={:.5} std={:.5}", name, t.shape(), mean_f32, std);
+    Ok(())
+}
+
 use crate::types::*;
 use crate::backend::LlmBackend;
 use crate::model::config::parse_config;
@@ -73,6 +84,16 @@ impl RmsNorm {
             Ok(out)
         }
     }
+}
+
+fn rms_norm_no_scale(x: &Tensor, eps: f64) -> Result<Tensor> {
+    let orig_dtype = x.dtype();
+    let x_f32 = x.to_dtype(DType::F32)?;
+    let variance = x_f32.sqr()?.mean_keepdim(x_f32.rank() - 1)?;
+    let denom = (variance + eps)?.sqrt()?;
+    let x_norm_f32 = x_f32.broadcast_div(&denom)?;
+    let x_norm = x_norm_f32.to_dtype(orig_dtype)?;
+    Ok(x_norm)
 }
 
 
@@ -1127,7 +1148,10 @@ impl LlmBackend for CandleBackend {
                         let (_, _, k_dim) = k_t.dims3()?;
                         let n_kv_heads = k_dim / head_dim;
                         let k_4d = k_t.reshape((b_sz, seq_len, n_kv_heads, layer_head_dim))?;
-                        let v_4d = v_t.reshape((b_sz, seq_len, n_kv_heads, layer_head_dim))?;
+                        let mut v_4d = v_t.reshape((b_sz, seq_len, n_kv_heads, layer_head_dim))?;
+                        if meta.ple_dim.is_some() {
+                            v_4d = rms_norm_no_scale(&v_4d, meta.rms_norm_eps as f64)?;
+                        }
                         (Some(k_4d), Some(v_4d), n_kv_heads)
                     } else {
                         (None, None, meta.n_kv_heads)
@@ -1189,7 +1213,11 @@ impl LlmBackend for CandleBackend {
                         let v_hist_rep = repeat_kv(v_hist_squeezed.transpose(0, 1)?, n_rep)?.contiguous()?;
 
                         let scores = q_i.matmul(&k_hist_rep.transpose(1, 2)?.contiguous()?)?;
-                        let scores_scaled = (scores / (layer_head_dim as f64).sqrt())?;
+                        let scores_scaled = if meta.ple_dim.is_some() {
+                            scores
+                        } else {
+                            (scores / (layer_head_dim as f64).sqrt())?
+                        };
 
                         let num_tokens = seq_len;
                         let seq_len_before = total_seq_len - num_tokens;
@@ -1333,27 +1361,33 @@ impl LlmBackend for CandleBackend {
                         out_flat.reshape((num_tokens, n_layers * ple_dim))?
                     };
 
-                    let token_identity = lookup_out.reshape((num_tokens, n_layers, ple_dim))?;
+                    let token_identity = lookup_out.reshape((num_tokens, n_layers, ple_dim))?.contiguous()?;
                     let token_identity = (token_identity * ((ple_dim as f64).sqrt()))?;
 
                     // Context-aware projection:
                     let text_emb = ctx.get(text_embeddings)?;
-                    let text_emb_flat = text_emb.reshape((num_tokens, hidden_dim))?;
+                    let text_emb_flat = text_emb.reshape((num_tokens, hidden_dim))?.contiguous()?;
                     let model_proj_w = self.get_weight(per_layer_model_proj, &mut local_cache)?.to_device(&self.device)?;
                     let context_proj = text_emb_flat.matmul(&model_proj_w.t()?)?;
                     let context_proj = (context_proj / ((hidden_dim as f64).sqrt()))?;
-                    let context_aware = context_proj.reshape((num_tokens, n_layers, ple_dim))?;
+                    let context_proj_reshaped = context_proj.reshape((num_tokens, n_layers, ple_dim))?.contiguous()?;
 
-                    // Combined:
-                    let combined = ((token_identity + context_aware)? * (1.0 / 2.0f64.sqrt()))?;
-
-                    // RMSNorm on the last dimension (ple_dim):
+                    // Apply RMSNorm specifically to the context projection
                     let norm_w = self.get_weight(per_layer_proj_norm, &mut local_cache)?.to_device(&self.device)?;
                     let is_gemma = self.meta.as_ref().map(|m| m.is_gemma).unwrap_or(false);
                     let is_gemma_hf = is_gemma && self.quantized_weights.is_empty();
-                    let out = RmsNorm::new(norm_w, 1e-6, is_gemma_hf).forward(&combined)?;
+                    let context_aware = RmsNorm::new(norm_w, 1e-6, is_gemma_hf).forward(&context_proj_reshaped)?;
 
-                    ctx.insert(output.clone(), out);
+                    print_stats("PleInput token_identity", &token_identity)?;
+                    print_stats("PleInput context_proj_reshaped", &context_proj_reshaped)?;
+                    print_stats("PleInput context_aware", &context_aware)?;
+
+                    // Combined: (token_identity + context_aware) * (1 / sqrt(2))
+                    let combined = ((token_identity + context_aware)? * (1.0 / 2.0f64.sqrt()))?;
+
+                    print_stats("PleInput combined", &combined)?;
+
+                    ctx.insert(output.clone(), combined);
                 }
                 Operator::PleLayer {
                     input,
@@ -1367,10 +1401,10 @@ impl LlmBackend for CandleBackend {
                     let in_t = ctx.get(input)?;
                     let (b_sz, seq_len, hidden_dim) = in_t.dims3()?;
                     let num_tokens = b_sz * seq_len;
-                    let in_flat = in_t.reshape((num_tokens, hidden_dim))?;
+                    let in_flat = in_t.reshape((num_tokens, hidden_dim))?.contiguous()?;
 
                     let ple_in = ctx.get(per_layer_input)?;
-                    let ple_slice = ple_in.narrow(1, *layer_idx, 1)?.reshape((num_tokens, ()))?;
+                    let ple_slice = ple_in.narrow(1, *layer_idx, 1)?.reshape((num_tokens, ()))?.contiguous()?;
 
                     let gate_w = self.get_weight(per_layer_input_gate, &mut local_cache)?.to_device(in_t.device())?;
                     let gate_input = in_flat.matmul(&gate_w.t()?)?;
@@ -1391,7 +1425,7 @@ impl LlmBackend for CandleBackend {
                     let is_gemma_hf = is_gemma && self.quantized_weights.is_empty();
                     let proj_normed = RmsNorm::new(norm_w, 1e-6, is_gemma_hf).forward(&proj_out)?;
 
-                    let proj_normed_3d = proj_normed.reshape((b_sz, seq_len, hidden_dim))?;
+                    let proj_normed_3d = proj_normed.reshape((b_sz, seq_len, hidden_dim))?.contiguous()?;
                     let out = (in_t + proj_normed_3d)?;
                     ctx.insert(output.clone(), out);
                 }

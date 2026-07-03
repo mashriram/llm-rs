@@ -1,13 +1,6 @@
 fn main() -> anyhow::Result<()> {
-    let mut file = std::fs::File::open("/home/mukundan/learning/llm/gemma-4-E2B-it-Q4_K_M.gguf")?;
-    let model = candle_core::quantized::gguf_file::Content::read(&mut file)?;
-    
-    println!("Gemma4 Layer 0 PLE tensor shapes:");
-    for suffix in &["inp_gate.weight", "proj.weight", "post_norm.weight", "layer_output_scale.weight"] {
-        let name = format!("blk.0.{}", suffix);
-        if let Some(info) = model.tensor_infos.get(&name) {
-            println!("  {}: {:?}", name, info.shape);
-        }
-    }
+    let tokenizer = tokenizers::Tokenizer::from_file("/home/mukundan/learning/llm/gemma4_tokenizer.json").unwrap();
+    let ids = vec![71499, 563, 886, 529, 506, 2390, 11001, 8290, 529, 4135, 568, 51528, 607, 129210, 1929, 236764, 506, 3188, 8825, 4912, 236764, 532, 506, 7209, 8825, 4912, 769, 799, 506, 33055, 3755, 236764, 5213, 50918, 563, 506, 4912, 529, 29433, 600, 7519, 1534, 1027, 1156, 7751, 600, 735, 3413, 653, 2778];
+    println!("Decoded: {:?}", tokenizer.decode(&ids, false).unwrap());
     Ok(())
 }
