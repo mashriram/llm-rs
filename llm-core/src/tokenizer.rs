@@ -31,4 +31,10 @@ impl LlmTokenizer {
     pub fn vocab_size(&self) -> usize {
         self.tokenizer.get_vocab_size(true)
     }
+
+    /// Get the token ID for a specific token string if it exists in the vocabulary.
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.tokenizer.token_to_id(token)
+    }
 }
+

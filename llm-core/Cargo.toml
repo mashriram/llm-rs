@@ -24,23 +24,10 @@ symphonia = { workspace = true }
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 
 [[bin]]
-name = "test_gguf_names"
-path = "/home/mukundan/.gemini/antigravity/brain/0fb9c17f-d6a6-4fe2-b8d6-fdc16e15cd81/scratch/test_gguf_names.rs"
+name = "debug_tokenizer"
+path = "../scratch/debug_tokenizer.rs"
 
 [[bin]]
-name = "test_gguf"
-path = "/home/mukundan/.gemini/antigravity/brain/0fb9c17f-d6a6-4fe2-b8d6-fdc16e15cd81/scratch/test_gguf.rs"
-
-[[bin]]
-name = "test_gguf_metadata"
-path = "/home/mukundan/.gemini/antigravity/brain/0fb9c17f-d6a6-4fe2-b8d6-fdc16e15cd81/scratch/test_gguf_metadata.rs"
-
-
-
-
-
-
-
-
-
+name = "print_chat_template"
+path = "../scratch/print_chat_template.rs"
 

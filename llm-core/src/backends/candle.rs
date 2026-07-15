@@ -5,16 +5,7 @@ use anyhow::{Result, anyhow, Context};
 use candle_core::{Device, Tensor, DType, Module};
 use candle_core::quantized::QMatMul;
 
-fn print_stats(name: &str, t: &Tensor) -> Result<()> {
-    let t_f32 = t.to_dtype(DType::F32)?;
-    let mean_f32 = t_f32.mean_all()?.to_scalar::<f32>()?;
-    let sq_f32 = t_f32.sqr()?.mean_all()?.to_scalar::<f32>()?;
-    let var = sq_f32 - mean_f32 * mean_f32;
-    let std = var.max(0.0).sqrt();
-    let _max = t_f32.flatten_all()?.maximum(0)?.to_dtype(DType::F32)?.mean_all()?.to_scalar::<f32>()?; // simple approx for max
-    println!("  [STATS] {}: shape={:?} mean={:.5} std={:.5}", name, t.shape(), mean_f32, std);
-    Ok(())
-}
+
 
 use crate::types::*;
 use crate::backend::LlmBackend;
@@ -110,7 +101,8 @@ fn apply_rope(
         return Ok((q.clone(), k.clone()));
     }
     let dev = q.device();
-    let (b_sz, seq_len, _n_heads, head_dim) = q.dims4()?;
+    let (b_sz, seq_len, n_heads, head_dim) = q.dims4()?;
+    let (_, _, n_kv_heads, _) = k.dims4()?;
     
     let half_dim = head_dim / 2;
     
@@ -130,22 +122,24 @@ fn apply_rope(
     let pos = Tensor::from_vec(pos_vec, (b_sz * seq_len, 1), dev)?;
     let freqs = pos.matmul(&inv_freq)?;
 
-    let cos = freqs.cos()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim))?;
-    let sin = freqs.sin()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim))?;
+    let cos = freqs.cos()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim, 1))?;
+    let sin = freqs.sin()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim, 1))?;
 
-    let q1 = q.narrow(candle_core::D::Minus1, 0, half_dim)?;
-    let q2 = q.narrow(candle_core::D::Minus1, half_dim, half_dim)?;
+    let q_reshaped = q.reshape((b_sz, seq_len, n_heads, half_dim, 2))?;
+    let q1 = q_reshaped.narrow(candle_core::D::Minus1, 0, 1)?;
+    let q2 = q_reshaped.narrow(candle_core::D::Minus1, 1, 1)?;
 
     let q_out_1 = (q1.broadcast_mul(&cos)? - q2.broadcast_mul(&sin)?)?;
     let q_out_2 = (q1.broadcast_mul(&sin)? + q2.broadcast_mul(&cos)?)?;
-    let q_out = Tensor::cat(&[q_out_1, q_out_2], candle_core::D::Minus1)?;
+    let q_out = Tensor::cat(&[q_out_1, q_out_2], candle_core::D::Minus1)?.reshape((b_sz, seq_len, n_heads, head_dim))?;
 
-    let k1 = k.narrow(candle_core::D::Minus1, 0, half_dim)?;
-    let k2 = k.narrow(candle_core::D::Minus1, half_dim, half_dim)?;
+    let k_reshaped = k.reshape((b_sz, seq_len, n_kv_heads, half_dim, 2))?;
+    let k1 = k_reshaped.narrow(candle_core::D::Minus1, 0, 1)?;
+    let k2 = k_reshaped.narrow(candle_core::D::Minus1, 1, 1)?;
 
     let k_out_1 = (k1.broadcast_mul(&cos)? - k2.broadcast_mul(&sin)?)?;
     let k_out_2 = (k1.broadcast_mul(&sin)? + k2.broadcast_mul(&cos)?)?;
-    let k_out = Tensor::cat(&[k_out_1, k_out_2], candle_core::D::Minus1)?;
+    let k_out = Tensor::cat(&[k_out_1, k_out_2], candle_core::D::Minus1)?.reshape((b_sz, seq_len, n_kv_heads, head_dim))?;
 
     Ok((q_out, k_out))
 }
@@ -160,7 +154,7 @@ fn apply_rope_q(
         return Ok(q.clone());
     }
     let dev = q.device();
-    let (b_sz, seq_len, _n_heads, head_dim) = q.dims4()?;
+    let (b_sz, seq_len, n_heads, head_dim) = q.dims4()?;
     
     let half_dim = head_dim / 2;
     
@@ -180,15 +174,16 @@ fn apply_rope_q(
     let pos = Tensor::from_vec(pos_vec, (b_sz * seq_len, 1), dev)?;
     let freqs = pos.matmul(&inv_freq)?;
 
-    let cos = freqs.cos()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim))?;
-    let sin = freqs.sin()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim))?;
+    let cos = freqs.cos()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim, 1))?;
+    let sin = freqs.sin()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim, 1))?;
 
-    let q1 = q.narrow(candle_core::D::Minus1, 0, half_dim)?;
-    let q2 = q.narrow(candle_core::D::Minus1, half_dim, half_dim)?;
+    let q_reshaped = q.reshape((b_sz, seq_len, n_heads, half_dim, 2))?;
+    let q1 = q_reshaped.narrow(candle_core::D::Minus1, 0, 1)?;
+    let q2 = q_reshaped.narrow(candle_core::D::Minus1, 1, 1)?;
 
     let q_out_1 = (q1.broadcast_mul(&cos)? - q2.broadcast_mul(&sin)?)?;
     let q_out_2 = (q1.broadcast_mul(&sin)? + q2.broadcast_mul(&cos)?)?;
-    let q_out = Tensor::cat(&[q_out_1, q_out_2], candle_core::D::Minus1)?;
+    let q_out = Tensor::cat(&[q_out_1, q_out_2], candle_core::D::Minus1)?.reshape((b_sz, seq_len, n_heads, head_dim))?;
 
     Ok(q_out)
 }
@@ -239,7 +234,62 @@ fn splice_visual_embeddings(
         // Fallback: only support batch size 1 for multimodal prefill
         return Ok(text_embeds.clone());
     }
+
+    // 1. Model-agnostic run-based detection of image placeholder sequence
+    let mut max_run_len = 0;
+    let mut _max_run_token_id = 0;
+    let mut max_run_start_idx = 0;
     
+    let mut current_token_id = 0;
+    let mut current_run_len = 0;
+    let mut current_run_start_idx = 0;
+    
+    for (idx, &tok) in token_ids.iter().enumerate() {
+        if idx == 0 {
+            current_token_id = tok;
+            current_run_len = 1;
+            current_run_start_idx = 0;
+        } else if tok == current_token_id {
+            current_run_len += 1;
+        } else {
+            if current_run_len > max_run_len {
+                max_run_len = current_run_len;
+                _max_run_token_id = current_token_id;
+                max_run_start_idx = current_run_start_idx;
+            }
+            current_token_id = tok;
+            current_run_len = 1;
+            current_run_start_idx = idx;
+        }
+    }
+    if current_run_len > max_run_len {
+        max_run_len = current_run_len;
+        _max_run_token_id = current_token_id;
+        max_run_start_idx = current_run_start_idx;
+    }
+
+    if max_run_len >= 16 {
+        let run_start = max_run_start_idx;
+        let run_len = max_run_len;
+        let visual_len = visual_embeds.dim(1)?;
+        
+        let before = text_embeds.narrow(1, 0, run_start)?;
+        let after = text_embeds.narrow(1, run_start + run_len, seq_len - (run_start + run_len))?;
+        
+        let middle = if visual_len == run_len {
+            visual_embeds.clone()
+        } else if visual_len > run_len {
+            visual_embeds.narrow(1, 0, run_len)?
+        } else {
+            let pad_len = run_len - visual_len;
+            let pad = Tensor::zeros((1, pad_len, hidden_dim), visual_embeds.dtype(), visual_embeds.device())?;
+            Tensor::cat(&[visual_embeds, &pad], 1)?
+        };
+        
+        return Ok(Tensor::cat(&[&before, &middle, &after], 1)?);
+    }
+
+    // 2. Fallback to start/end marker-based logic
     let mut start_idx = None;
     let mut end_idx = None;
     for (idx, &tok) in token_ids.iter().enumerate() {
@@ -250,23 +300,11 @@ fn splice_visual_embeddings(
         }
     }
 
-    // Fallback: if start/end markers not found, look for common image placeholder token IDs
     if start_idx.is_none() || end_idx.is_none() {
-        let mut first_img = None;
-        let mut last_img = None;
-        for (idx, &tok) in token_ids.iter().enumerate() {
-            if tok == 151655 || tok == 32000 || tok == 88253 || tok == 151652 || tok == 151653 {
-                if first_img.is_none() {
-                    first_img = Some(idx);
-                }
-                last_img = Some(idx);
-            }
-        }
-        if let (Some(first), Some(last)) = (first_img, last_img) {
-            start_idx = Some(first.saturating_sub(1));
-            end_idx = Some((last + 1).min(token_ids.len() - 1));
-        }
+        // No start/end markers found - the run-based detection above handles this case.
+        // Nothing to do here: if max_run_len < 16 the function returns text_embeds unchanged.
     }
+
 
     if let (Some(start), Some(end)) = (start_idx, end_idx) {
         if end > start + 1 {
@@ -802,7 +840,9 @@ impl LlmBackend for CandleBackend {
                 _ => None,
             };
 
-            let projector_type = match model.metadata.get("clip.projector_type")
+            let projector_type = match model.metadata.get("clip.vision.projector_type")
+                .or_else(|| mmproj_metadata.get("clip.vision.projector_type"))
+                .or_else(|| model.metadata.get("clip.projector_type"))
                 .or_else(|| mmproj_metadata.get("clip.projector_type")) {
                 Some(candle_core::quantized::gguf_file::Value::String(s)) => Some(s.clone()),
                 _ => None,
@@ -841,8 +881,27 @@ impl LlmBackend for CandleBackend {
                 .map(|v| v as usize);
 
             let is_gemma = arch == "gemma" || arch == "gemma2" || arch == "gemma4";
-            let hidden_act = if is_gemma { HiddenAct::GeLU } else { HiddenAct::SiLU };
-            let tie_word_embeddings = is_gemma;
+
+            // Detect activation function from GGUF metadata first, then fall back to arch heuristic.
+            // GGUF key: "<arch>.feed_forward_type" (e.g. "llama.feed_forward_type" = "SiLU")
+            let feed_forward_type = Self::find_metadata_key(&model.metadata, "feed_forward_type")
+                .and_then(|k| model.metadata.get(&k))
+                .and_then(|v| if let candle_core::quantized::gguf_file::Value::String(s) = v { Some(s.to_lowercase()) } else { None });
+            let hidden_act = match feed_forward_type.as_deref() {
+                Some(s) if s.contains("gelu") => HiddenAct::GeLU,
+                Some(s) if s.contains("silu") || s.contains("swiglu") => HiddenAct::SiLU,
+                // Fallback: Gemma family uses GeLU, everything else (LLaMA/Qwen/Mistral) uses SiLU.
+                _ => if is_gemma { HiddenAct::GeLU } else { HiddenAct::SiLU },
+            };
+
+            // Detect tied embeddings from GGUF tensor presence rather than arch name.
+            // If neither "output.weight" nor "lm_head.weight" exists as a tensor, the model
+            // uses tied embeddings (shares token_embd.weight for both input and output projection).
+            let has_dedicated_lm_head = model.tensor_infos.contains_key("output.weight")
+                || model.tensor_infos.contains_key("lm_head.weight")
+                || model.tensor_infos.contains_key("output_norm.weight") && model.tensor_infos.contains_key("output.weight");
+            // For Gemma, always tie (embed_scale requires the shared weight).
+            let tie_word_embeddings = is_gemma || !has_dedicated_lm_head;
 
             let embed_scale = if is_gemma {
                 Some((hidden_dim as f32).sqrt())
@@ -1155,14 +1214,9 @@ impl LlmBackend for CandleBackend {
                             let target_dev = qt.device().clone();
                             match qt.dequantize(&target_dev) {
                                 Ok(t) => {
-                                    match t.to_dtype(DType::F16) {
-                                        Ok(t_f16) => {
-                                            local_deq.insert(name.clone(), t_f16.clone());
-                                        }
-                                        Err(e) => {
-                                            println!("Error: Failed to cast dequantized tensor {} to F16: {:?}", name, e);
-                                        }
-                                    }
+                                    // Keep as f32 — f16 can overflow (~65504) for large
+                                    // residual activations (e.g. Qwen 2.5 reaches ~43k by layer 0).
+                                    local_deq.insert(name.clone(), t);
                                 }
                                 Err(e) => {
                                     println!("Error: Failed to dequantize tensor {} on CPU: {:?}", name, e);
@@ -1297,16 +1351,17 @@ impl LlmBackend for CandleBackend {
                 _ => true,
             };
             let pixel_val = if needs_load {
+                let vision_dtype = if dev.is_cpu() { DType::F32 } else { DType::F16 };
                 let loaded = if let Some(ref path_str) = active_path {
                     match crate::backends::vision::load_image(Path::new(path_str), img_size, &dev) {
-                        Ok(t) => t.to_dtype(DType::F16)?,
+                        Ok(t) => t.to_dtype(vision_dtype)?,
                         Err(e) => {
                             tracing::warn!("Failed to load image from {path_str}: {e}, using zeros");
-                            Tensor::zeros((1, 3, img_size, img_size), DType::F16, &dev)?
+                            Tensor::zeros((1, 3, img_size, img_size), vision_dtype, &dev)?
                         }
                     }
                 } else {
-                    Tensor::zeros((1, 3, img_size, img_size), DType::F16, &dev)?
+                    Tensor::zeros((1, 3, img_size, img_size), vision_dtype, &dev)?
                 };
                 *cache = Some(loaded.clone());
                 *last_path = active_path.clone();
@@ -1347,6 +1402,11 @@ impl LlmBackend for CandleBackend {
 
         // Execute operators sequentially
         for (idx, op) in graph.ops.iter().enumerate() {
+            if batch.seq_ids[0] == 1 && kv_cache.get_seq_len(batch.seq_ids[0]) == 0 {
+                use std::io::Write;
+                println!("Executing OP idx={}/{}: {:?}", idx, graph.ops.len(), op);
+                std::io::stdout().flush().ok();
+            }
             match op {
                 Operator::Embed { input_ids, weight, output } => {
                     let ids = ctx.get(input_ids)?;
@@ -1384,8 +1444,11 @@ impl LlmBackend for CandleBackend {
 
                     let out = if let Some(qmatmul) = qmatmul_opt {
                         let in_t_f32 = in_t.to_dtype(DType::F32)?;
-                        let out_f32 = qmatmul.forward(&in_t_f32)?;
-                        out_f32.to_dtype(in_t.dtype())?
+                        // Keep output as f32 — do NOT downcast back to f16.
+                        // f16 overflows at ~65504; Qwen 2.5 residuals reach ~43k by layer 0
+                        // and easily overflow by layer 4, producing NaN that poisons all
+                        // subsequent layers. Staying in f32 costs 2x memory but is correct.
+                        qmatmul.forward(&in_t_f32)?
                     } else {
                         let w_t = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
 
@@ -1620,13 +1683,15 @@ impl LlmBackend for CandleBackend {
                 Operator::SpliceTensors { text_embeds, visual_embeds, output } => {
                     let t_emb = ctx.get(text_embeds)?;
                     let v_emb = ctx.get(visual_embeds)?;
+                    // Unify dtypes: visual embeddings (may be F32 on CPU) must match text embedding dtype
+                    let v_emb = v_emb.to_dtype(t_emb.dtype())?;
                     let v_emb_narrowed = if v_emb.dim(2)? > t_emb.dim(2)? {
                         v_emb.narrow(2, 0, t_emb.dim(2)?)?
                     } else {
                         v_emb.clone()
                     };
                     let token_ids = &batch.token_ids;
-                    let out = splice_visual_embeddings(&t_emb, &v_emb_narrowed, token_ids, 151652, 151653)?;
+                    let out = splice_visual_embeddings(&t_emb, &v_emb_narrowed, token_ids, 0, 0)?;
                     ctx.insert(output.clone(), out);
                 }
                 Operator::DeepStackFuse { input, layer_idx, output } => {
@@ -1653,7 +1718,7 @@ impl LlmBackend for CandleBackend {
                     if let Some(idx) = ds_idx {
                         let ds_feat = vis_embeds.narrow(2, (1 + idx) * hidden_dim, hidden_dim)?;
                         let token_ids = &batch.token_ids;
-                        let fused = splice_visual_embeddings(&in_t, &ds_feat, token_ids, 151652, 151653)?;
+                        let fused = splice_visual_embeddings(&in_t, &ds_feat, token_ids, 0, 0)?;
                         ctx.insert(output.clone(), fused);
                     } else {
                         ctx.insert(output.clone(), in_t.clone());
@@ -1737,14 +1802,8 @@ impl LlmBackend for CandleBackend {
                     let is_gemma_hf = is_gemma && !self.weights.is_empty();
                     let context_aware = RmsNorm::new(norm_w, 1e-6, is_gemma_hf).forward(&context_proj_reshaped)?;
 
-                    print_stats("PleInput token_identity", &token_identity)?;
-                    print_stats("PleInput context_proj_reshaped", &context_proj_reshaped)?;
-                    print_stats("PleInput context_aware", &context_aware)?;
-
                     // Combined: (token_identity + context_aware) * (1 / sqrt(2))
                     let combined = ((token_identity + context_aware)? * (1.0 / 2.0f64.sqrt()))?;
-
-                    print_stats("PleInput combined", &combined)?;
 
                     ctx.insert(output.clone(), combined);
                 }

@@ -76,6 +76,7 @@ fn try_jinja_render(template_str: &str, messages: &[Message], _meta: &ModelMeta)
     let mut env = Environment::new();
     // Add Python-compat builtins (tojson, etc.)
     add_to_environment(&mut env);
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     // Register strftime_now: returns today's date string (HF templates use this)
     env.add_function("strftime_now", |fmt: &str| -> String {
         // Return a plausible static date; no std::time formatting in minijinja natively
@@ -125,10 +126,18 @@ fn try_jinja_render(template_str: &str, messages: &[Message], _meta: &ModelMeta)
 fn manual_format(messages: &[Message], meta: &ModelMeta) -> String {
     let mut result = String::new();
 
-    if meta.is_gemma {
-        // Gemma 4 format: <start_of_turn>role\ncontent<end_of_turn>\n
+    if meta.arch == "gemma4" {
+        // Gemma 4 format: <|turn>role\ncontent<turn|>\n
         for msg in messages {
-            result.push_str(&format!("<start_of_turn>{}\n{}<end_of_turn>\n", msg.role, msg.content));
+            let role = if msg.role == "assistant" { "model" } else { &msg.role };
+            result.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, msg.content));
+        }
+        result.push_str("<|turn>model\n");
+    } else if meta.is_gemma {
+        // Gemma 1/2 format: <start_of_turn>role\ncontent<end_of_turn>\n
+        for msg in messages {
+            let role = if msg.role == "assistant" { "model" } else { &msg.role };
+            result.push_str(&format!("<start_of_turn>{}\n{}<end_of_turn>\n", role, msg.content));
         }
         result.push_str("<start_of_turn>model\n");
     } else if meta.chat_template.as_deref().map(|t| t.contains("<|im_start|>")).unwrap_or(false)
@@ -330,7 +339,12 @@ async fn main() -> anyhow::Result<()> {
     }
     println!();
 
-    let eos_token_id = backend.eos_token_id();
+    let mut eos_token_ids = vec![backend.eos_token_id()];
+    for tok in &["<|im_end|>", "<end_of_turn>", "<turn|>"] {
+        if let Some(id) = tokenizer.token_to_id(tok) {
+            eos_token_ids.push(id);
+        }
+    }
     let engine = Arc::new(ServingEngine::new(backend, 2048));
     let meta = Arc::new(meta);
 
@@ -370,6 +384,8 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(sys) = &args.system_prompt {
                     conversation.push(Message { role: "system".to_string(), content: sys.clone() });
                 }
+                *llm_core::backends::ACTIVE_IMAGE_PATH.lock().unwrap() = None;
+                *llm_core::backends::ACTIVE_AUDIO_PATH.lock().unwrap() = None;
                 println!("[chat] Conversation cleared.\n");
                 continue;
             }
@@ -385,14 +401,10 @@ async fn main() -> anyhow::Result<()> {
 
         if let Some(ref img) = image_path {
             *llm_core::backends::ACTIVE_IMAGE_PATH.lock().unwrap() = Some(img.to_string_lossy().to_string());
-        } else {
-            *llm_core::backends::ACTIVE_IMAGE_PATH.lock().unwrap() = None;
         }
 
         if let Some(ref aud) = audio_path {
             *llm_core::backends::ACTIVE_AUDIO_PATH.lock().unwrap() = Some(aud.to_string_lossy().to_string());
-        } else {
-            *llm_core::backends::ACTIVE_AUDIO_PATH.lock().unwrap() = None;
         }
 
         if text_content.is_empty() && image_path.is_none() && audio_path.is_none() {
@@ -405,8 +417,42 @@ async fn main() -> anyhow::Result<()> {
         // Render the full conversation to tokens
         let mut prompt_str = render_prompt(&conversation, &meta);
         if meta.has_vision_encoder {
-            let pads = "<|image_pad|>".repeat(576);
-            let replacement = format!("<|vision_start|>{pads}<|vision_end|>");
+            // Dynamically resolve the image pad token name from the tokenizer
+            let pad_token = if tokenizer.token_to_id("<|image_pad|>").is_some() {
+                "<|image_pad|>"
+            } else if tokenizer.token_to_id("<|image|>").is_some() {
+                "<|image|>"
+            } else if tokenizer.token_to_id("<image>").is_some() {
+                "<image>"
+            } else {
+                "<|image|>" // Fallback
+            };
+
+            let (start_token, end_token) = if tokenizer.token_to_id("<|vision_start|>").is_some()
+                && tokenizer.token_to_id("<|vision_end|>").is_some() {
+                (Some("<|vision_start|>"), Some("<|vision_end|>"))
+            } else if tokenizer.token_to_id("<|image>").is_some()
+                && tokenizer.token_to_id("<image|>").is_some() {
+                (Some("<|image>"), Some("<image|>"))
+            } else {
+                (None, None)
+            };
+
+            // Compute number of image tokens dynamically from model architecture metadata.
+            // patches_per_side = image_size / patch_size  →  total_patches = patches_per_side^2
+            // spatial_merge reduces tokens: total / (merge_size^2), defaulting to 1 (no merge).
+            let image_size = meta.vision_image_size.unwrap_or(224);
+            let patch_size = meta.vision_patch_size.unwrap_or(16);
+            let merge = meta.spatial_merge_size.unwrap_or(1).max(1);
+            let patches_per_side = image_size / patch_size.max(1);
+            let num_image_tokens = (patches_per_side * patches_per_side) / (merge * merge);
+            let num_image_tokens = num_image_tokens.max(16); // always at least 16 so run-based splice triggers
+
+            let pads = pad_token.repeat(num_image_tokens);
+            let replacement = match (start_token, end_token) {
+                (Some(st), Some(et)) => format!("{st}{pads}{et}"),
+                _ => pads,
+            };
             prompt_str = prompt_str.replace("<image>", &replacement);
         }
         let mut prompt_tokens = tokenizer.encode(&prompt_str, true)?;
@@ -457,7 +503,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     generated_tokens.push(event.token_id);
 
-                    if event.is_eos || event.token_id == eos_token_id {
+                    if event.is_eos || eos_token_ids.contains(&event.token_id) {
                         break;
                     }
                     if generated_tokens.len() >= args.max_new_tokens {
