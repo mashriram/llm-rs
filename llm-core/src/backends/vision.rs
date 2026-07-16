@@ -36,6 +36,10 @@ impl VisionEncoder {
         let mut num_layers = 24;
         let mut num_heads = 16;
         let mut projection_dim = 2560;
+        // Known spatial_merge_size by family (verified against upstream configs):
+        //   Qwen2-VL family: 2
+        //   Gemma-4 vision (SigLIP-derived): 1
+        //   default when metadata absent: 1 (safe: produces MORE tokens than needed, never fewer)
         let mut spatial_merge_size = 1;
         let mut is_deepstack_layers = vec![false; 24];
 

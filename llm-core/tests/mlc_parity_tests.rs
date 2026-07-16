@@ -54,6 +54,11 @@ fn test_loader_parity() {
         spatial_merge_size: None,
         is_deepstack_layers: None,
         projector_type: None,
+        has_audio_encoder: false,
+        audio_hidden_dim: None,
+        audio_block_count: None,
+        audio_embedding_length: None,
+        audio_num_mel_bins: None,
         shared_kv_layers: None,
         sliding_window_pattern: None,
         sliding_window: None,
@@ -162,3 +167,29 @@ fn test_conversation_template_parity() {
     assert_eq!(conv.name, "llama-2");
     assert_eq!(conv.system_message, "You are a helpful assistant.");
 }
+
+#[test]
+fn test_audio_keys() {
+    let path = std::path::Path::new("/home/shri/learning/llm-rs/models/google_gemma-4-E2B-it-mmproj-BF16.gguf");
+    if path.exists() {
+        let mut file = std::fs::File::open(path).unwrap();
+        let model = candle_core::quantized::gguf_file::Content::read(&mut file).unwrap();
+        let mut output = String::new();
+        output.push_str("Metadata:\n");
+        for (k, v) in &model.metadata {
+            if k.contains("audio") {
+                output.push_str(&format!("  {}: {:?}\n", k, v));
+            }
+        }
+        output.push_str("Tensors:\n");
+        for (k, v) in &model.tensor_infos {
+            if k.starts_with("a.") {
+                output.push_str(&format!("  {}: {:?}\n", k, v.shape));
+            }
+        }
+        std::fs::write("/home/shri/learning/llm-rs/scratch/audio_names.txt", output).unwrap();
+    } else {
+        println!("Model path does not exist, skipping test");
+    }
+}
+

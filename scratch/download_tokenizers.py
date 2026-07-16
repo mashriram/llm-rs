@@ -1,7 +1,7 @@
 import os
 from huggingface_hub import hf_hub_download
 
-dest_dir = "/home/mukundan/learning/llm"
+dest_dir = "/home/shri/learning/llm-rs/models"
 
 print("Downloading SmolLM3 tokenizer.json...")
 try:

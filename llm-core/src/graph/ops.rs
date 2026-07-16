@@ -73,6 +73,15 @@ pub enum Operator {
         visual_embeds: String,
         output: String,
     },
+    AudioEmbed {
+        audio_values: String,
+        output: String,
+    },
+    SpliceAudioTensors {
+        text_embeds: String,
+        audio_embeds: String,
+        output: String,
+    },
     DeepStackFuse {
         input: String,
         layer_idx: usize,

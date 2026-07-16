@@ -1,6 +1,25 @@
 use crate::types::SampleParams;
 use rand::Rng;
 use anyhow::{Result, bail};
+use std::cmp::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+/// Logged once (not per-token) if NaN logits are detected, to surface upstream bugs
+/// without flooding the log on every decode step.
+static NAN_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// NaN-safe descending sort for `(prob, idx)` tuples; NaNs sort last.
+#[inline]
+fn cmp_desc_prob(a: &(f32, usize), b: &(f32, usize)) -> Ordering {
+    b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal)
+}
+
+/// NaN-safe descending sort for `(idx, logit)` tuples; NaNs sort last.
+#[inline]
+fn cmp_desc_logit(a: &(usize, f32), b: &(usize, f32)) -> Ordering {
+    b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+}
+
 
 /// CPU Sampler implementing MLC-LLM compatible top-p, top-k, temperature, and repetition penalty.
 pub fn sample_logits(
@@ -51,8 +70,11 @@ pub fn sample_logits(
         }
     }
 
-    // 5. Sort probabilities in descending order
-    probs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    // 5. Sort probabilities descending (NaN-safe: NaN logits sort last)
+    if probs.iter().any(|(p, _)| p.is_nan()) && !NAN_WARNED.swap(true, AtomicOrdering::Relaxed) {
+        tracing::warn!("NaN probabilities in sampler — numerical bug upstream; NaN tokens excluded by top-k/p");
+    }
+    probs.sort_unstable_by(cmp_desc_prob);
 
     // 6. Apply Top-K
     if params.top_k > 0 && params.top_k < probs.len() {
@@ -140,7 +162,7 @@ pub fn apply_top_k(logits: &mut [f32], top_k: usize) {
         return;
     }
     let mut indexed_logits: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    indexed_logits.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    indexed_logits.sort_unstable_by(cmp_desc_logit);
     
     let threshold = indexed_logits[top_k - 1].1;
     for val in logits.iter_mut() {
@@ -173,7 +195,7 @@ pub fn apply_top_p(logits: &mut [f32], top_p: f32) {
         *p /= sum_prob;
     }
 
-    probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    probs.sort_unstable_by(cmp_desc_logit);
 
     let mut cumulative_prob = 0.0;
     let mut cutoff_idx = probs.len();

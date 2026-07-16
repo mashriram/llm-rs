@@ -63,7 +63,11 @@ impl<'a> Reader<'a> {
         if self.pos + 4 > self.data.len() {
             bail!("Unexpected EOF reading u32");
         }
-        let val = u32::from_le_bytes(self.data[self.pos..self.pos+4].try_into().unwrap());
+        let val = u32::from_le_bytes(
+            self.data[self.pos..self.pos+4]
+                .try_into()
+                .map_err(|_| anyhow!("GGUF truncated at offset {}: expected 4 bytes for u32", self.pos))?
+        );
         self.pos += 4;
         Ok(val)
     }
@@ -72,7 +76,11 @@ impl<'a> Reader<'a> {
         if self.pos + 8 > self.data.len() {
             bail!("Unexpected EOF reading u64");
         }
-        let val = u64::from_le_bytes(self.data[self.pos..self.pos+8].try_into().unwrap());
+        let val = u64::from_le_bytes(
+            self.data[self.pos..self.pos+8]
+                .try_into()
+                .map_err(|_| anyhow!("GGUF truncated at offset {}: expected 8 bytes for u64", self.pos))?
+        );
         self.pos += 8;
         Ok(val)
     }
@@ -81,7 +89,11 @@ impl<'a> Reader<'a> {
         if self.pos + 4 > self.data.len() {
             bail!("Unexpected EOF reading f32");
         }
-        let val = f32::from_le_bytes(self.data[self.pos..self.pos+4].try_into().unwrap());
+        let val = f32::from_le_bytes(
+            self.data[self.pos..self.pos+4]
+                .try_into()
+                .map_err(|_| anyhow!("GGUF truncated at offset {}: expected 4 bytes for f32", self.pos))?
+        );
         self.pos += 4;
         Ok(val)
     }
@@ -90,7 +102,11 @@ impl<'a> Reader<'a> {
         if self.pos + 8 > self.data.len() {
             bail!("Unexpected EOF reading f64");
         }
-        let val = f64::from_le_bytes(self.data[self.pos..self.pos+8].try_into().unwrap());
+        let val = f64::from_le_bytes(
+            self.data[self.pos..self.pos+8]
+                .try_into()
+                .map_err(|_| anyhow!("GGUF truncated at offset {}: expected 8 bytes for f64", self.pos))?
+        );
         self.pos += 8;
         Ok(val)
     }
@@ -116,11 +132,15 @@ impl<'a> Reader<'a> {
             GGUF_VALUE_TYPE_INT8 => Ok(GgufValue::I8(self.read_bytes(1)?[0] as i8)),
             GGUF_VALUE_TYPE_UINT16 => {
                 let b = self.read_bytes(2)?;
-                Ok(GgufValue::U16(u16::from_le_bytes(b.try_into().unwrap())))
+                Ok(GgufValue::U16(u16::from_le_bytes(
+                    b.try_into().map_err(|_| anyhow!("GGUF: invalid u16 bytes"))?
+                )))
             }
             GGUF_VALUE_TYPE_INT16 => {
                 let b = self.read_bytes(2)?;
-                Ok(GgufValue::I16(i16::from_le_bytes(b.try_into().unwrap())))
+                Ok(GgufValue::I16(i16::from_le_bytes(
+                    b.try_into().map_err(|_| anyhow!("GGUF: invalid i16 bytes"))?
+                )))
             }
             GGUF_VALUE_TYPE_UINT32 => Ok(GgufValue::U32(self.read_u32()?)),
             GGUF_VALUE_TYPE_INT32 => Ok(GgufValue::I32(self.read_u32()? as i32)),

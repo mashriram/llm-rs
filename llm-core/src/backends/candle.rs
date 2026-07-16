@@ -1,359 +1,139 @@
 use std::path::Path;
-use std::sync::Mutex;
 use std::collections::HashMap;
 use anyhow::{Result, anyhow, Context};
 use candle_core::{Device, Tensor, DType, Module};
 use candle_core::quantized::QMatMul;
-
-
+use parking_lot::Mutex;
 
 use crate::types::*;
 use crate::backend::LlmBackend;
 use crate::model::config::parse_config;
 use crate::sampler::sample_logits;
 use crate::graph::{ComputeGraph, Operator, scan_tensors, build_graph, map_gguf_name};
-// HardwareProfile not needed: CUDA device always selected when available, GGUF weights stay on CPU
 use crate::backends::vision::VisionEncoder;
+use crate::backends::attention::{RmsNorm, RawKvCache, apply_rope, apply_rope_q, repeat_kv, rms_norm_no_scale};
+use crate::backends::multimodal::splice_visual_embeddings;
+use crate::backends::weights::{ExecContext, WeightStore, meta_u32, meta_u32_agnostic, meta_f32_agnostic, find_meta_key};
+use crate::backends::audio::AudioEncoder;
 
-// RMSNorm implementation in Candle
-struct RmsNorm {
-    weight: Tensor,
-    eps: f64,
-    is_gemma: bool,
+
+
+
+
+#[derive(Clone)]
+pub(crate) struct BlockData {
+    pub k: Tensor,
+    pub k_scale: Option<Tensor>,
+    pub v: Tensor,
+    pub v_scale: Option<Tensor>,
 }
 
-impl RmsNorm {
-    fn new(weight: Tensor, eps: f64, is_gemma: bool) -> Self {
-        Self { weight, eps, is_gemma }
+fn generate_hadamard_orthogonal(d: usize) -> Vec<f32> {
+    let mut p2 = 1;
+    while p2 * 2 <= d {
+        p2 *= 2;
     }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let orig_dtype = x.dtype();
-        let x_f32 = x.to_dtype(DType::F32)?;
-        
-        let w_len = self.weight.dim(0)?;
-        let last_dim = x_f32.dim(x_f32.rank() - 1)?;
-        
-        let w_scaled = if self.is_gemma {
-            self.weight.affine(1.0, 1.0)?
-        } else {
-            self.weight.clone()
-        };
-
-        if last_dim != w_len && last_dim % w_len == 0 {
-            let rank = x_f32.rank();
-            let reshaped = if rank == 3 {
-                let (b, s, _) = x_f32.dims3()?;
-                let h = last_dim / w_len;
-                x_f32.reshape((b, s, h, w_len))?
-            } else if rank == 2 {
-                let (s, _) = x_f32.dims2()?;
-                let h = last_dim / w_len;
-                x_f32.reshape((s, h, w_len))?
-            } else {
-                return Err(anyhow!("Unsupported rank {} in RmsNorm with QK reshaping", rank));
-            };
-            
-            let variance = reshaped.sqr()?.mean_keepdim(reshaped.rank() - 1)?;
-            let x_norm_f32 = reshaped.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-            let x_norm = x_norm_f32.to_dtype(orig_dtype)?;
-            
-            let out_reshaped = x_norm.broadcast_mul(&w_scaled)?;
-            let out = if rank == 3 {
-                let (b, s, _, _) = out_reshaped.dims4()?;
-                out_reshaped.reshape((b, s, last_dim))?
-            } else {
-                let (s, _, _) = out_reshaped.dims3()?;
-                out_reshaped.reshape((s, last_dim))?
-            };
-            Ok(out)
-        } else {
-            let variance = x_f32.sqr()?.mean_keepdim(x_f32.rank() - 1)?;
-            let denom = (variance + self.eps)?.sqrt()?;
-            let x_norm_f32 = x_f32.broadcast_div(&denom)?;
-            let x_norm = x_norm_f32.to_dtype(orig_dtype)?;
-            let out = x_norm.broadcast_mul(&w_scaled)?;
-            Ok(out)
-        }
-    }
-}
-
-fn rms_norm_no_scale(x: &Tensor, eps: f64) -> Result<Tensor> {
-    let orig_dtype = x.dtype();
-    let x_f32 = x.to_dtype(DType::F32)?;
-    let variance = x_f32.sqr()?.mean_keepdim(x_f32.rank() - 1)?;
-    let denom = (variance + eps)?.sqrt()?;
-    let x_norm_f32 = x_f32.broadcast_div(&denom)?;
-    let x_norm = x_norm_f32.to_dtype(orig_dtype)?;
-    Ok(x_norm)
-}
-
-
-
-fn apply_rope(
-    q: &Tensor, // (b_sz, seq_len, n_heads, head_dim)
-    k: &Tensor, // (b_sz, seq_len, n_kv_heads, head_dim)
-    batch: &BatchInput,
-    kv_cache: &RawKvCache,
-    rope_theta: f32,
-) -> Result<(Tensor, Tensor)> {
-    if rope_theta == 0.0 {
-        return Ok((q.clone(), k.clone()));
-    }
-    let dev = q.device();
-    let (b_sz, seq_len, n_heads, head_dim) = q.dims4()?;
-    let (_, _, n_kv_heads, _) = k.dims4()?;
     
-    let half_dim = head_dim / 2;
-    
-    let inv_freq_vec: Vec<f32> = (0..half_dim)
-        .map(|i| 1.0 / rope_theta.powf((2 * i) as f32 / head_dim as f32))
-        .collect();
-    let inv_freq = Tensor::from_vec(inv_freq_vec, (1, half_dim), dev)?;
-
-    let mut pos_vec = Vec::with_capacity(b_sz * seq_len);
-    for b in 0..b_sz {
-        let seq_id = batch.seq_ids[b];
-        let seq_len_before = kv_cache.get_seq_len(seq_id);
-        for t in 0..seq_len {
-            pos_vec.push((seq_len_before + t) as f32);
-        }
-    }
-    let pos = Tensor::from_vec(pos_vec, (b_sz * seq_len, 1), dev)?;
-    let freqs = pos.matmul(&inv_freq)?;
-
-    let cos = freqs.cos()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim, 1))?;
-    let sin = freqs.sin()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim, 1))?;
-
-    let q_reshaped = q.reshape((b_sz, seq_len, n_heads, half_dim, 2))?;
-    let q1 = q_reshaped.narrow(candle_core::D::Minus1, 0, 1)?;
-    let q2 = q_reshaped.narrow(candle_core::D::Minus1, 1, 1)?;
-
-    let q_out_1 = (q1.broadcast_mul(&cos)? - q2.broadcast_mul(&sin)?)?;
-    let q_out_2 = (q1.broadcast_mul(&sin)? + q2.broadcast_mul(&cos)?)?;
-    let q_out = Tensor::cat(&[q_out_1, q_out_2], candle_core::D::Minus1)?.reshape((b_sz, seq_len, n_heads, head_dim))?;
-
-    let k_reshaped = k.reshape((b_sz, seq_len, n_kv_heads, half_dim, 2))?;
-    let k1 = k_reshaped.narrow(candle_core::D::Minus1, 0, 1)?;
-    let k2 = k_reshaped.narrow(candle_core::D::Minus1, 1, 1)?;
-
-    let k_out_1 = (k1.broadcast_mul(&cos)? - k2.broadcast_mul(&sin)?)?;
-    let k_out_2 = (k1.broadcast_mul(&sin)? + k2.broadcast_mul(&cos)?)?;
-    let k_out = Tensor::cat(&[k_out_1, k_out_2], candle_core::D::Minus1)?.reshape((b_sz, seq_len, n_kv_heads, head_dim))?;
-
-    Ok((q_out, k_out))
-}
-
-fn apply_rope_q(
-    q: &Tensor, // (b_sz, seq_len, n_heads, head_dim)
-    batch: &BatchInput,
-    kv_cache: &RawKvCache,
-    rope_theta: f32,
-) -> Result<Tensor> {
-    if rope_theta == 0.0 {
-        return Ok(q.clone());
-    }
-    let dev = q.device();
-    let (b_sz, seq_len, n_heads, head_dim) = q.dims4()?;
-    
-    let half_dim = head_dim / 2;
-    
-    let inv_freq_vec: Vec<f32> = (0..half_dim)
-        .map(|i| 1.0 / rope_theta.powf((2 * i) as f32 / head_dim as f32))
-        .collect();
-    let inv_freq = Tensor::from_vec(inv_freq_vec, (1, half_dim), dev)?;
-
-    let mut pos_vec = Vec::with_capacity(b_sz * seq_len);
-    for b in 0..b_sz {
-        let seq_id = batch.seq_ids[b];
-        let seq_len_before = kv_cache.get_seq_len(seq_id);
-        for t in 0..seq_len {
-            pos_vec.push((seq_len_before + t) as f32);
-        }
-    }
-    let pos = Tensor::from_vec(pos_vec, (b_sz * seq_len, 1), dev)?;
-    let freqs = pos.matmul(&inv_freq)?;
-
-    let cos = freqs.cos()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim, 1))?;
-    let sin = freqs.sin()?.to_dtype(q.dtype())?.reshape((b_sz, seq_len, 1, half_dim, 1))?;
-
-    let q_reshaped = q.reshape((b_sz, seq_len, n_heads, half_dim, 2))?;
-    let q1 = q_reshaped.narrow(candle_core::D::Minus1, 0, 1)?;
-    let q2 = q_reshaped.narrow(candle_core::D::Minus1, 1, 1)?;
-
-    let q_out_1 = (q1.broadcast_mul(&cos)? - q2.broadcast_mul(&sin)?)?;
-    let q_out_2 = (q1.broadcast_mul(&sin)? + q2.broadcast_mul(&cos)?)?;
-    let q_out = Tensor::cat(&[q_out_1, q_out_2], candle_core::D::Minus1)?.reshape((b_sz, seq_len, n_heads, head_dim))?;
-
-    Ok(q_out)
-}
-
-fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
-    if n_rep == 1 {
-        Ok(xs)
-    } else {
-        let (n_kv_heads, seq_len, head_dim) = xs.dims3()?;
-        let xs = xs.unsqueeze(1)?;
-        let xs = xs.expand((n_kv_heads, n_rep, seq_len, head_dim))?;
-        let xs = xs.reshape((n_kv_heads * n_rep, seq_len, head_dim))?;
-        Ok(xs)
-    }
-}
-
-// Host-side raw KV cache storage
-struct RawKvCache {
-    seq_lengths: HashMap<SeqId, usize>,
-}
-
-impl RawKvCache {
-    fn new(_num_blocks: usize, _block_size: usize, _n_layers: usize, _n_kv_heads: usize, _head_dim: usize) -> Self {
-        Self {
-            seq_lengths: HashMap::new(),
-        }
-    }
-
-    fn get_seq_len(&self, seq_id: SeqId) -> usize {
-        *self.seq_lengths.get(&seq_id).unwrap_or(&0)
-    }
-
-    fn set_seq_len(&mut self, seq_id: SeqId, len: usize) {
-        self.seq_lengths.insert(seq_id, len);
-    }
-}
-
-// Helper function to splice visual tokens into text embeddings.
-fn splice_visual_embeddings(
-    text_embeds: &Tensor,
-    visual_embeds: &Tensor,
-    token_ids: &[u32],
-    vision_start_id: u32,
-    vision_end_id: u32,
-) -> Result<Tensor> {
-    let (b_sz, seq_len, hidden_dim) = text_embeds.dims3()?;
-    if b_sz != 1 {
-        // Fallback: only support batch size 1 for multimodal prefill
-        return Ok(text_embeds.clone());
-    }
-
-    // 1. Model-agnostic run-based detection of image placeholder sequence
-    let mut max_run_len = 0;
-    let mut _max_run_token_id = 0;
-    let mut max_run_start_idx = 0;
-    
-    let mut current_token_id = 0;
-    let mut current_run_len = 0;
-    let mut current_run_start_idx = 0;
-    
-    for (idx, &tok) in token_ids.iter().enumerate() {
-        if idx == 0 {
-            current_token_id = tok;
-            current_run_len = 1;
-            current_run_start_idx = 0;
-        } else if tok == current_token_id {
-            current_run_len += 1;
-        } else {
-            if current_run_len > max_run_len {
-                max_run_len = current_run_len;
-                _max_run_token_id = current_token_id;
-                max_run_start_idx = current_run_start_idx;
+    let mut h = vec![0.0f32; d * d];
+    let mut h_sub = vec![1.0f32; p2 * p2];
+    let mut step = 1;
+    while step < p2 {
+        for i in 0..step {
+            for j in 0..step {
+                let val = h_sub[i * p2 + j];
+                h_sub[i * p2 + (j + step)] = val;
+                h_sub[(i + step) * p2 + j] = val;
+                h_sub[(i + step) * p2 + (j + step)] = -val;
             }
-            current_token_id = tok;
-            current_run_len = 1;
-            current_run_start_idx = idx;
+        }
+        step *= 2;
+    }
+    
+    let scale = 1.0 / (p2 as f32).sqrt();
+    for i in 0..p2 {
+        for j in 0..p2 {
+            h[i * d + j] = h_sub[i * p2 + j] * scale;
         }
     }
-    if current_run_len > max_run_len {
-        max_run_len = current_run_len;
-        _max_run_token_id = current_token_id;
-        max_run_start_idx = current_run_start_idx;
+    for i in p2..d {
+        h[i * d + i] = 1.0;
     }
-
-    if max_run_len >= 16 {
-        let run_start = max_run_start_idx;
-        let run_len = max_run_len;
-        let visual_len = visual_embeds.dim(1)?;
-        
-        let before = text_embeds.narrow(1, 0, run_start)?;
-        let after = text_embeds.narrow(1, run_start + run_len, seq_len - (run_start + run_len))?;
-        
-        let middle = if visual_len == run_len {
-            visual_embeds.clone()
-        } else if visual_len > run_len {
-            visual_embeds.narrow(1, 0, run_len)?
-        } else {
-            let pad_len = run_len - visual_len;
-            let pad = Tensor::zeros((1, pad_len, hidden_dim), visual_embeds.dtype(), visual_embeds.device())?;
-            Tensor::cat(&[visual_embeds, &pad], 1)?
-        };
-        
-        return Ok(Tensor::cat(&[&before, &middle, &after], 1)?);
-    }
-
-    // 2. Fallback to start/end marker-based logic
-    let mut start_idx = None;
-    let mut end_idx = None;
-    for (idx, &tok) in token_ids.iter().enumerate() {
-        if tok == vision_start_id {
-            start_idx = Some(idx);
-        } else if tok == vision_end_id {
-            end_idx = Some(idx);
-        }
-    }
-
-    if start_idx.is_none() || end_idx.is_none() {
-        // No start/end markers found - the run-based detection above handles this case.
-        // Nothing to do here: if max_run_len < 16 the function returns text_embeds unchanged.
-    }
-
-
-    if let (Some(start), Some(end)) = (start_idx, end_idx) {
-        if end > start + 1 {
-            let num_pads = end - start - 1;
-            let visual_len = visual_embeds.dim(1)?;
-            
-            let before = text_embeds.narrow(1, 0, start + 1)?;
-            let after = text_embeds.narrow(1, end, seq_len - end)?;
-            
-            let middle = if visual_len == num_pads {
-                visual_embeds.clone()
-            } else if visual_len > num_pads {
-                visual_embeds.narrow(1, 0, num_pads)?
-            } else {
-                let pad_len = num_pads - visual_len;
-                let pad = Tensor::zeros((1, pad_len, hidden_dim), visual_embeds.dtype(), visual_embeds.device())?;
-                Tensor::cat(&[visual_embeds, &pad], 1)?
-            };
-            
-            return Ok(Tensor::cat(&[&before, &middle, &after], 1)?);
-        }
-    }
-    Ok(text_embeds.clone())
+    h
 }
 
-struct ExecContext {
-    activations: HashMap<String, Tensor>,
+fn quantize(x: &Tensor, dtype: KvDtype, comp_dtype: DType) -> Result<(Tensor, Tensor)> {
+    let dev = x.device();
+    let abs_x = x.abs()?;
+    let max_val = abs_x.max_keepdim(3)?;
+    
+    let max_quant = match dtype {
+        KvDtype::Q8 => 127.0f32,
+        KvDtype::Q4 => 7.0f32,
+        _ => 1.0f32,
+    };
+    
+    let scale = max_val.affine(1.0 / max_quant as f64, 0.0)?.broadcast_add(&Tensor::new(1e-5f32, dev)?.to_dtype(comp_dtype)?)?;
+    let scaled = x.broadcast_div(&scale)?;
+    let rounded = scaled.round()?;
+    
+    let offset = match dtype {
+        KvDtype::Q8 => 128.0f32,
+        KvDtype::Q4 => 8.0f32,
+        _ => 0.0f32,
+    };
+    
+    let u8_tensor = rounded.affine(1.0, offset as f64)?.to_dtype(DType::U8)?;
+    Ok((u8_tensor, scale))
 }
 
-impl ExecContext {
-    fn new() -> Self {
-        Self {
-            activations: HashMap::new(),
+fn dequantize(u8_tensor: &Tensor, scale: &Tensor, dtype: KvDtype, comp_dtype: DType) -> Result<Tensor> {
+    let f_tensor = u8_tensor.to_dtype(comp_dtype)?;
+    let offset = match dtype {
+        KvDtype::Q8 => 128.0f32,
+        KvDtype::Q4 => 8.0f32,
+        _ => 0.0f32,
+    };
+    let centered = f_tensor.affine(1.0, -offset as f64)?;
+    let dequantized = centered.broadcast_mul(scale)?;
+    Ok(dequantized)
+}
+
+fn update_block_tensor(
+    block_tensor: &Tensor,
+    slice_tensor: &Tensor,
+    start_offset: usize,
+    chunk_len: usize,
+) -> Result<Tensor> {
+    let block_size = block_tensor.dim(1)?;
+    let end_offset = start_offset + chunk_len;
+    
+    let left = if start_offset > 0 {
+        Some(block_tensor.narrow(1, 0, start_offset)?)
+    } else {
+        None
+    };
+    
+    let right = if end_offset < block_size {
+        Some(block_tensor.narrow(1, end_offset, block_size - end_offset)?)
+    } else {
+        None
+    };
+    
+    let res = match (left, right) {
+        (Some(l), Some(r)) => {
+            Tensor::cat(&[&l, slice_tensor, &r], 1)?
         }
-    }
-
-    fn get(&self, name: &str) -> Result<Tensor> {
-        self.activations.get(name)
-            .cloned()
-            .ok_or_else(|| anyhow!("Activation tensor not found in context: {}", name))
-    }
-
-    fn insert(&mut self, name: String, tensor: Tensor) {
-        self.activations.insert(name, tensor);
-    }
-
-    fn remove(&mut self, name: &str) {
-        self.activations.remove(name);
-    }
+        (Some(l), None) => {
+            Tensor::cat(&[&l, slice_tensor], 1)?
+        }
+        (None, Some(r)) => {
+            Tensor::cat(&[slice_tensor, &r], 1)?
+        }
+        (None, None) => {
+            slice_tensor.clone()
+        }
+    };
+    Ok(res)
 }
 
 pub struct CandleBackend {
@@ -361,8 +141,8 @@ pub struct CandleBackend {
     weights: HashMap<String, Tensor>,
     /// Quantized GGUF weights kept on CPU; dequantized lazily
     quantized_weights: HashMap<String, candle_core::quantized::QTensor>,
-    /// Dequantization cache: GPU-tier if weight fits in budget, CPU-tier otherwise
-    deq_cache: std::sync::Mutex<HashMap<String, Tensor>>,
+    /// Dequantization cache: embed/norm weights stored as f32 to avoid f16 overflow
+    deq_cache: Mutex<HashMap<String, Tensor>>,
     /// Running GPU bytes used by deq_cache
     gpu_cache_bytes: std::sync::atomic::AtomicU64,
     /// GPU VRAM budget for weight cache (bytes); set at load time
@@ -374,15 +154,23 @@ pub struct CandleBackend {
     eos_token_id: u32,
     /// Primary compute device (CUDA or CPU)
     device: Device,
+    /// Compute dtype: F32 on CPU (prevents f16 overflow), F16 on CUDA.
+    compute_dtype: DType,
     vision_encoder: Option<VisionEncoder>,
     visual_embeddings: Mutex<Option<Tensor>>,
     last_image_path: Mutex<Option<String>>,
     last_pixel_values: Mutex<Option<Tensor>>,
-    gpu_kv_cache: Mutex<HashMap<(usize, SeqId), (Tensor, Tensor)>>,
+    audio_encoder: Option<AudioEncoder>,
+    audio_embeddings: Mutex<Option<Tensor>>,
+    last_audio_path: Mutex<Option<String>>,
+    last_audio_values: Mutex<Option<Tensor>>,
+    gpu_kv_cache: Mutex<HashMap<(usize, BlockId), BlockData>>,
+    seq_blocks: Mutex<HashMap<SeqId, Vec<BlockId>>>,
     explicit_dequantize: bool,
     use_vram_embeddings: bool,
-    qmatmul_cache: std::sync::Mutex<HashMap<String, QMatMul>>,
+    qmatmul_cache: Mutex<HashMap<String, QMatMul>>,
 }
+
 
 impl CandleBackend {
     pub fn new() -> Self {
@@ -391,7 +179,7 @@ impl CandleBackend {
         Self {
             weights: HashMap::new(),
             quantized_weights: HashMap::new(),
-            deq_cache: std::sync::Mutex::new(HashMap::new()),
+            deq_cache: Mutex::new(HashMap::new()),
             gpu_cache_bytes: std::sync::atomic::AtomicU64::new(0),
             gpu_cache_budget: 0,
             graph: None,
@@ -402,192 +190,58 @@ impl CandleBackend {
                 n_kv_heads: 32,
                 head_dim: 128,
                 block_size: 16,
-                dtype: KvDtype::F16,
+                dtype: match std::env::var("LLM_KV_DTYPE").as_deref() {
+                    Ok("q8") | Ok("Q8") => KvDtype::Q8,
+                    Ok("q4") | Ok("Q4") => KvDtype::Q4,
+                    _ => KvDtype::F16,
+                },
             },
             eos_token_id: 2,
             device: Device::Cpu,
+            // F32 on CPU prevents f16 accumulation overflow in matmul;
+            // updated to F16 when CUDA device is selected at load time.
+            compute_dtype: DType::F32,
             vision_encoder: None,
             visual_embeddings: Mutex::new(None),
             last_image_path: Mutex::new(None),
             last_pixel_values: Mutex::new(None),
+            audio_encoder: None,
+            audio_embeddings: Mutex::new(None),
+            last_audio_path: Mutex::new(None),
+            last_audio_values: Mutex::new(None),
             gpu_kv_cache: Mutex::new(HashMap::new()),
+            seq_blocks: Mutex::new(HashMap::new()),
             explicit_dequantize,
             use_vram_embeddings,
-            qmatmul_cache: std::sync::Mutex::new(HashMap::new()),
+            qmatmul_cache: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Resolve a weight tensor.
-    /// - safetensors weights: already on the primary device, returned directly.
-    /// - GGUF QTensors: dequantized once directly to target device:
-    ///   * Cache tier: if the dequantized bytes fit in `gpu_cache_budget`, cached on GPU.
-    ///   * Offload tier: dequantized once, stored in CPU memory as F16, and copied to GPU on demand.
+    /// Thin wrapper: resolve a weight tensor by delegating to `WeightStore`.
+    ///
+    /// This keeps the ~20 call sites in `forward_pass` unchanged while the
+    /// actual resolution logic lives in `weights.rs`.
     fn get_weight(&self, name: &str, local_cache: &mut HashMap<String, Tensor>) -> Result<Tensor> {
-        // 1. Full-precision map (safetensors)
-        if let Some(t) = self.weights.get(name) {
-            return Ok(t.clone());
-        }
-        // 2. Already in local_cache (GPU or CPU tiered)
-        if let Some(t) = local_cache.get(name) {
-            return Ok(t.clone());
-        }
-        // 2b. Already in deq_cache (e.g. eagerly dequantized non-matmul weights on startup)
-        if let Ok(cache) = self.deq_cache.lock() {
-            if let Some(t) = cache.get(name) {
-                local_cache.insert(name.to_string(), t.clone());
-                return Ok(t.clone());
-            }
-        }
-        // 3. Dequantize from QTensor (done only ONCE per weight name if cached, or on-the-fly if not)
-        if let Some(qt) = self.quantized_weights.get(name) {
-            if !self.explicit_dequantize {
-                let t = qt.dequantize(&self.device)
-                    .with_context(|| format!("dequantize {} to {:?}", name, self.device))?;
-                let t = t.to_dtype(DType::F16)?;
-                let mut cache = self.deq_cache.lock().map_err(|_| anyhow!("deq_cache poisoned"))?;
-                cache.insert(name.to_string(), t.clone());
-                local_cache.insert(name.to_string(), t.clone());
-                return Ok(t);
-            }
-            let tensor_bytes = qt.shape().elem_count() as u64 * 2; // F16 = 2 bytes
-
-            let mut cache = self.deq_cache.lock().map_err(|_| anyhow!("deq_cache poisoned"))?;
-            let used = self.gpu_cache_bytes.load(std::sync::atomic::Ordering::Relaxed);
-            if used + tensor_bytes <= self.gpu_cache_budget {
-                // GPU cached
-                let t = qt.dequantize(&self.device)
-                    .with_context(|| format!("dequantize {} to {:?}", name, self.device))?;
-                let t = t.to_dtype(DType::F16)?;
-                self.gpu_cache_bytes.fetch_add(tensor_bytes, std::sync::atomic::Ordering::Relaxed);
-                cache.insert(name.to_string(), t.clone());
-                local_cache.insert(name.to_string(), t.clone());
-                return Ok(t);
-            } else {
-                // CPU offloaded
-                let t = qt.dequantize(&Device::Cpu)
-                    .with_context(|| format!("dequantize {} to CPU", name))?;
-                let t = t.to_dtype(DType::F16)?;
-                cache.insert(name.to_string(), t.clone());
-                local_cache.insert(name.to_string(), t.clone());
-                return Ok(t);
-            }
-        }
-        // Fallback: lm_head.weight alias → use model.embed_tokens.weight (for explicit_dequantize or safetensors paths)
-        if name == "lm_head.weight" {
-            let embed_name = "model.embed_tokens.weight";
-            if let Some(t) = self.weights.get(embed_name) {
-                let t = t.to_device(&self.device)?;
-                local_cache.insert(name.to_string(), t.clone());
-                return Ok(t);
-            }
-            if let Ok(cache) = self.deq_cache.lock() {
-                if let Some(t) = cache.get(embed_name) {
-                    let t = t.to_device(&self.device)?;
-                    local_cache.insert(name.to_string(), t.clone());
-                    return Ok(t);
-                }
-            }
-        }
-        Err(anyhow!("Weight not found: {}", name))
+        let store = WeightStore {
+            weights: &self.weights,
+            deq_cache: &self.deq_cache,
+            quantized_weights: &self.quantized_weights,
+            gpu_cache_bytes: &self.gpu_cache_bytes,
+            gpu_cache_budget: self.gpu_cache_budget,
+            explicit_dequantize: self.explicit_dequantize,
+            device: &self.device,
+        };
+        store.get(name, local_cache)
     }
 
-
-
+    /// Set pre-computed visual embeddings (called by the CLI before forward_pass).
     pub fn set_visual_embeddings(&self, embeds: Tensor) {
-        if let Ok(mut lock) = self.visual_embeddings.lock() {
-            *lock = Some(embeds);
-        }
-    }
-
-    /// Query free VRAM via nvidia-smi; returns 0 on CPU-only systems.
-    fn query_free_vram_bytes() -> u64 {
-        if !candle_core::utils::cuda_is_available() {
-            return 0;
-        }
-        std::process::Command::new("nvidia-smi")
-            .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<u64>().ok()))
-            .map(|mib| mib * 1024 * 1024)
-            .unwrap_or(4 * 1024 * 1024 * 1024) // 4 GB conservative default
-    }
-
-    fn get_metadata_u32(metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>, key: &str) -> Option<u32> {
-        match metadata.get(key) {
-            Some(candle_core::quantized::gguf_file::Value::U8(v)) => Some(*v as u32),
-            Some(candle_core::quantized::gguf_file::Value::I8(v)) => Some(*v as u32),
-            Some(candle_core::quantized::gguf_file::Value::U16(v)) => Some(*v as u32),
-            Some(candle_core::quantized::gguf_file::Value::I16(v)) => Some(*v as u32),
-            Some(candle_core::quantized::gguf_file::Value::U32(v)) => Some(*v),
-            Some(candle_core::quantized::gguf_file::Value::I32(v)) => Some(*v as u32),
-            Some(candle_core::quantized::gguf_file::Value::U64(v)) => Some(*v as u32),
-            Some(candle_core::quantized::gguf_file::Value::I64(v)) => Some(*v as u32),
-            Some(candle_core::quantized::gguf_file::Value::Array(arr)) => {
-                if let Some(first) = arr.first() {
-                    match first {
-                        candle_core::quantized::gguf_file::Value::U8(v) => Some(*v as u32),
-                        candle_core::quantized::gguf_file::Value::I8(v) => Some(*v as u32),
-                        candle_core::quantized::gguf_file::Value::U16(v) => Some(*v as u32),
-                        candle_core::quantized::gguf_file::Value::I16(v) => Some(*v as u32),
-                        candle_core::quantized::gguf_file::Value::U32(v) => Some(*v),
-                        candle_core::quantized::gguf_file::Value::I32(v) => Some(*v as u32),
-                        candle_core::quantized::gguf_file::Value::U64(v) => Some(*v as u32),
-                        candle_core::quantized::gguf_file::Value::I64(v) => Some(*v as u32),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn get_metadata_f32(metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>, key: &str) -> Option<f32> {
-        match metadata.get(key) {
-            Some(candle_core::quantized::gguf_file::Value::F32(v)) => Some(*v),
-            Some(candle_core::quantized::gguf_file::Value::F64(v)) => Some(*v as f32),
-            Some(candle_core::quantized::gguf_file::Value::Array(arr)) => {
-                if let Some(first) = arr.first() {
-                    match first {
-                        candle_core::quantized::gguf_file::Value::F32(v) => Some(*v),
-                        candle_core::quantized::gguf_file::Value::F64(v) => Some(*v as f32),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn find_metadata_key(metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>, suffix: &str) -> Option<String> {
-        if metadata.contains_key(suffix) {
-            return Some(suffix.to_string());
-        }
-        for key in metadata.keys() {
-            if key == suffix || key.ends_with(&format!(".{}", suffix)) {
-                return Some(key.clone());
-            }
-        }
-        None
-    }
-
-    fn get_metadata_u32_agnostic(metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>, suffix: &str) -> Option<u32> {
-        let key = Self::find_metadata_key(metadata, suffix)?;
-        Self::get_metadata_u32(metadata, &key)
-    }
-
-    fn get_metadata_f32_agnostic(metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>, suffix: &str) -> Option<f32> {
-        let key = Self::find_metadata_key(metadata, suffix)?;
-        Self::get_metadata_f32(metadata, &key)
+        *self.visual_embeddings.lock() = Some(embeds);
     }
 }
 
 impl LlmBackend for CandleBackend {
+
     fn name(&self) -> &str {
         match self.device {
             Device::Cpu => "candle-cpu",
@@ -601,8 +255,18 @@ impl LlmBackend for CandleBackend {
     }
 
     fn clear_sequence(&self, seq_id: SeqId) {
-        if let Ok(mut cache) = self.gpu_kv_cache.lock() {
-            cache.retain(|&(_, sid), _| sid != seq_id);
+        let blocks_to_clear = {
+            let mut seq_blocks_map = self.seq_blocks.lock();
+            seq_blocks_map.remove(&seq_id)
+        };
+        if let Some(blocks) = blocks_to_clear {
+            let mut cache = self.gpu_kv_cache.lock();
+            let n_layers = self.kv_config.n_layers;
+            for layer_idx in 0..n_layers {
+                for &block_id in &blocks {
+                    cache.remove(&(layer_idx, block_id));
+                }
+            }
         }
     }
 
@@ -629,10 +293,22 @@ impl LlmBackend for CandleBackend {
             Device::Cpu
         };
         self.device = dev.clone();
+        self.compute_dtype = if dev.is_cpu() { DType::F32 } else { DType::F16 };
 
         // Query free VRAM for cache budget (leave 2.0 GB headroom for activations/KV cache)
         let vram_headroom_bytes: u64 = 2_000 * 1024 * 1024;
-        let mut free_vram = Self::query_free_vram_bytes();
+        let mut free_vram = if candle_core::utils::cuda_is_available() {
+            std::process::Command::new("nvidia-smi")
+                .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<u64>().ok()))
+                .map(|mib| mib * 1024 * 1024)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         if free_vram == 0 && dev.is_cuda() {
             tracing::info!("nvidia-smi query returned 0, but CUDA device is active. Falling back to 6.0 GB estimated free VRAM.");
             free_vram = 6_000 * 1024 * 1024;
@@ -716,25 +392,25 @@ impl LlmBackend for CandleBackend {
                 _ => 151936,
             };
 
-            let n_layers = Self::get_metadata_u32_agnostic(&model.metadata, "block_count")
+            let n_layers = meta_u32_agnostic(&model.metadata, "block_count")
                 .ok_or_else(|| anyhow!("Missing block_count in GGUF metadata"))? as usize;
 
-            let hidden_dim = Self::get_metadata_u32_agnostic(&model.metadata, "embedding_length")
+            let hidden_dim = meta_u32_agnostic(&model.metadata, "embedding_length")
                 .ok_or_else(|| anyhow!("Missing embedding_length in GGUF metadata"))? as usize;
 
-            let intermediate_dim = Self::get_metadata_u32_agnostic(&model.metadata, "feed_forward_length")
+            let intermediate_dim = meta_u32_agnostic(&model.metadata, "feed_forward_length")
                 .ok_or_else(|| anyhow!("Missing feed_forward_length in GGUF metadata"))? as usize;
 
-            let n_heads = Self::get_metadata_u32_agnostic(&model.metadata, "attention.head_count")
+            let n_heads = meta_u32_agnostic(&model.metadata, "attention.head_count")
                 .ok_or_else(|| anyhow!("Missing head_count in GGUF metadata"))? as usize;
 
-            let n_kv_heads = Self::get_metadata_u32_agnostic(&model.metadata, "attention.head_count_kv")
+            let n_kv_heads = meta_u32_agnostic(&model.metadata, "attention.head_count_kv")
                 .unwrap_or(n_heads as u32) as usize;
 
-            let max_seq_len = Self::get_metadata_u32_agnostic(&model.metadata, "context_length")
+            let max_seq_len = meta_u32_agnostic(&model.metadata, "context_length")
                 .unwrap_or(4096) as usize;
 
-            let rope_theta = Self::get_metadata_f32_agnostic(&model.metadata, "rope.freq_base")
+            let rope_theta = meta_f32_agnostic(&model.metadata, "rope.freq_base")
                 .unwrap_or(10000.0);
 
             let head_dim = if let Some(info) = model.tensor_infos.get("blk.0.attn_q.weight") {
@@ -742,14 +418,14 @@ impl LlmBackend for CandleBackend {
             } else if let Some(info) = model.tensor_infos.get("blk.0.attn_q") {
                 info.shape.dims()[0] / n_heads
             } else {
-                Self::get_metadata_u32_agnostic(&model.metadata, "attention.key_length")
+                meta_u32_agnostic(&model.metadata, "attention.key_length")
                     .unwrap_or((hidden_dim / n_heads) as u32) as usize
             };
 
-            let rms_norm_eps = Self::get_metadata_f32_agnostic(&model.metadata, "attention.layer_norm_rms_epsilon")
+            let rms_norm_eps = meta_f32_agnostic(&model.metadata, "attention.layer_norm_rms_epsilon")
                 .unwrap_or(1e-6);
 
-            let eos_token_id = Self::get_metadata_u32(&model.metadata, "tokenizer.ggml.eos_token_id")
+            let eos_token_id = meta_u32(&model.metadata, "tokenizer.ggml.eos_token_id")
                 .unwrap_or(2);
             self.eos_token_id = eos_token_id;
 
@@ -807,26 +483,43 @@ impl LlmBackend for CandleBackend {
                 Some(candle_core::quantized::gguf_file::Value::Bool(b)) => *b,
                 _ => false,
             };
-            let vision_hidden_dim = Self::get_metadata_u32(&model.metadata, "clip.vision.embedding_length")
-                .or_else(|| Self::get_metadata_u32(&mmproj_metadata, "clip.vision.embedding_length"))
+            let has_audio_encoder = match model.metadata.get("clip.has_audio_encoder")
+                .or_else(|| mmproj_metadata.get("clip.has_audio_encoder")) {
+                Some(candle_core::quantized::gguf_file::Value::Bool(b)) => *b,
+                _ => false,
+            };
+            let audio_hidden_dim = meta_u32(&model.metadata, "clip.audio.embedding_length")
+                .or_else(|| meta_u32(&mmproj_metadata, "clip.audio.embedding_length"))
                 .map(|v| v as usize);
-            let vision_patch_size = Self::get_metadata_u32(&model.metadata, "clip.vision.patch_size")
-                .or_else(|| Self::get_metadata_u32(&mmproj_metadata, "clip.vision.patch_size"))
+            let audio_block_count = meta_u32(&model.metadata, "clip.audio.block_count")
+                .or_else(|| meta_u32(&mmproj_metadata, "clip.audio.block_count"))
                 .map(|v| v as usize);
-            let vision_image_size = Self::get_metadata_u32(&model.metadata, "clip.vision.image_size")
-                .or_else(|| Self::get_metadata_u32(&mmproj_metadata, "clip.vision.image_size"))
+            let audio_embedding_length = meta_u32(&model.metadata, "clip.audio.embedding_length")
+                .or_else(|| meta_u32(&mmproj_metadata, "clip.audio.embedding_length"))
                 .map(|v| v as usize);
-            let vision_num_layers = Self::get_metadata_u32(&model.metadata, "clip.vision.block_count")
-                .or_else(|| Self::get_metadata_u32(&mmproj_metadata, "clip.vision.block_count"))
+            let audio_num_mel_bins = meta_u32(&model.metadata, "clip.audio.num_mel_bins")
+                .or_else(|| meta_u32(&mmproj_metadata, "clip.audio.num_mel_bins"))
                 .map(|v| v as usize);
-            let vision_num_heads = Self::get_metadata_u32(&model.metadata, "clip.vision.attention.head_count")
-                .or_else(|| Self::get_metadata_u32(&mmproj_metadata, "clip.vision.attention.head_count"))
+            let vision_hidden_dim = meta_u32(&model.metadata, "clip.vision.embedding_length")
+                .or_else(|| meta_u32(&mmproj_metadata, "clip.vision.embedding_length"))
                 .map(|v| v as usize);
-            let vision_projection_dim = Self::get_metadata_u32(&model.metadata, "clip.vision.projection_dim")
-                .or_else(|| Self::get_metadata_u32(&mmproj_metadata, "clip.vision.projection_dim"))
+            let vision_patch_size = meta_u32(&model.metadata, "clip.vision.patch_size")
+                .or_else(|| meta_u32(&mmproj_metadata, "clip.vision.patch_size"))
                 .map(|v| v as usize);
-            let spatial_merge_size = Self::get_metadata_u32(&model.metadata, "clip.vision.spatial_merge_size")
-                .or_else(|| Self::get_metadata_u32(&mmproj_metadata, "clip.vision.spatial_merge_size"))
+            let vision_image_size = meta_u32(&model.metadata, "clip.vision.image_size")
+                .or_else(|| meta_u32(&mmproj_metadata, "clip.vision.image_size"))
+                .map(|v| v as usize);
+            let vision_num_layers = meta_u32(&model.metadata, "clip.vision.block_count")
+                .or_else(|| meta_u32(&mmproj_metadata, "clip.vision.block_count"))
+                .map(|v| v as usize);
+            let vision_num_heads = meta_u32(&model.metadata, "clip.vision.attention.head_count")
+                .or_else(|| meta_u32(&mmproj_metadata, "clip.vision.attention.head_count"))
+                .map(|v| v as usize);
+            let vision_projection_dim = meta_u32(&model.metadata, "clip.vision.projection_dim")
+                .or_else(|| meta_u32(&mmproj_metadata, "clip.vision.projection_dim"))
+                .map(|v| v as usize);
+            let spatial_merge_size = meta_u32(&model.metadata, "clip.vision.spatial_merge_size")
+                .or_else(|| meta_u32(&mmproj_metadata, "clip.vision.spatial_merge_size"))
                 .map(|v| v as usize);
 
             let is_deepstack_layers = match model.metadata.get("clip.vision.is_deepstack_layers")
@@ -848,10 +541,10 @@ impl LlmBackend for CandleBackend {
                 _ => None,
             };
 
-            let shared_kv_layers = Self::get_metadata_u32_agnostic(&model.metadata, "attention.shared_kv_layers")
+            let shared_kv_layers = meta_u32_agnostic(&model.metadata, "attention.shared_kv_layers")
                 .map(|v| v as usize);
 
-            let sliding_window_pattern = match Self::find_metadata_key(&model.metadata, "attention.sliding_window_pattern") {
+            let sliding_window_pattern = match find_meta_key(&model.metadata, "attention.sliding_window_pattern") {
                 Some(key) => match model.metadata.get(&key) {
                     Some(candle_core::quantized::gguf_file::Value::Array(arr)) => {
                         Some(arr.iter().map(|v| match v {
@@ -864,27 +557,27 @@ impl LlmBackend for CandleBackend {
                 None => None,
             };
 
-            let sliding_window = Self::get_metadata_u32_agnostic(&model.metadata, "attention.sliding_window")
+            let sliding_window = meta_u32_agnostic(&model.metadata, "attention.sliding_window")
                 .map(|v| v as usize);
 
-            let key_length = Self::get_metadata_u32_agnostic(&model.metadata, "attention.key_length")
+            let key_length = meta_u32_agnostic(&model.metadata, "attention.key_length")
                 .map(|v| v as usize);
 
-            let key_length_swa = Self::get_metadata_u32_agnostic(&model.metadata, "attention.key_length_swa")
+            let key_length_swa = meta_u32_agnostic(&model.metadata, "attention.key_length_swa")
                 .map(|v| v as usize);
 
-            let rope_theta_swa = Self::get_metadata_f32_agnostic(&model.metadata, "rope.freq_base_swa");
+            let rope_theta_swa = meta_f32_agnostic(&model.metadata, "rope.freq_base_swa");
 
-            let final_logit_softcapping = Self::get_metadata_f32_agnostic(&model.metadata, "final_logit_softcapping");
+            let final_logit_softcapping = meta_f32_agnostic(&model.metadata, "final_logit_softcapping");
 
-            let ple_dim = Self::get_metadata_u32_agnostic(&model.metadata, "embedding_length_per_layer_input")
+            let ple_dim = meta_u32_agnostic(&model.metadata, "embedding_length_per_layer_input")
                 .map(|v| v as usize);
 
             let is_gemma = arch == "gemma" || arch == "gemma2" || arch == "gemma4";
 
             // Detect activation function from GGUF metadata first, then fall back to arch heuristic.
             // GGUF key: "<arch>.feed_forward_type" (e.g. "llama.feed_forward_type" = "SiLU")
-            let feed_forward_type = Self::find_metadata_key(&model.metadata, "feed_forward_type")
+            let feed_forward_type = find_meta_key(&model.metadata, "feed_forward_type")
                 .and_then(|k| model.metadata.get(&k))
                 .and_then(|v| if let candle_core::quantized::gguf_file::Value::String(s) = v { Some(s.to_lowercase()) } else { None });
             let hidden_act = match feed_forward_type.as_deref() {
@@ -956,6 +649,11 @@ impl LlmBackend for CandleBackend {
                 spatial_merge_size,
                 is_deepstack_layers,
                 projector_type,
+                has_audio_encoder,
+                audio_hidden_dim,
+                audio_block_count,
+                audio_embedding_length,
+                audio_num_mel_bins,
                 shared_kv_layers,
                 sliding_window_pattern,
                 sliding_window,
@@ -1001,12 +699,12 @@ impl LlmBackend for CandleBackend {
                 return Err(anyhow!("No safetensors files found in {:?}", path));
             }
 
-            // Load all SafeTensors tensors to CPU memory in F16 first
+            // Load all SafeTensors tensors to CPU memory in compute_dtype first
             let mut cpu_tensors = HashMap::new();
             for sf_file in sf_files {
                 let loaded = candle_core::safetensors::load(&sf_file, &Device::Cpu)?;
                 for (name, tensor) in loaded {
-                    let casted = tensor.to_dtype(DType::F16)?;
+                    let casted = tensor.to_dtype(self.compute_dtype)?;
                     cpu_tensors.insert(name, casted);
                 }
             }
@@ -1085,21 +783,18 @@ impl LlmBackend for CandleBackend {
         let graph = build_graph(&meta, &group);
         tracing::info!("Compute graph built: {} operators", graph.ops.len());
 
-        let num_blocks = 1024;
-        let kv_cache = RawKvCache::new(
-            num_blocks,
-            16,
-            meta.n_layers,
-            meta.n_kv_heads,
-            meta.head_dim,
-        );
+        let kv_cache = RawKvCache::new();
 
         self.kv_config = KvCacheConfig {
             n_layers: meta.n_layers,
             n_kv_heads: meta.n_kv_heads,
             head_dim: meta.head_dim,
             block_size: 16,
-            dtype: KvDtype::F16,
+            dtype: match std::env::var("LLM_KV_DTYPE").as_deref() {
+                Ok("q8") | Ok("Q8") => KvDtype::Q8,
+                Ok("q4") | Ok("Q4") => KvDtype::Q4,
+                _ => KvDtype::F16,
+            },
         };
 
         self.weights = weights;
@@ -1145,7 +840,7 @@ impl LlmBackend for CandleBackend {
                                 println!("Warning: Eager dequantize failed for {}: {:?}", name, e);
                                 // Fallback to CPU dequantize if GPU fails
                                 if let Ok(t) = qt.dequantize(&Device::Cpu) {
-                                    if let Ok(t) = t.to_dtype(DType::F16) {
+                                    if let Ok(t) = t.to_dtype(self.compute_dtype) {
                                         local_cache.insert(name.clone(), t);
                                     }
                                 }
@@ -1153,7 +848,7 @@ impl LlmBackend for CandleBackend {
                         } else {
                             // Dequantize to CPU directly for offloaded weights (never touch GPU)
                             if let Ok(t) = qt.dequantize(&Device::Cpu) {
-                                if let Ok(t) = t.to_dtype(DType::F16) {
+                                if let Ok(t) = t.to_dtype(self.compute_dtype) {
                                     local_cache.insert(name.clone(), t);
                                 }
                             } else {
@@ -1164,7 +859,7 @@ impl LlmBackend for CandleBackend {
                 }
                 println!("Eager dequantization loop done. local_cache len: {}. model.embed_tokens.weight cached: {}", local_cache.len(), local_cache.contains_key("model.embed_tokens.weight"));
                 // Now transfer all local_cache entries to the Mutex deq_cache
-                if let Ok(mut cache) = self.deq_cache.lock() {
+                { let mut cache = self.deq_cache.lock();
                     *cache = local_cache.clone();
                 }
                 
@@ -1235,18 +930,18 @@ impl LlmBackend for CandleBackend {
                         }
                     }
                 }
-                if let Ok(mut cache) = self.deq_cache.lock() {
+                { let mut cache = self.deq_cache.lock();
                     *cache = local_deq;
                 }
-                if let Ok(mut cache) = self.qmatmul_cache.lock() {
+                { let mut cache = self.qmatmul_cache.lock();
                     *cache = local_qmatmul;
                 }
-                let gpu_deq_bytes = self.deq_cache.lock().unwrap().values().map(|t| t.shape().elem_count() as u64 * 2).sum::<u64>();
+                let gpu_deq_bytes = self.deq_cache.lock().values().map(|t| t.shape().elem_count() as u64 * 2).sum::<u64>();
                 println!("Quantized weight loading finished.");
                 println!("  - Cached standard GPU/device tensors (embed/norm): {} weights ({:.2} MB)", 
-                         self.deq_cache.lock().unwrap().len(), 
+                         self.deq_cache.lock().len(), 
                          gpu_deq_bytes as f64 / (1024.0 * 1024.0));
-                println!("  - Cached QMatMul layers: {} weights", self.qmatmul_cache.lock().unwrap().len());
+                println!("  - Cached QMatMul layers: {} weights", self.qmatmul_cache.lock().len());
             }
         }
 
@@ -1308,6 +1003,58 @@ impl LlmBackend for CandleBackend {
             }
         }
 
+        if meta.has_audio_encoder {
+            let audio_path = if is_gguf {
+                let base = path.to_string_lossy();
+                let stem = if let Some(pos) = base.rfind('.') {
+                    let without_ext = &base[..pos]; // remove .gguf
+                    if let Some(q_pos) = without_ext.rfind('.') {
+                        without_ext[..q_pos].to_string()
+                    } else {
+                        without_ext.to_string()
+                    }
+                } else {
+                    base.to_string()
+                };
+                let suffixes = [
+                    "-mmproj-f16.gguf",
+                    ".mmproj.gguf",
+                    "-mmproj.gguf",
+                    ".BF16-mmproj.gguf",
+                    "-mmproj-f32.gguf",
+                ];
+                let mut found = None;
+                for suffix in &suffixes {
+                    let candidate = format!("{}{}", stem, suffix);
+                    if std::path::Path::new(&candidate).exists() {
+                        found = Some(std::path::PathBuf::from(candidate));
+                        break;
+                    }
+                }
+                if found.is_none() {
+                    if let Some(parent) = path.parent() {
+                        if let Ok(entries) = std::fs::read_dir(parent) {
+                            for entry in entries.flatten() {
+                                let n = entry.file_name().to_string_lossy().to_lowercase();
+                                if n.contains("mmproj") && n.ends_with(".gguf") {
+                                    found = Some(entry.path());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                found.unwrap_or_else(|| path.to_path_buf())
+            } else {
+                path.to_path_buf()
+            };
+            tracing::info!("Attempting to load AudioEncoder from {:?}", audio_path);
+            match AudioEncoder::load(&audio_path, &dev) {
+                Ok(enc) => { self.audio_encoder = Some(enc); }
+                Err(e) => { tracing::warn!("AudioEncoder load skipped: {e}"); }
+            }
+        }
+
         Ok(meta)
     }
 
@@ -1315,7 +1062,7 @@ impl LlmBackend for CandleBackend {
         let graph = self.graph.as_ref().ok_or_else(|| anyhow!("Compute graph not built"))?;
         let meta = self.meta.as_ref().ok_or_else(|| anyhow!("Model metadata not loaded"))?;
         let kv_cache_mutex = self.kv_cache.as_ref().ok_or_else(|| anyhow!("KV Cache not initialized"))?;
-        let mut kv_cache = kv_cache_mutex.lock().map_err(|_| anyhow!("KV Cache mutex poisoned"))?;
+        let mut kv_cache = kv_cache_mutex.lock();
 
         if batch.seq_ids[0] == 1 && kv_cache.get_seq_len(batch.seq_ids[0]) == 0 {
             for (idx, op) in graph.ops.iter().enumerate().take(60) {
@@ -1328,7 +1075,7 @@ impl LlmBackend for CandleBackend {
 
         // Create a local clone of the deq_cache to avoid lock contention on every weight resolution
         let mut local_cache = {
-            let cache = self.deq_cache.lock().map_err(|_| anyhow!("deq_cache poisoned"))?;
+            let cache = self.deq_cache.lock();
             cache.clone()
         };
 
@@ -1343,15 +1090,15 @@ impl LlmBackend for CandleBackend {
         // Feed pixel_values if vision encoder is present
         if meta.has_vision_encoder {
             let img_size = self.vision_encoder.as_ref().map(|e| e.image_size).unwrap_or(768);
-            let active_path = crate::backends::ACTIVE_IMAGE_PATH.lock().unwrap().clone();
-            let mut cache = self.last_pixel_values.lock().unwrap();
-            let mut last_path = self.last_image_path.lock().unwrap();
+            let active_path = crate::backends::ACTIVE_IMAGE_PATH.lock().clone();
+            let mut cache = self.last_pixel_values.lock();
+            let mut last_path = self.last_image_path.lock();
             let needs_load = match (&active_path, &*last_path, &*cache) {
                 (Some(curr), Some(prev), Some(_)) if curr == prev => false,
                 _ => true,
             };
             let pixel_val = if needs_load {
-                let vision_dtype = if dev.is_cpu() { DType::F32 } else { DType::F16 };
+                let vision_dtype = self.compute_dtype;
                 let loaded = if let Some(ref path_str) = active_path {
                     match crate::backends::vision::load_image(Path::new(path_str), img_size, &dev) {
                         Ok(t) => t.to_dtype(vision_dtype)?,
@@ -1372,6 +1119,37 @@ impl LlmBackend for CandleBackend {
             ctx.insert("pixel_values".to_string(), pixel_val);
         }
 
+        // Feed audio_values if audio encoder is present
+        if meta.has_audio_encoder {
+            let active_path = crate::backends::ACTIVE_AUDIO_PATH.lock().clone();
+            let mut cache = self.last_audio_values.lock();
+            let mut last_path = self.last_audio_path.lock();
+            let needs_load = match (&active_path, &*last_path, &*cache) {
+                (Some(curr), Some(prev), Some(_)) if curr == prev => false,
+                _ => true,
+            };
+            let audio_val = if needs_load {
+                let audio_dtype = self.compute_dtype;
+                let loaded = if let Some(ref path_str) = active_path {
+                    match crate::backends::audio::load_audio(Path::new(path_str), &dev) {
+                        Ok(t) => t.to_dtype(audio_dtype)?,
+                        Err(e) => {
+                            tracing::warn!("Failed to load audio from {path_str}: {e}, using zeros");
+                            Tensor::zeros((1, 128, 3000), audio_dtype, &dev)?
+                        }
+                    }
+                } else {
+                    Tensor::zeros((1, 128, 3000), audio_dtype, &dev)?
+                };
+                *cache = Some(loaded.clone());
+                *last_path = active_path.clone();
+                loaded
+            } else {
+                cache.as_ref().unwrap().clone()
+            };
+            ctx.insert("audio_values".to_string(), audio_val);
+        }
+
         // Compute last use index for each activation tensor to free VRAM immediately
         let mut last_use: HashMap<String, usize> = HashMap::new();
         for (idx, op) in graph.ops.iter().enumerate() {
@@ -1388,6 +1166,8 @@ impl LlmBackend for CandleBackend {
                 Operator::Add { lhs, rhs, .. } => vec![lhs.clone(), rhs.clone()],
                 Operator::VisualEmbed { pixel_values, .. } => vec![pixel_values.clone()],
                 Operator::SpliceTensors { text_embeds, visual_embeds, .. } => vec![text_embeds.clone(), visual_embeds.clone()],
+                Operator::AudioEmbed { audio_values, .. } => vec![audio_values.clone()],
+                Operator::SpliceAudioTensors { text_embeds, audio_embeds, .. } => vec![text_embeds.clone(), audio_embeds.clone()],
                 Operator::DeepStackFuse { input, .. } => vec![input.clone(), "visual_embeddings".to_string()],
                 Operator::Softcap { input, .. } => vec![input.clone()],
                 Operator::Scale { input, .. } => vec![input.clone()],
@@ -1402,11 +1182,13 @@ impl LlmBackend for CandleBackend {
 
         // Execute operators sequentially
         for (idx, op) in graph.ops.iter().enumerate() {
+            /*
             if batch.seq_ids[0] == 1 && kv_cache.get_seq_len(batch.seq_ids[0]) == 0 {
                 use std::io::Write;
                 println!("Executing OP idx={}/{}: {:?}", idx, graph.ops.len(), op);
                 std::io::stdout().flush().ok();
             }
+            */
             match op {
                 Operator::Embed { input_ids, weight, output } => {
                     let ids = ctx.get(input_ids)?;
@@ -1438,7 +1220,7 @@ impl LlmBackend for CandleBackend {
                     let qmatmul_opt = if self.explicit_dequantize {
                         None
                     } else {
-                        let cache = self.qmatmul_cache.lock().map_err(|_| anyhow!("qmatmul_cache poisoned"))?;
+                        let cache = self.qmatmul_cache.lock();
                         cache.get(weight).cloned()
                     };
 
@@ -1531,8 +1313,30 @@ impl LlmBackend for CandleBackend {
                     let q_4d = q_t.reshape((b_sz, seq_len, layer_n_heads, layer_head_dim))?;
 
                     let is_shared = meta.is_kv_shared(*layer_idx);
+                    let q_dev = q_4d.device();
 
-                    let (k_4d, v_4d, _) = if !is_shared {
+                    {
+                        let mut seq_blocks_map = self.seq_blocks.lock();
+                        for (i, &seq_id) in batch.seq_ids.iter().enumerate() {
+                            seq_blocks_map.insert(seq_id, batch.block_tables[i].clone());
+                        }
+                    }
+
+                    let is_quantized = self.kv_config.dtype == KvDtype::Q8 || self.kv_config.dtype == KvDtype::Q4;
+                    let r_tensor = if is_quantized {
+                        let r_vec = generate_hadamard_orthogonal(head_dim);
+                        Some(Tensor::from_vec(r_vec, (head_dim, head_dim), q_dev)?.to_dtype(q_4d.dtype())?)
+                    } else {
+                        None
+                    };
+
+                    let q_4d_rotated = if let Some(ref r) = r_tensor {
+                        q_4d.reshape(((), head_dim))?.matmul(r)?.reshape(q_4d.dims())?
+                    } else {
+                        q_4d.clone()
+                    };
+
+                    let (k_4d, v_4d, n_kv_heads) = if !is_shared {
                         let k_t = ctx.get(k)?;
                         let v_t = ctx.get(v)?;
                         let (_, _, k_dim) = k_t.dims3()?;
@@ -1542,60 +1346,140 @@ impl LlmBackend for CandleBackend {
                         if meta.ple_dim.is_some() {
                             v_4d = rms_norm_no_scale(&v_4d, meta.rms_norm_eps as f64)?;
                         }
-                        (Some(k_4d), Some(v_4d), n_kv_heads)
+                        
+                        let k_4d_rotated = if let Some(ref r) = r_tensor {
+                            k_4d.reshape(((), head_dim))?.matmul(r)?.reshape(k_4d.dims())?
+                        } else {
+                            k_4d
+                        };
+                        (Some(k_4d_rotated), Some(v_4d), n_kv_heads)
                     } else {
                         (None, None, meta.n_kv_heads)
                     };
 
-                    let q_dev = q_4d.device();
-                    let mut gpu_cache = self.gpu_kv_cache.lock().map_err(|_| anyhow!("gpu_kv_cache poisoned"))?;
-
+                    let mut gpu_cache = self.gpu_kv_cache.lock();
+                    let block_size = self.kv_config.block_size;
                     let mut att_outputs = Vec::with_capacity(b_sz);
 
                     for (i, &seq_id) in batch.seq_ids.iter().enumerate() {
-                        let (mut k_hist_t, mut v_hist_t) = if is_shared {
-                            let src_layer = meta.get_kv_source_layer(*layer_idx);
-                            gpu_cache.get(&(src_layer, seq_id))
-                                .cloned()
-                                .ok_or_else(|| anyhow!("Shared KV cache not found for layer {} from source layer {}", layer_idx, src_layer))?
-                        } else {
+                        let block_table = &batch.block_tables[i];
+                        let offset = kv_cache.get_seq_len(seq_id);
+                        
+                        if !is_shared {
                             let k_4d_val = k_4d.as_ref().unwrap();
                             let v_4d_val = v_4d.as_ref().unwrap();
                             let k_i = k_4d_val.narrow(0, i, 1)?;
                             let v_i = v_4d_val.narrow(0, i, 1)?;
-
-                            let (new_k, new_v) = if let Some((old_k, old_v)) = gpu_cache.get(&(*layer_idx, seq_id)) {
-                                let new_k = Tensor::cat(&[old_k, &k_i], 1)?;
-                                let new_v = Tensor::cat(&[old_v, &v_i], 1)?;
-                                (new_k, new_v)
-                            } else {
-                                (k_i, v_i)
-                            };
-
-                            gpu_cache.insert((*layer_idx, seq_id), (new_k.clone(), new_v.clone()));
-                            (new_k, new_v)
-                        };
-
-                        if let Some(window_len) = meta.get_sliding_window_len(*layer_idx) {
-                            let total_len = k_hist_t.dim(1)?;
-                            if total_len > window_len {
-                                let start_idx = total_len - window_len;
-                                k_hist_t = k_hist_t.narrow(1, start_idx, window_len)?;
-                                v_hist_t = v_hist_t.narrow(1, start_idx, window_len)?;
-                                if !is_shared {
-                                    gpu_cache.insert((*layer_idx, seq_id), (k_hist_t.clone(), v_hist_t.clone()));
+                            
+                            let mut t_start = 0;
+                            while t_start < seq_len {
+                                let abs_idx = offset + t_start;
+                                let block_idx = abs_idx / block_size;
+                                let start_block_offset = abs_idx % block_size;
+                                let block_id = block_table[block_idx];
+                                
+                                let chunk_len = std::cmp::min(seq_len - t_start, block_size - start_block_offset);
+                                let t_end = t_start + chunk_len;
+                                
+                                let k_chunk = k_i.narrow(1, t_start, chunk_len)?;
+                                let v_chunk = v_i.narrow(1, t_start, chunk_len)?;
+                                
+                                let block_data = gpu_cache.entry((*layer_idx, block_id)).or_insert_with(|| {
+                                    let dev = q_dev;
+                                    let dtype = self.kv_config.dtype;
+                                    let comp_dtype = self.compute_dtype;
+                                    
+                                    let (k_block, k_scale) = if dtype == KvDtype::Q8 || dtype == KvDtype::Q4 {
+                                        let d = Tensor::zeros((1, block_size, n_kv_heads, head_dim), DType::U8, dev).unwrap();
+                                        let s = Tensor::zeros((1, block_size, n_kv_heads, 1), comp_dtype, dev).unwrap();
+                                        (d, Some(s))
+                                    } else {
+                                        let d = Tensor::zeros((1, block_size, n_kv_heads, head_dim), comp_dtype, dev).unwrap();
+                                        (d, None)
+                                    };
+                                    
+                                    let (v_block, v_scale) = if dtype == KvDtype::Q8 || dtype == KvDtype::Q4 {
+                                        let d = Tensor::zeros((1, block_size, n_kv_heads, head_dim), DType::U8, dev).unwrap();
+                                        let s = Tensor::zeros((1, block_size, n_kv_heads, 1), comp_dtype, dev).unwrap();
+                                        (d, Some(s))
+                                    } else {
+                                        let d = Tensor::zeros((1, block_size, n_kv_heads, head_dim), comp_dtype, dev).unwrap();
+                                        (d, None)
+                                    };
+                                    
+                                    BlockData { k: k_block, k_scale, v: v_block, v_scale }
+                                });
+                                
+                                if self.kv_config.dtype == KvDtype::Q8 || self.kv_config.dtype == KvDtype::Q4 {
+                                    let (q_k, q_k_scale) = quantize(&k_chunk, self.kv_config.dtype, self.compute_dtype)?;
+                                    let (q_v, q_v_scale) = quantize(&v_chunk, self.kv_config.dtype, self.compute_dtype)?;
+                                    
+                                    block_data.k = update_block_tensor(&block_data.k, &q_k, start_block_offset, chunk_len)?;
+                                    block_data.k_scale = Some(update_block_tensor(block_data.k_scale.as_ref().unwrap(), &q_k_scale, start_block_offset, chunk_len)?);
+                                    
+                                    block_data.v = update_block_tensor(&block_data.v, &q_v, start_block_offset, chunk_len)?;
+                                    block_data.v_scale = Some(update_block_tensor(block_data.v_scale.as_ref().unwrap(), &q_v_scale, start_block_offset, chunk_len)?);
+                                } else {
+                                    block_data.k = update_block_tensor(&block_data.k, &k_chunk, start_block_offset, chunk_len)?;
+                                    block_data.v = update_block_tensor(&block_data.v, &v_chunk, start_block_offset, chunk_len)?;
                                 }
+                                
+                                t_start = t_end;
                             }
                         }
 
-                        // Squeeze batch dimension for attention computation
-                        let k_hist_squeezed = k_hist_t.squeeze(0)?; // shape: (total_seq_len, n_kv_heads, head_dim)
-                        let v_hist_squeezed = v_hist_t.squeeze(0)?; // shape: (total_seq_len, n_kv_heads, head_dim)
+                        let src_layer = if is_shared {
+                            meta.get_kv_source_layer(*layer_idx)
+                        } else {
+                            *layer_idx
+                        };
+
+                        let num_active_blocks = std::cmp::min(
+                            (offset + seq_len + block_size - 1) / block_size,
+                            block_table.len()
+                        );
+                        let mut k_blocks = Vec::with_capacity(num_active_blocks);
+                        let mut v_blocks = Vec::with_capacity(num_active_blocks);
+
+                        for &block_id in &block_table[0..num_active_blocks] {
+                            let block_data = gpu_cache.get(&(src_layer, block_id))
+                                .ok_or_else(|| anyhow!("Block ID {} not found for layer {}", block_id, src_layer))?;
+                            
+                            let k_deq = if self.kv_config.dtype == KvDtype::Q8 || self.kv_config.dtype == KvDtype::Q4 {
+                                dequantize(&block_data.k, block_data.k_scale.as_ref().unwrap(), self.kv_config.dtype, self.compute_dtype)?
+                            } else {
+                                block_data.k.clone()
+                            };
+                            
+                            let v_deq = if self.kv_config.dtype == KvDtype::Q8 || self.kv_config.dtype == KvDtype::Q4 {
+                                dequantize(&block_data.v, block_data.v_scale.as_ref().unwrap(), self.kv_config.dtype, self.compute_dtype)?
+                            } else {
+                                block_data.v.clone()
+                            };
+
+                            k_blocks.push(k_deq.squeeze(0)?);
+                            v_blocks.push(v_deq.squeeze(0)?);
+                        }
+
+                        let mut k_hist_squeezed = Tensor::cat(&k_blocks, 0)?;
+                        let mut v_hist_squeezed = Tensor::cat(&v_blocks, 0)?;
+
+                        let total_len = offset + seq_len;
+                        k_hist_squeezed = k_hist_squeezed.narrow(0, 0, total_len)?;
+                        v_hist_squeezed = v_hist_squeezed.narrow(0, 0, total_len)?;
+
+                        if let Some(window_len) = meta.get_sliding_window_len(*layer_idx) {
+                            if total_len > window_len {
+                                let start_idx = total_len - window_len;
+                                k_hist_squeezed = k_hist_squeezed.narrow(0, start_idx, window_len)?;
+                                v_hist_squeezed = v_hist_squeezed.narrow(0, start_idx, window_len)?;
+                            }
+                        }
 
                         let total_seq_len = k_hist_squeezed.dim(0)?;
                         let layer_n_kv_heads = k_hist_squeezed.dim(1)?;
 
-                        let q_i = q_4d.narrow(0, i, 1)?.squeeze(0)?;
+                        let q_i = q_4d_rotated.narrow(0, i, 1)?.squeeze(0)?;
                         let q_i = q_i.transpose(0, 1)?.contiguous()?; // (n_heads, seq_len, head_dim)
                         
                         let n_rep = layer_n_heads / layer_n_kv_heads;
@@ -1656,10 +1540,10 @@ impl LlmBackend for CandleBackend {
                     ctx.insert(output.clone(), lhs_t.broadcast_add(&rhs_t)?);
                 }
                 Operator::VisualEmbed { pixel_values, output } => {
-                    let active_path = crate::backends::ACTIVE_IMAGE_PATH.lock().unwrap().clone();
+                    let active_path = crate::backends::ACTIVE_IMAGE_PATH.lock().clone();
                     let out = if let Some(ref enc) = self.vision_encoder {
-                        let mut cache = self.visual_embeddings.lock().unwrap();
-                        let mut last_path = self.last_image_path.lock().unwrap();
+                        let mut cache = self.visual_embeddings.lock();
+                        let mut last_path = self.last_image_path.lock();
                         let needs_encode = match (&active_path, &*last_path, &*cache) {
                             (Some(curr), Some(prev), Some(_)) if curr == prev => false,
                             _ => true,
@@ -1673,7 +1557,7 @@ impl LlmBackend for CandleBackend {
                         } else {
                             cache.as_ref().unwrap().clone()
                         }
-                    } else if let Some(ref preloaded) = *self.visual_embeddings.lock().unwrap() {
+                    } else if let Some(ref preloaded) = *self.visual_embeddings.lock() {
                         preloaded.clone()
                     } else {
                         return Err(anyhow!("VisionEncoder / visual_embeddings not loaded for VisualEmbed"));
@@ -1692,6 +1576,61 @@ impl LlmBackend for CandleBackend {
                     };
                     let token_ids = &batch.token_ids;
                     let out = splice_visual_embeddings(&t_emb, &v_emb_narrowed, token_ids, 0, 0)?;
+                    ctx.insert(output.clone(), out);
+                }
+                Operator::AudioEmbed { audio_values, output } => {
+                    let active_path = crate::backends::ACTIVE_AUDIO_PATH.lock().clone();
+                    // If no audio is provided, emit a dummy embedding and skip encoding.
+                    // This avoids running the conformer on zero tensors when the prompt is text-only.
+                    let out = if active_path.is_none() {
+                        // Dummy: (1, 1, embed_dim) so downstream SpliceAudioTensors is a no-op
+                        let t_emb = ctx.get("text_embeddings").or_else(|_| ctx.get("spliced_visual_embeddings"))?;
+                        let embed_dim = t_emb.dim(2)?;
+                        Tensor::zeros((1, 1, embed_dim), t_emb.dtype(), t_emb.device())?
+                    } else if let Some(ref enc) = self.audio_encoder {
+                        let mut cache = self.audio_embeddings.lock();
+                        let mut last_path = self.last_audio_path.lock();
+                        let needs_encode = match (&active_path, &*last_path, &*cache) {
+                            (Some(curr), Some(prev), Some(_)) if curr == prev => false,
+                            _ => true,
+                        };
+                        if needs_encode {
+                            let a_val = ctx.get(audio_values)?;
+                            let encoded = enc.encode(&a_val)?;
+                            *cache = Some(encoded.clone());
+                            *last_path = active_path.clone();
+                            encoded
+                        } else {
+                            cache.as_ref().unwrap().clone()
+                        }
+                    } else if let Some(ref preloaded) = *self.audio_embeddings.lock() {
+                        preloaded.clone()
+                    } else {
+                        // No encoder and no preloaded — dummy passthrough
+                        let t_emb = ctx.get("text_embeddings").or_else(|_| ctx.get("spliced_visual_embeddings"))?;
+                        let embed_dim = t_emb.dim(2)?;
+                        Tensor::zeros((1, 1, embed_dim), t_emb.dtype(), t_emb.device())?
+                    };
+                    ctx.insert(output.clone(), out);
+                }
+                Operator::SpliceAudioTensors { text_embeds, audio_embeds, output } => {
+                    let t_emb = ctx.get(text_embeds)?;
+                    // Only splice if audio is actually present in the token sequence.
+                    // When no audio pad tokens exist, pass text embeddings through unchanged.
+                    let active_audio = crate::backends::ACTIVE_AUDIO_PATH.lock().clone();
+                    let out = if active_audio.is_none() {
+                        t_emb.clone()
+                    } else {
+                        let a_emb = ctx.get(audio_embeds)?;
+                        let a_emb = a_emb.to_dtype(t_emb.dtype())?;
+                        let a_emb_narrowed = if a_emb.dim(2)? > t_emb.dim(2)? {
+                            a_emb.narrow(2, 0, t_emb.dim(2)?)?
+                        } else {
+                            a_emb.clone()
+                        };
+                        let token_ids = &batch.token_ids;
+                        crate::backends::multimodal::splice_audio_embeddings(&t_emb, &a_emb_narrowed, token_ids)?
+                    };
                     ctx.insert(output.clone(), out);
                 }
                 Operator::DeepStackFuse { input, layer_idx, output } => {
@@ -1781,7 +1720,7 @@ impl LlmBackend for CandleBackend {
                     let qmatmul_opt = if self.explicit_dequantize {
                         None
                     } else {
-                        let cache = self.qmatmul_cache.lock().map_err(|_| anyhow!("qmatmul_cache poisoned"))?;
+                        let cache = self.qmatmul_cache.lock();
                         cache.get(per_layer_model_proj).cloned()
                     };
 
@@ -1827,7 +1766,7 @@ impl LlmBackend for CandleBackend {
                     let qmatmul_gate_opt = if self.explicit_dequantize {
                         None
                     } else {
-                        let cache = self.qmatmul_cache.lock().map_err(|_| anyhow!("qmatmul_cache poisoned"))?;
+                        let cache = self.qmatmul_cache.lock();
                         cache.get(per_layer_input_gate).cloned()
                     };
 
@@ -1851,7 +1790,7 @@ impl LlmBackend for CandleBackend {
                     let qmatmul_proj_opt = if self.explicit_dequantize {
                         None
                     } else {
-                        let cache = self.qmatmul_cache.lock().map_err(|_| anyhow!("qmatmul_cache poisoned"))?;
+                        let cache = self.qmatmul_cache.lock();
                         cache.get(per_layer_projection).cloned()
                     };
 
@@ -1937,5 +1876,54 @@ impl LlmBackend for CandleBackend {
 
     fn kv_cache_config(&self) -> KvCacheConfig {
         self.kv_config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{Tensor, Device};
+
+    #[test]
+    fn test_hadamard_orthogonal() {
+        let d = 128;
+        let h_vec = generate_hadamard_orthogonal(d);
+        assert_eq!(h_vec.len(), d * d);
+        
+        let dev = &Device::Cpu;
+        let h_tensor = Tensor::from_vec(h_vec, (d, d), dev).unwrap();
+        let h_t = h_tensor.t().unwrap();
+        let identity = h_tensor.matmul(&h_t).unwrap();
+        
+        let identity_expected = Tensor::eye(d, DType::F32, dev).unwrap();
+        let diff = (identity - identity_expected).unwrap().abs().unwrap();
+        let max_diff = diff.max_all().unwrap().to_scalar::<f32>().unwrap();
+        assert!(max_diff < 1e-4, "Hadamard matrix is not orthogonal: max diff = {}", max_diff);
+    }
+
+    #[test]
+    fn test_kv_quantization_q8() {
+        let dev = &Device::Cpu;
+        let x = Tensor::from_slice(&[1.0f32, -2.0, 3.5, -4.0, 0.5, 0.0], (1, 1, 1, 6), dev).unwrap();
+        
+        let (u8_tensor, scale) = quantize(&x, KvDtype::Q8, DType::F32).unwrap();
+        let deq = dequantize(&u8_tensor, &scale, KvDtype::Q8, DType::F32).unwrap();
+        
+        let diff = (&x - &deq).unwrap().abs().unwrap();
+        let max_diff = diff.max_all().unwrap().to_scalar::<f32>().unwrap();
+        assert!(max_diff < 0.1, "Q8 quantization loss too high: max diff = {}", max_diff);
+    }
+
+    #[test]
+    fn test_kv_quantization_q4() {
+        let dev = &Device::Cpu;
+        let x = Tensor::from_slice(&[1.0f32, -2.0, 3.5, -4.0, 0.5, 0.0], (1, 1, 1, 6), dev).unwrap();
+        
+        let (u8_tensor, scale) = quantize(&x, KvDtype::Q4, DType::F32).unwrap();
+        let deq = dequantize(&u8_tensor, &scale, KvDtype::Q4, DType::F32).unwrap();
+        
+        let diff = (&x - &deq).unwrap().abs().unwrap();
+        let max_diff = diff.max_all().unwrap().to_scalar::<f32>().unwrap();
+        assert!(max_diff < 0.7, "Q4 quantization loss too high: max diff = {}", max_diff);
     }
 }

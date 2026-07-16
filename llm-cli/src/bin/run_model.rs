@@ -9,10 +9,10 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(long, default_value = "/home/mukundan/learning/llm/qwen3-vl-4b-instruct.Q4_K_M.gguf")]
+    #[arg(long)]
     model_path: String,
 
-    #[arg(long, default_value = "/home/mukundan/learning/llm/llm-rs/qwen2.5-0.5b/tokenizer.json")]
+    #[arg(long)]
     tokenizer_path: String,
 
     #[arg(long, default_value = "Explain the theory of relativity in 2 sentences.")]

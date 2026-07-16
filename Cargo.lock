@@ -2129,6 +2129,7 @@ dependencies = [
  "half",
  "image",
  "memmap2",
+ "parking_lot",
  "rand 0.8.6",
  "safetensors 0.5.3",
  "serde",

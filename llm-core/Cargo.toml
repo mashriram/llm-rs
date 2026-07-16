@@ -19,15 +19,8 @@ rand = { workspace = true }
 half = { workspace = true }
 image = { workspace = true }
 symphonia = { workspace = true }
+parking_lot = { workspace = true }
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
-
-[[bin]]
-name = "debug_tokenizer"
-path = "../scratch/debug_tokenizer.rs"
-
-[[bin]]
-name = "print_chat_template"
-path = "../scratch/print_chat_template.rs"
 

@@ -384,8 +384,8 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(sys) = &args.system_prompt {
                     conversation.push(Message { role: "system".to_string(), content: sys.clone() });
                 }
-                *llm_core::backends::ACTIVE_IMAGE_PATH.lock().unwrap() = None;
-                *llm_core::backends::ACTIVE_AUDIO_PATH.lock().unwrap() = None;
+                *llm_core::backends::ACTIVE_IMAGE_PATH.lock() = None;
+                *llm_core::backends::ACTIVE_AUDIO_PATH.lock() = None;
                 println!("[chat] Conversation cleared.\n");
                 continue;
             }
@@ -400,11 +400,11 @@ async fn main() -> anyhow::Result<()> {
         let (text_content, image_path, audio_path) = parse_user_input(line);
 
         if let Some(ref img) = image_path {
-            *llm_core::backends::ACTIVE_IMAGE_PATH.lock().unwrap() = Some(img.to_string_lossy().to_string());
+            *llm_core::backends::ACTIVE_IMAGE_PATH.lock() = Some(img.to_string_lossy().to_string());
         }
 
         if let Some(ref aud) = audio_path {
-            *llm_core::backends::ACTIVE_AUDIO_PATH.lock().unwrap() = Some(aud.to_string_lossy().to_string());
+            *llm_core::backends::ACTIVE_AUDIO_PATH.lock() = Some(aud.to_string_lossy().to_string());
         }
 
         if text_content.is_empty() && image_path.is_none() && audio_path.is_none() {
@@ -454,6 +454,22 @@ async fn main() -> anyhow::Result<()> {
                 _ => pads,
             };
             prompt_str = prompt_str.replace("<image>", &replacement);
+        }
+        if meta.has_audio_encoder {
+            // Dynamically resolve the audio pad token name from the tokenizer
+            let pad_token = if tokenizer.token_to_id("<|audio_pad|>").is_some() {
+                "<|audio_pad|>"
+            } else if tokenizer.token_to_id("<|audio|>").is_some() {
+                "<|audio|>"
+            } else if tokenizer.token_to_id("<audio>").is_some() {
+                "<audio>"
+            } else {
+                "<|audio|>" // Fallback
+            };
+
+            let num_audio_tokens = meta.audio_embedding_length.unwrap_or(750);
+            let pads = pad_token.repeat(num_audio_tokens);
+            prompt_str = prompt_str.replace("<audio>", &pads);
         }
         let mut prompt_tokens = tokenizer.encode(&prompt_str, true)?;
         maybe_prepend_bos(&mut prompt_tokens, &meta);

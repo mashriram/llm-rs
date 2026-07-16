@@ -4,7 +4,6 @@ use anyhow::{Result, anyhow, Context};
 use candle_core::{Tensor, Device, DType};
 use symphonia::core::audio::Signal;
 
-
 pub struct AudioEncoder {
     weights: HashMap<String, Tensor>,
     pub hidden_dim: usize,
@@ -18,10 +17,10 @@ impl AudioEncoder {
         tracing::info!("Loading audio encoder from {:?}", path);
 
         let mut raw_weights = HashMap::new();
-        let mut hidden_dim = 1280;
-        let mut num_layers = 32;
-        let mut num_heads = 20;
-        let mut projection_dim = 2560;
+        let mut hidden_dim = 1024;
+        let mut num_layers = 12;
+        let mut num_heads = 8;
+        let mut projection_dim = 1024;
 
         let is_gguf = path.is_file() && path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_lowercase() == "gguf").unwrap_or(false);
 
@@ -45,12 +44,13 @@ impl AudioEncoder {
             if let Some(v) = get_metadata_u32("clip.audio.projection_dim") { projection_dim = v as usize; }
 
             let cpu = Device::Cpu;
+            let audio_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
             for name in model.tensor_infos.keys() {
                 let qtensor = model.tensor(&mut file, name, &cpu)
                     .context(format!("Failed to load audio tensor {}", name))?;
                 let tensor = qtensor.dequantize(&cpu)
                     .context(format!("Failed to dequantize audio tensor {}", name))?
-                    .to_dtype(DType::F16)?
+                    .to_dtype(audio_dtype)?
                     .to_device(device)?;
                 raw_weights.insert(name.clone(), tensor);
             }
@@ -70,15 +70,14 @@ impl AudioEncoder {
                 candle_core::safetensors::load(path, device)?
             };
 
+            let audio_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
             for (k, v) in loaded {
-                raw_weights.insert(k, v.to_dtype(DType::F16)?);
+                raw_weights.insert(k, v.to_dtype(audio_dtype)?);
             }
         }
 
-        let weights = normalize_audio_tensors(raw_weights, num_layers, device)?;
-
         Ok(Self {
-            weights,
+            weights: raw_weights,
             hidden_dim,
             num_layers,
             num_heads,
@@ -87,246 +86,429 @@ impl AudioEncoder {
     }
 
     pub fn encode(&self, audio_values: &Tensor) -> Result<Tensor> {
-        // 1. Conv1D Feature Extraction
-        let conv1_w = self.weights.get("audio.conv1.weight")
-            .ok_or_else(|| anyhow!("audio.conv1.weight not found"))?;
-        let conv1_b = self.weights.get("audio.conv1.bias");
-        
-        let conv2_w = self.weights.get("audio.conv2.weight")
-            .ok_or_else(|| anyhow!("audio.conv2.weight not found"))?;
-        let conv2_b = self.weights.get("audio.conv2.bias");
+        let device = audio_values.device();
+        // Dynamically resolve the working dtype from the weights
+        let first_w = self.weights.values().next()
+            .ok_or_else(|| anyhow!("No weights loaded in AudioEncoder"))?;
+        let dtype = first_w.dtype();
+        let audio_values = audio_values.to_dtype(dtype)?;
+        let batch_size = audio_values.dim(0)?;
 
-        // Conv1: stride 1, padding 1
-        let mut x = audio_values.conv1d(conv1_w, 1, 1, 1, 1)?;
-        if let Some(bias) = conv1_b {
-            let b = bias.reshape((1, bias.dim(0)?, 1))?;
-            x = x.broadcast_add(&b)?;
-        }
-        x = x.gelu()?;
+        // 1. SubSampleConvProjection
+        // Unsqueeze to (batch, 1, 128, 3000)
+        let x = audio_values.unsqueeze(1)?.contiguous()?;
 
-        // Conv2: stride 2, padding 1
-        x = x.conv1d(conv2_w, 2, 1, 1, 1)?;
-        if let Some(bias) = conv2_b {
-            let b = bias.reshape((1, bias.dim(0)?, 1))?;
-            x = x.broadcast_add(&b)?;
-        }
-        x = x.gelu()?;
+        // layer 0: Conv2d(stride=2, padding=1), LayerNorm, ReLU
+        let conv0_w = self.weights.get("a.conv1d.0.weight")
+            .ok_or_else(|| anyhow!("a.conv1d.0.weight not found"))?;
+        let norm0_w = self.weights.get("a.conv1d.0.norm.weight")
+            .ok_or_else(|| anyhow!("a.conv1d.0.norm.weight not found"))?;
 
-        // Transpose to [batch, seq_len, hidden_dim]
-        // From [batch, hidden_dim, seq_len] -> permute(0, 2, 1)
-        x = x.transpose(1, 2)?;
+        let x = x.conv2d(conv0_w, 1, 2, 1, 1)?; // padding 1, stride 2
 
-        // 2. Positional Embeddings
-        if let Some(pos_emb) = self.weights.get("audio.pos_embed.weight") {
-            let seq_len = x.dim(1)?;
-            let emb_len = pos_emb.dim(0)?;
-            let sliced_emb = if seq_len < emb_len {
-                pos_emb.narrow(0, 0, seq_len)?
-            } else {
-                pos_emb.clone()
-            };
-            x = x.broadcast_add(&sliced_emb)?;
-        }
+        // Permute to (batch, h, w, channels) for LayerNorm
+        let x = x.permute((0, 2, 3, 1))?.contiguous()?;
 
-        // 3. Transformer Encoder Blocks
-        let head_dim = self.hidden_dim / self.num_heads;
-        let scale = 1.0 / (head_dim as f64).sqrt();
+        let norm0_b = Tensor::zeros(128, dtype, device)?;
+        let x = candle_nn::ops::layer_norm(&x, norm0_w, &norm0_b, 1e-5)?;
+        let x = x.relu()?;
+        let x = x.permute((0, 3, 1, 2))?; // Back to (batch, channels, h, w)
 
+        // layer 1: Conv2d(stride=2, padding=1), LayerNorm, ReLU
+        let conv1_w = self.weights.get("a.conv1d.1.weight")
+            .ok_or_else(|| anyhow!("a.conv1d.1.weight not found"))?;
+        let norm1_w = self.weights.get("a.conv1d.1.norm.weight")
+            .ok_or_else(|| anyhow!("a.conv1d.1.norm.weight not found"))?;
+
+        let x = x.contiguous()?.conv2d(conv1_w, 1, 2, 1, 1)?; // padding 1, stride 2
+        let x = x.permute((0, 2, 3, 1))?.contiguous()?;
+        let norm1_b = Tensor::zeros(32, dtype, device)?;
+        let x = candle_nn::ops::layer_norm(&x, norm1_w, &norm1_b, 1e-5)?;
+        let x = x.relu()?;
+        let x = x.permute((0, 3, 1, 2))?; // (batch, 32, 32, 750)
+
+        // Reshape to sequence: (batch, seq_len, hidden_dim)
+        let x = x.permute((0, 2, 3, 1))?.contiguous()?;
+        let seq_len = x.dim(2)?;
+        let x = x.reshape((batch_size, seq_len, self.hidden_dim))?;
+
+        // input_proj_linear
+        let ip_w = self.weights.get("a.input_projection.weight")
+            .ok_or_else(|| anyhow!("a.input_projection.weight not found"))?;
+        let mut x = matmul_3d_2d(&x, ip_w)?;
+
+        // 2. Position Embeddings
+        // Gemma4AudioRelPositionalEncoding
+        let chunk_size = 12;
+        let rel_len = chunk_size + 1;
+
+        let pos_ids: Vec<f32> = (0..rel_len).map(|v| (rel_len - 1 - v) as f32).collect();
+        let position_ids = Tensor::from_vec(pos_ids, (rel_len, 1), device)?.to_dtype(dtype)?;
+
+        let num_timescales = self.hidden_dim / 2;
+        let min_timescale = 1.0f32;
+        let max_timescale = 10000.0f32;
+        let log_timescale_increment = (max_timescale / min_timescale).ln() / ((num_timescales - 1) as f32).max(1.0);
+        let timescales: Vec<f32> = (0..num_timescales)
+            .map(|i| min_timescale * (-(i as f32) * log_timescale_increment).exp())
+            .collect();
+        let inv_timescales = Tensor::from_vec(timescales, (1, 1, num_timescales), device)?.to_dtype(dtype)?;
+
+        let scaled_time = position_ids.unsqueeze(0)?.broadcast_mul(&inv_timescales)?;
+        let sin_t = scaled_time.sin()?;
+        let cos_t = scaled_time.cos()?;
+        let pos_embed = Tensor::cat(&[sin_t, cos_t], 2)?; // shape [1, rel_len, hidden_dim]
+
+        // 3. Conformer Blocks (12 layers)
         for i in 0..self.num_layers {
-            let ln1_w = self.weights.get(&format!("audio.layers.{}.ln1.weight", i))
-                .ok_or_else(|| anyhow!("audio.layers.{}.ln1.weight not found", i))?;
-            let ln1_b = self.weights.get(&format!("audio.layers.{}.ln1.bias", i))
-                .ok_or_else(|| anyhow!("audio.layers.{}.ln1.bias not found", i))?;
-            let ln2_w = self.weights.get(&format!("audio.layers.{}.ln2.weight", i))
-                .ok_or_else(|| anyhow!("audio.layers.{}.ln2.weight not found", i))?;
-            let ln2_b = self.weights.get(&format!("audio.layers.{}.ln2.bias", i))
-                .ok_or_else(|| anyhow!("audio.layers.{}.ln2.bias not found", i))?;
-
-            let qkv_w = self.weights.get(&format!("audio.layers.{}.attn_qkv.weight", i))
-                .ok_or_else(|| anyhow!("audio.layers.{}.attn_qkv.weight not found", i))?;
-            let qkv_b = self.weights.get(&format!("audio.layers.{}.attn_qkv.bias", i))
-                .ok_or_else(|| anyhow!("audio.layers.{}.attn_qkv.bias not found", i))?;
-
-            let attn_out_w = self.weights.get(&format!("audio.layers.{}.attn_out.weight", i))
-                .ok_or_else(|| anyhow!("audio.layers.{}.attn_out.weight not found", i))?;
-            let attn_out_b = self.weights.get(&format!("audio.layers.{}.attn_out.bias", i))
-                .ok_or_else(|| anyhow!("audio.layers.{}.attn_out.bias not found", i))?;
-
-            let ffn_up_w = self.weights.get(&format!("audio.layers.{}.ffn_up.weight", i))
-                .ok_or_else(|| anyhow!("audio.layers.{}.ffn_up.weight not found", i))?;
-            let ffn_up_b = self.weights.get(&format!("audio.layers.{}.ffn_up.bias", i))
-                .ok_or_else(|| anyhow!("audio.layers.{}.ffn_up.bias not found", i))?;
-            let ffn_down_w = self.weights.get(&format!("audio.layers.{}.ffn_down.weight", i))
-                .ok_or_else(|| anyhow!("audio.layers.{}.ffn_down.weight not found", i))?;
-            let ffn_down_b = self.weights.get(&format!("audio.layers.{}.ffn_down.bias", i))
-                .ok_or_else(|| anyhow!("audio.layers.{}.ffn_down.bias not found", i))?;
-
-            // LN1
-            let norm_x = candle_nn::ops::layer_norm(&x, ln1_w, ln1_b, 1e-5)?;
-
-            // Attention
-            let qkv = matmul_3d_2d(&norm_x, qkv_w)?;
-            let qkv = qkv.broadcast_add(qkv_b)?;
-
-            let (b, seq, three_d) = qkv.dims3()?;
-            let d = three_d / 3;
-
-            let q = qkv.narrow(2, 0, d)?;
-            let k = qkv.narrow(2, d, d)?;
-            let v = qkv.narrow(2, 2 * d, d)?;
-
-            // Reshape for MHA: [b, h, seq, head_dim]
-            let q = q.reshape((b, seq, self.num_heads, head_dim))?.transpose(1, 2)?;
-            let k = k.reshape((b, seq, self.num_heads, head_dim))?.transpose(1, 2)?;
-            let v = v.reshape((b, seq, self.num_heads, head_dim))?.transpose(1, 2)?;
-
-            let scores = q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?;
-            let scores = (scores * scale)?;
-            let attn = candle_nn::ops::softmax(&scores, 3)?;
-            let context = attn.matmul(&v.contiguous()?)?;
-
-            // Transpose back: [b, seq, hidden_dim]
-            let context = context.transpose(1, 2)?.contiguous()?.reshape((b, seq, d))?;
-            let attn_out = matmul_3d_2d(&context, attn_out_w)?;
-            let attn_out = attn_out.broadcast_add(attn_out_b)?;
-
-            // Residual
-            x = x.add(&attn_out)?;
-
-            // LN2 + FFN
-            let norm_x2 = candle_nn::ops::layer_norm(&x, ln2_w, ln2_b, 1e-5)?;
-            let ffn = matmul_3d_2d(&norm_x2, ffn_up_w)?;
-            let ffn = ffn.broadcast_add(ffn_up_b)?;
-            let ffn = ffn.gelu()?;
-            let ffn = matmul_3d_2d(&ffn, ffn_down_w)?;
-            let ffn = ffn.broadcast_add(ffn_down_b)?;
-
-            // Residual
-            x = x.add(&ffn)?;
+            x = self.forward_conformer_block(i, &x, &pos_embed, rel_len)?;
         }
 
-        // 4. Post LN
-        if let (Some(post_ln_w), Some(post_ln_b)) = (self.weights.get("audio.post_ln.weight"), self.weights.get("audio.post_ln.bias")) {
-            x = candle_nn::ops::layer_norm(&x, post_ln_w, post_ln_b, 1e-5)?;
-        }
+        // 4. Output Projector (output_proj)
+        let op_w = self.weights.get("a.pre_encode.out.weight")
+            .ok_or_else(|| anyhow!("a.pre_encode.out.weight not found"))?;
+        let op_b = self.weights.get("a.pre_encode.out.bias")
+            .ok_or_else(|| anyhow!("a.pre_encode.out.bias not found"))?;
 
-        // 5. Audio Projector
-        if let (Some(proj_w), Some(proj_b)) = (self.weights.get("projector.0.weight"), self.weights.get("projector.0.bias")) {
-            x = matmul_3d_2d(&x, proj_w)?;
-            x = x.broadcast_add(proj_b)?;
-            x = x.gelu()?;
-        }
-        if let (Some(proj_w), Some(proj_b)) = (self.weights.get("projector.2.weight"), self.weights.get("projector.2.bias")) {
-            x = matmul_3d_2d(&x, proj_w)?;
-            x = x.broadcast_add(proj_b)?;
-        }
+        let x = matmul_3d_2d(&x, op_w)?;
+        let x = x.broadcast_add(op_b)?;
+
+        Ok(x)
+    }
+
+    fn forward_conformer_block(&self, i: usize, x: &Tensor, pos_embed: &Tensor, rel_len: usize) -> Result<Tensor> {
+        let _device = x.device();
+        let dtype = x.dtype();
+        let grad_clip = if dtype == DType::F16 { 65504.0f32 } else { 1e10f32 };
+
+        // 1. feed_forward1
+        let ffw1_in = x.clamp(-grad_clip, grad_clip)?;
+        let ffw1_norm = self.weights.get(&format!("a.blk.{}.ffn_norm.weight", i))
+            .ok_or_else(|| anyhow!("ffn_norm for layer {} not found", i))?;
+        let ffw1_normed = rms_norm(&ffw1_in, Some(ffw1_norm), 1e-6)?;
+
+        let ffw1_w1 = self.weights.get(&format!("a.blk.{}.ffn_up.weight", i))
+            .ok_or_else(|| anyhow!("ffn_up weight for layer {} not found", i))?;
+        let ffw1_w1_imin = self.weights.get(&format!("a.blk.{}.ffn_up.input_min", i));
+        let ffw1_w1_imax = self.weights.get(&format!("a.blk.{}.ffn_up.input_max", i));
+        let ffw1_w1_omin = self.weights.get(&format!("a.blk.{}.ffn_up.output_min", i));
+        let ffw1_w1_omax = self.weights.get(&format!("a.blk.{}.ffn_up.output_max", i));
+
+        let ffw1_w2 = self.weights.get(&format!("a.blk.{}.ffn_down.weight", i))
+            .ok_or_else(|| anyhow!("ffn_down weight for layer {} not found", i))?;
+        let ffw1_w2_imin = self.weights.get(&format!("a.blk.{}.ffn_down.input_min", i));
+        let ffw1_w2_imax = self.weights.get(&format!("a.blk.{}.ffn_down.input_max", i));
+        let ffw1_w2_omin = self.weights.get(&format!("a.blk.{}.ffn_down.output_min", i));
+        let ffw1_w2_omax = self.weights.get(&format!("a.blk.{}.ffn_down.output_max", i));
+
+        let mut f1 = clippable_linear_forward(&ffw1_normed, ffw1_w1, ffw1_w1_imin, ffw1_w1_imax, ffw1_w1_omin, ffw1_w1_omax)?;
+        f1 = f1.silu()?;
+        let f1 = clippable_linear_forward(&f1, ffw1_w2, ffw1_w2_imin, ffw1_w2_imax, ffw1_w2_omin, ffw1_w2_omax)?;
+
+        let f1_post_norm = self.weights.get(&format!("a.blk.{}.ffn_post_norm.weight", i))
+            .ok_or_else(|| anyhow!("ffn_post_norm weight for layer {} not found", i))?;
+        let f1_post_normed = rms_norm(&f1.clamp(-grad_clip, grad_clip)?, Some(f1_post_norm), 1e-6)?;
+
+        // Add scaled residual: residual_weight = 0.5
+        let x = x.add(&(f1_post_normed * 0.5)?)?;
+
+        // 2. self_attn
+        let residual = x.clone();
+        let attn_in = x.clamp(-grad_clip, grad_clip)?;
+        let attn_norm1 = self.weights.get(&format!("a.blk.{}.attn_pre_norm.weight", i))
+            .ok_or_else(|| anyhow!("attn_pre_norm weight for layer {} not found", i))?;
+        let attn_norm1_out = rms_norm(&attn_in, Some(attn_norm1), 1e-6)?;
+
+        // q, k, v projections
+        let q_w = self.weights.get(&format!("a.blk.{}.attn_q.weight", i))
+            .ok_or_else(|| anyhow!("attn_q weight for layer {} not found", i))?;
+        let q_imin = self.weights.get(&format!("a.blk.{}.attn_q.input_min", i));
+        let q_imax = self.weights.get(&format!("a.blk.{}.attn_q.input_max", i));
+        let q_omin = self.weights.get(&format!("a.blk.{}.attn_q.output_min", i));
+        let q_omax = self.weights.get(&format!("a.blk.{}.attn_q.output_max", i));
+
+        let k_w = self.weights.get(&format!("a.blk.{}.attn_k.weight", i))
+            .ok_or_else(|| anyhow!("attn_k weight for layer {} not found", i))?;
+        let k_imin = self.weights.get(&format!("a.blk.{}.attn_k.input_min", i));
+        let k_imax = self.weights.get(&format!("a.blk.{}.attn_k.input_max", i));
+        let k_omin = self.weights.get(&format!("a.blk.{}.attn_k.output_min", i));
+        let k_omax = self.weights.get(&format!("a.blk.{}.attn_k.output_max", i));
+
+        let v_w = self.weights.get(&format!("a.blk.{}.attn_v.weight", i))
+            .ok_or_else(|| anyhow!("attn_v weight for layer {} not found", i))?;
+        let v_imin = self.weights.get(&format!("a.blk.{}.attn_v.input_min", i));
+        let v_imax = self.weights.get(&format!("a.blk.{}.attn_v.input_max", i));
+        let v_omin = self.weights.get(&format!("a.blk.{}.attn_v.output_min", i));
+        let v_omax = self.weights.get(&format!("a.blk.{}.attn_v.output_max", i));
+
+        let q = clippable_linear_forward(&attn_norm1_out, q_w, q_imin, q_imax, q_omin, q_omax)?;
+        let k = clippable_linear_forward(&attn_norm1_out, k_w, k_imin, k_imax, k_omin, k_omax)?;
+        let v = clippable_linear_forward(&attn_norm1_out, v_w, v_imin, v_imax, v_omin, v_omax)?;
+
+        // Chunked local attention
+        let (batch_size, seq_len, hidden_size) = q.dims3()?;
+        let num_heads = self.num_heads;
+        let head_dim = self.hidden_dim / self.num_heads;
+        let chunk_size = 12;
+        let max_past_horizon = 12;
+        let max_future_horizon = 0;
+        let context_size = 24;
+
+        // q = q * q_scale * softplus(per_dim_scale)
+        let per_dim_scale = self.weights.get(&format!("a.blk.{}.per_dim_scale.weight", i))
+            .ok_or_else(|| anyhow!("per_dim_scale weight for layer {} not found", i))?;
+        let q_scale = (head_dim as f64).powf(-0.5) / 2.0f64.ln();
+        let q_scale_factor = (softplus(per_dim_scale)? * q_scale)?;
+        let q_reshaped = q.reshape((batch_size, seq_len, num_heads, head_dim))?;
+        let q_scaled = q_reshaped.broadcast_mul(&q_scale_factor)?;
+
+        let k_scale = (1.0f64 + std::f64::consts::E).ln() / 2.0f64.ln();
+        let k_reshaped = k.reshape((batch_size, seq_len, num_heads, head_dim))?;
+        let k_scaled = (k_reshaped * k_scale)?;
+        let v_reshaped = v.reshape((batch_size, seq_len, num_heads, head_dim))?;
+
+        // convert to block/context
+        let num_blocks = (seq_len + chunk_size - 1) / chunk_size;
+        let pad = num_blocks * chunk_size - seq_len;
+        let pad_tensor = Tensor::zeros((batch_size, pad, num_heads, head_dim), q.dtype(), q.device())?;
+        let q_padded = Tensor::cat(&[q_scaled, pad_tensor.clone()], 1)?.contiguous()?;
+        let query_states = q_padded.reshape((batch_size, num_blocks, chunk_size, num_heads, head_dim))?;
+
+        let key_states = extract_block_context(&k_scaled, max_past_horizon, max_future_horizon, chunk_size, context_size)?;
+        let value_states = extract_block_context(&v_reshaped, max_past_horizon, max_future_horizon, chunk_size, context_size)?;
+
+        // relative_key_states = relative_k_proj(pos_embed)
+        let rel_k_w = self.weights.get(&format!("a.blk.{}.attn_k_rel.weight", i))
+            .ok_or_else(|| anyhow!("attn_k_rel weight for layer {} not found", i))?;
+        let relative_key_states = matmul_3d_2d(pos_embed, rel_k_w)?;
+        let relative_key_states = relative_key_states.reshape((rel_len, num_heads, head_dim))?;
+
+        let queries = query_states.permute((0, 3, 1, 2, 4))?.contiguous()?;
+        let keys = key_states.permute((0, 3, 1, 4, 2))?.contiguous()?;
+
+        let b_sz = batch_size * num_heads * num_blocks;
+        let queries_3d = queries.reshape((b_sz, chunk_size, head_dim))?;
+        let keys_3d = keys.reshape((b_sz, head_dim, context_size))?;
+        let matrix_ac = queries_3d.matmul(&keys_3d)?
+            .reshape((batch_size, num_heads, num_blocks, chunk_size, context_size))?;
+
+        let queries_flat = queries.contiguous()?.reshape((batch_size, num_heads, num_blocks * chunk_size, head_dim))?;
+        let rel_keys = relative_key_states.permute((1, 2, 0))?.unsqueeze(0)?.contiguous()?;
+        let matrix_bd = queries_flat.matmul(&rel_keys)?;
+        let matrix_bd = matrix_bd.reshape((batch_size, num_heads, num_blocks, chunk_size, rel_len))?;
+        let matrix_bd = rel_shift(&matrix_bd, context_size, chunk_size)?;
+
+        let attn_weights = (matrix_ac + matrix_bd)?;
+        let softcap = 50.0f64;
+        let attn_weights = (attn_weights / softcap)?;
+        let attn_weights = attn_weights.tanh()?;
+        let attn_weights = (attn_weights * softcap)?;
+
+        let attn_probs = candle_nn::ops::softmax(&attn_weights, 4)?;
+
+        let value_states_perm = value_states.permute((0, 3, 1, 2, 4))?.contiguous()?;
+        let attn_probs_3d = attn_probs.reshape((b_sz, chunk_size, context_size))?;
+        let value_states_perm_3d = value_states_perm.reshape((b_sz, context_size, head_dim))?;
+        let attn_output = attn_probs_3d.matmul(&value_states_perm_3d)?
+            .reshape((batch_size, num_heads, num_blocks, chunk_size, head_dim))?;
+
+        let attn_output = attn_output.permute((0, 2, 3, 1, 4))?.contiguous()?;
+        let attn_output = attn_output.reshape((batch_size, num_blocks * chunk_size, hidden_size))?;
+        let attn_output = attn_output.narrow(1, 0, seq_len)?;
+
+        let post_w = self.weights.get(&format!("a.blk.{}.attn_out.weight", i))
+            .ok_or_else(|| anyhow!("attn_out weight for layer {} not found", i))?;
+        let post_imin = self.weights.get(&format!("a.blk.{}.attn_out.input_min", i));
+        let post_imax = self.weights.get(&format!("a.blk.{}.attn_out.input_max", i));
+        let post_omin = self.weights.get(&format!("a.blk.{}.attn_out.output_min", i));
+        let post_omax = self.weights.get(&format!("a.blk.{}.attn_out.output_max", i));
+        let attn_output = clippable_linear_forward(&attn_output, post_w, post_imin, post_imax, post_omin, post_omax)?;
+
+        let attn_norm2 = self.weights.get(&format!("a.blk.{}.attn_post_norm.weight", i))
+            .ok_or_else(|| anyhow!("attn_post_norm weight for layer {} not found", i))?;
+        let attn_norm2_out = rms_norm(&attn_output, Some(attn_norm2), 1e-6)?;
+
+        let x = residual.add(&attn_norm2_out)?;
+
+        // 3. lconv1d
+        let residual = x.clone();
+        let conv_in = x.clamp(-grad_clip, grad_clip)?;
+        let conv_norm1 = self.weights.get(&format!("a.blk.{}.norm_conv.weight", i))
+            .ok_or_else(|| anyhow!("norm_conv weight for layer {} not found", i))?;
+        let conv_norm1_out = rms_norm(&conv_in, Some(conv_norm1), 1e-6)?;
+
+        let lconv_pw1_w = self.weights.get(&format!("a.blk.{}.conv_pw1.weight", i))
+            .ok_or_else(|| anyhow!("conv_pw1 weight for layer {} not found", i))?;
+        let lconv_pw1_imin = self.weights.get(&format!("a.blk.{}.conv_pw1.input_min", i));
+        let lconv_pw1_imax = self.weights.get(&format!("a.blk.{}.conv_pw1.input_max", i));
+        let lconv_pw1_omin = self.weights.get(&format!("a.blk.{}.conv_pw1.output_min", i));
+        let lconv_pw1_omax = self.weights.get(&format!("a.blk.{}.conv_pw1.output_max", i));
+        let conv_proj1 = clippable_linear_forward(&conv_norm1_out, lconv_pw1_w, lconv_pw1_imin, lconv_pw1_imax, lconv_pw1_omin, lconv_pw1_omax)?;
+
+        let conv_glu = glu(&conv_proj1)?;
+
+        // Depthwise Conv1d
+        let conv_dw_w = self.weights.get(&format!("a.blk.{}.conv_dw.weight", i))
+            .ok_or_else(|| anyhow!("conv_dw weight for layer {} not found", i))?;
+        let kernel_size = conv_dw_w.dim(conv_dw_w.rank() - 1)?;
+        let conv_dw_w_reshaped = conv_dw_w.reshape((hidden_size, 1, kernel_size))?;
+
+        let x_trans = conv_glu.transpose(1, 2)?.contiguous()?;
+        let pad_len = kernel_size - 1;
+        let pad_left_t = Tensor::zeros((batch_size, hidden_size, pad_len), x_trans.dtype(), x_trans.device())?;
+        let x_padded = Tensor::cat(&[pad_left_t, x_trans], 2)?.contiguous()?;
+        let conv_dw_out = x_padded.conv1d(&conv_dw_w_reshaped, 0, 1, 1, hidden_size)?;
+        let conv_dw_out = conv_dw_out.transpose(1, 2)?;
+
+        let conv_dw_clamped = conv_dw_out.clamp(-grad_clip, grad_clip)?;
+        let conv_norm2 = self.weights.get(&format!("a.blk.{}.conv_norm.weight", i))
+            .ok_or_else(|| anyhow!("conv_norm weight for layer {} not found", i))?;
+        let conv_norm2_out = rms_norm(&conv_dw_clamped, Some(conv_norm2), 1e-6)?;
+        let conv_norm2_act = conv_norm2_out.silu()?;
+
+        let lconv_pw2_w = self.weights.get(&format!("a.blk.{}.conv_pw2.weight", i))
+            .ok_or_else(|| anyhow!("conv_pw2 weight for layer {} not found", i))?;
+        let lconv_pw2_imin = self.weights.get(&format!("a.blk.{}.conv_pw2.input_min", i));
+        let lconv_pw2_imax = self.weights.get(&format!("a.blk.{}.conv_pw2.input_max", i));
+        let lconv_pw2_omin = self.weights.get(&format!("a.blk.{}.conv_pw2.output_min", i));
+        let lconv_pw2_omax = self.weights.get(&format!("a.blk.{}.conv_pw2.output_max", i));
+        let conv_proj2 = clippable_linear_forward(&conv_norm2_act, lconv_pw2_w, lconv_pw2_imin, lconv_pw2_imax, lconv_pw2_omin, lconv_pw2_omax)?;
+
+        let x = residual.add(&conv_proj2)?;
+
+        // 4. feed_forward2
+        let ffw2_in = x.clamp(-grad_clip, grad_clip)?;
+        let ffw2_norm = self.weights.get(&format!("a.blk.{}.ffn_norm_1.weight", i))
+            .ok_or_else(|| anyhow!("ffn_norm_1 weight for layer {} not found", i))?;
+        let ffw2_normed = rms_norm(&ffw2_in, Some(ffw2_norm), 1e-6)?;
+
+        let ffw2_w1 = self.weights.get(&format!("a.blk.{}.ffn_up_1.weight", i))
+            .ok_or_else(|| anyhow!("ffn_up_1 weight for layer {} not found", i))?;
+        let ffw2_w1_imin = self.weights.get(&format!("a.blk.{}.ffn_up_1.input_min", i));
+        let ffw2_w1_imax = self.weights.get(&format!("a.blk.{}.ffn_up_1.input_max", i));
+        let ffw2_w1_omin = self.weights.get(&format!("a.blk.{}.ffn_up_1.output_min", i));
+        let ffw2_w1_omax = self.weights.get(&format!("a.blk.{}.ffn_up_1.output_max", i));
+
+        let ffw2_w2 = self.weights.get(&format!("a.blk.{}.ffn_down_1.weight", i))
+            .ok_or_else(|| anyhow!("ffn_down_1 weight for layer {} not found", i))?;
+        let ffw2_w2_imin = self.weights.get(&format!("a.blk.{}.ffn_down_1.input_min", i));
+        let ffw2_w2_imax = self.weights.get(&format!("a.blk.{}.ffn_down_1.input_max", i));
+        let ffw2_w2_omin = self.weights.get(&format!("a.blk.{}.ffn_down_1.output_min", i));
+        let ffw2_w2_omax = self.weights.get(&format!("a.blk.{}.ffn_down_1.output_max", i));
+
+        let mut f2 = clippable_linear_forward(&ffw2_normed, ffw2_w1, ffw2_w1_imin, ffw2_w1_imax, ffw2_w1_omin, ffw2_w1_omax)?;
+        f2 = f2.silu()?;
+        let f2 = clippable_linear_forward(&f2, ffw2_w2, ffw2_w2_imin, ffw2_w2_imax, ffw2_w2_omin, ffw2_w2_omax)?;
+
+        let f2_post_norm = self.weights.get(&format!("a.blk.{}.ffn_post_norm_1.weight", i))
+            .ok_or_else(|| anyhow!("ffn_post_norm_1 weight for layer {} not found", i))?;
+        let f2_post_normed = rms_norm(&f2.clamp(-grad_clip, grad_clip)?, Some(f2_post_norm), 1e-6)?;
+
+        let x = x.add(&(f2_post_normed * 0.5)?)?;
+
+        // 5. norm_out
+        let out_in = x.clamp(-grad_clip, grad_clip)?;
+        let out_norm = self.weights.get(&format!("a.blk.{}.norm_out.weight", i));
+        let x = rms_norm(&out_in, out_norm, 1e-6)?;
 
         Ok(x)
     }
 }
 
-fn normalize_audio_tensors(
-    raw: HashMap<String, Tensor>,
-    num_layers: usize,
-    device: &Device,
-) -> Result<HashMap<String, Tensor>> {
-    let mut normalized = HashMap::new();
-    let mut q_weights = HashMap::new();
-    let mut k_weights = HashMap::new();
-    let mut v_weights = HashMap::new();
-    let mut q_biases = HashMap::new();
-    let mut k_biases = HashMap::new();
-    let mut v_biases = HashMap::new();
+fn rms_norm(x: &Tensor, weight: Option<&Tensor>, eps: f64) -> Result<Tensor> {
+    let original_dtype = x.dtype();
+    let x_f32 = x.to_dtype(DType::F32)?;
+    let mean_sq = x_f32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+    let x_normed = x_f32.broadcast_div(&(mean_sq + eps)?.sqrt()?)?;
+    let res = if let Some(w) = weight {
+        let w_f32 = w.to_dtype(DType::F32)?;
+        x_normed.broadcast_mul(&w_f32)?
+    } else {
+        x_normed
+    };
+    Ok(res.to_dtype(original_dtype)?)
+}
 
-    for (k, v) in raw {
-        if k.contains("audio_encoder.conv1.weight") || k.contains("audio_encoder.conv1.weight") {
-            normalized.insert("audio.conv1.weight".to_string(), v);
-        } else if k.contains("audio_encoder.conv1.bias") {
-            normalized.insert("audio.conv1.bias".to_string(), v);
-        } else if k.contains("audio_encoder.conv2.weight") {
-            normalized.insert("audio.conv2.weight".to_string(), v);
-        } else if k.contains("audio_encoder.conv2.bias") {
-            normalized.insert("audio.conv2.bias".to_string(), v);
-        } else if k.contains("audio_encoder.positional_embedding") {
-            normalized.insert("audio.pos_embed.weight".to_string(), v);
-        } else if k.contains("audio_encoder.ln_post.weight") {
-            normalized.insert("audio.post_ln.weight".to_string(), v);
-        } else if k.contains("audio_encoder.ln_post.bias") {
-            normalized.insert("audio.post_ln.bias".to_string(), v);
-        } else if k.contains("audio_projector.linear_1.weight") || k.contains("audio_projector.0.weight") {
-            normalized.insert("projector.0.weight".to_string(), v);
-        } else if k.contains("audio_projector.linear_1.bias") || k.contains("audio_projector.0.bias") {
-            normalized.insert("projector.0.bias".to_string(), v);
-        } else if k.contains("audio_projector.linear_2.weight") || k.contains("audio_projector.2.weight") {
-            normalized.insert("projector.2.weight".to_string(), v);
-        } else if k.contains("audio_projector.linear_2.bias") || k.contains("audio_projector.2.bias") {
-            normalized.insert("projector.2.bias".to_string(), v);
-        } else if k.contains("audio_encoder.layers.") {
-            let parts: Vec<&str> = k.split('.').collect();
-            if let Some(idx_str) = parts.iter().position(|&p| p == "layers").and_then(|pos| parts.get(pos + 1)) {
-                if let Ok(layer_idx) = idx_str.parse::<usize>() {
-                    if k.contains("layer_norm1.weight") {
-                        normalized.insert(format!("audio.layers.{}.ln1.weight", layer_idx), v);
-                    } else if k.contains("layer_norm1.bias") {
-                        normalized.insert(format!("audio.layers.{}.ln1.bias", layer_idx), v);
-                    } else if k.contains("layer_norm2.weight") {
-                        normalized.insert(format!("audio.layers.{}.ln2.weight", layer_idx), v);
-                    } else if k.contains("layer_norm2.bias") {
-                        normalized.insert(format!("audio.layers.{}.ln2.bias", layer_idx), v);
-                    } else if k.contains("self_attn.out_proj.weight") || k.contains("self_attn.dense.weight") {
-                        normalized.insert(format!("audio.layers.{}.attn_out.weight", layer_idx), v);
-                    } else if k.contains("self_attn.out_proj.bias") || k.contains("self_attn.dense.bias") {
-                        normalized.insert(format!("audio.layers.{}.attn_out.bias", layer_idx), v);
-                    } else if k.contains("mlp.fc1.weight") || k.contains("mlp.dense_h_to_4h.weight") {
-                        normalized.insert(format!("audio.layers.{}.ffn_up.weight", layer_idx), v);
-                    } else if k.contains("mlp.fc1.bias") || k.contains("mlp.dense_h_to_4h.bias") {
-                        normalized.insert(format!("audio.layers.{}.ffn_up.bias", layer_idx), v);
-                    } else if k.contains("mlp.fc2.weight") || k.contains("mlp.dense_4h_to_h.weight") {
-                        normalized.insert(format!("audio.layers.{}.ffn_down.weight", layer_idx), v);
-                    } else if k.contains("mlp.fc2.bias") || k.contains("mlp.dense_4h_to_h.bias") {
-                        normalized.insert(format!("audio.layers.{}.ffn_down.bias", layer_idx), v);
-                    } else if k.contains("self_attn.q_proj.weight") {
-                        q_weights.insert(layer_idx, v);
-                    } else if k.contains("self_attn.k_proj.weight") {
-                        k_weights.insert(layer_idx, v);
-                    } else if k.contains("self_attn.v_proj.weight") {
-                        v_weights.insert(layer_idx, v);
-                    } else if k.contains("self_attn.q_proj.bias") {
-                        q_biases.insert(layer_idx, v);
-                    } else if k.contains("self_attn.k_proj.bias") {
-                        k_biases.insert(layer_idx, v);
-                    } else if k.contains("self_attn.v_proj.bias") {
-                        v_biases.insert(layer_idx, v);
-                    }
-                }
-            }
-        }
+fn to_f32_scalar(t: &Tensor) -> Result<f32> {
+    let t = t.to_dtype(DType::F32)?.flatten_all()?;
+    let vec = t.to_vec1::<f32>()?;
+    if vec.is_empty() {
+        anyhow::bail!("Empty tensor for scalar conversion");
+    }
+    Ok(vec[0])
+}
+
+fn clippable_linear_forward(
+    x: &Tensor,
+    weight: &Tensor,
+    input_min: Option<&Tensor>,
+    input_max: Option<&Tensor>,
+    output_min: Option<&Tensor>,
+    output_max: Option<&Tensor>,
+) -> Result<Tensor> {
+    let mut hidden_states = x.clone();
+
+    if let (Some(imin), Some(imax)) = (input_min, input_max) {
+        let min_val = to_f32_scalar(imin)?;
+        let max_val = to_f32_scalar(imax)?;
+        hidden_states = hidden_states.clamp(min_val, max_val)?;
     }
 
-    for layer_idx in 0..num_layers {
-        if let (Some(q), Some(k), Some(v)) = (q_weights.remove(&layer_idx), k_weights.remove(&layer_idx), v_weights.remove(&layer_idx)) {
-            let qkv = Tensor::cat(&[&q, &k, &v], 0)?;
-            normalized.insert(format!("audio.layers.{}.attn_qkv.weight", layer_idx), qkv);
-        }
-        let q_b = q_biases.remove(&layer_idx);
-        let k_b = k_biases.remove(&layer_idx);
-        let v_b = v_biases.remove(&layer_idx);
-        if q_b.is_some() || k_b.is_some() || v_b.is_some() {
-            let q_b = q_b.unwrap_or(Tensor::zeros(1, DType::F16, device)?);
-            let k_b = k_b.unwrap_or(Tensor::zeros(1, DType::F16, device)?);
-            let v_b = v_b.unwrap_or(Tensor::zeros(1, DType::F16, device)?);
-            let qkv_b = Tensor::cat(&[&q_b, &k_b, &v_b], 0)?;
-            normalized.insert(format!("audio.layers.{}.attn_qkv.bias", layer_idx), qkv_b);
-        } else {
-            if let Some(qkv_w) = normalized.get(&format!("audio.layers.{}.attn_qkv.weight", layer_idx)) {
-                let out_dim = qkv_w.dim(0)?;
-                let zeros = Tensor::zeros(out_dim, DType::F16, device)?;
-                normalized.insert(format!("audio.layers.{}.attn_qkv.bias", layer_idx), zeros);
-            }
-        }
+    hidden_states = matmul_3d_2d(&hidden_states, weight)?;
+
+    if let (Some(omin), Some(omax)) = (output_min, output_max) {
+        let min_val = to_f32_scalar(omin)?;
+        let max_val = to_f32_scalar(omax)?;
+        hidden_states = hidden_states.clamp(min_val, max_val)?;
     }
 
-    Ok(normalized)
+    Ok(hidden_states)
+}
+
+fn softplus(x: &Tensor) -> Result<Tensor> {
+    Ok((x.exp()? + 1.0)?.log()?)
+}
+
+fn glu(x: &Tensor) -> Result<Tensor> {
+    let last_dim = x.dim(2)?;
+    let half = last_dim / 2;
+    let a = x.narrow(2, 0, half)?;
+    let b = x.narrow(2, half, half)?;
+    Ok(a.broadcast_mul(&candle_nn::ops::sigmoid(&b)?)?)
+}
+
+fn extract_block_context(
+    x: &Tensor,
+    _max_past_horizon: usize,
+    _max_future_horizon: usize,
+    chunk_size: usize,
+    context_size: usize,
+) -> Result<Tensor> {
+    let (batch_size, seq_len, num_heads, head_dim) = x.dims4()?;
+    let num_blocks = (seq_len + chunk_size - 1) / chunk_size;
+    let pad = num_blocks * chunk_size - seq_len;
+    let pad_tensor = Tensor::zeros((batch_size, pad, num_heads, head_dim), x.dtype(), x.device())?;
+    let x_padded = Tensor::cat(&[x.clone(), pad_tensor], 1)?.contiguous()?;
+
+    let mut blocks = Vec::new();
+    for b in 0..num_blocks {
+        let block_start = b * chunk_size;
+        let context_start = (block_start + chunk_size).saturating_sub(context_size);
+        let context_len = context_size;
+        let slice = x_padded.narrow(1, context_start, context_len)?;
+        blocks.push(slice);
+    }
+    Ok(Tensor::stack(&blocks, 1)?)
+}
+
+fn rel_shift(x: &Tensor, context_size: usize, _chunk_size: usize) -> Result<Tensor> {
+    let (batch_size, num_heads, num_blocks, block_size, position_length) = x.dims5()?;
+    let pad_len = context_size + 1 - position_length;
+    let pad_tensor = Tensor::zeros((batch_size, num_heads, num_blocks, block_size, pad_len), x.dtype(), x.device())?;
+    let x = Tensor::cat(&[x.clone(), pad_tensor], 4)?.contiguous()?;
+    let x = x.reshape((batch_size, num_heads, num_blocks, block_size * (context_size + 1)))?;
+    let x = x.narrow(3, 0, block_size * context_size)?;
+    Ok(x.reshape((batch_size, num_heads, num_blocks, block_size, context_size))?)
 }
 
 pub fn load_audio(path: &Path, device: &Device) -> Result<Tensor> {
@@ -410,7 +592,8 @@ pub fn load_audio(path: &Path, device: &Device) -> Result<Tensor> {
         pcm_data.truncate(target_samples);
     }
 
-    let mut mel_data = vec![0.0f32; 80 * 3000];
+    let num_mel_bins = 128;
+    let mut mel_data = vec![0.0f32; num_mel_bins * 3000];
     for frame in 0..3000 {
         let start_idx = frame * 160;
         let mut power = 0.0f32;
@@ -423,17 +606,16 @@ pub fn load_audio(path: &Path, device: &Device) -> Result<Tensor> {
         }
         power = (power / window_len as f32).sqrt();
 
-        for bin in 0..80 {
-            let factor = ((bin as f32 / 80.0) * std::f32::consts::PI).sin();
+        for bin in 0..num_mel_bins {
+            let factor = ((bin as f32 / num_mel_bins as f32) * std::f32::consts::PI).sin();
             mel_data[bin * 3000 + frame] = power * factor;
         }
     }
 
-    let t = Tensor::from_vec(mel_data, (1, 80, 3000), device)?;
+    let t = Tensor::from_vec(mel_data, (1, num_mel_bins, 3000), device)?;
     Ok(t)
 }
 
 fn matmul_3d_2d(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
-    Ok(lhs.contiguous()?.matmul(&rhs.unsqueeze(0)?.contiguous()?)?)
+    Ok(lhs.contiguous()?.matmul(&rhs.t()?.unsqueeze(0)?.contiguous()?)?)
 }
-
