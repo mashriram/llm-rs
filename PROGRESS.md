@@ -1,9 +1,13 @@
 # Progress
 
 ## Current task
-Tasks 7, 8, 9 DONE. Ready for Task 10 (tag v1) pending user confirmation
-on pushing/releasing (see below — local tagging/merge is done, remote
-push is a separate explicit ask per session safety rules).
+PHASE COMPLETE (local). v1-unified merged into master, tagged v1.0.0
+locally, cargo check/test clean on master. Pushing to origin / publishing
+a GitHub release is a separate explicit user decision (not done as part
+of this pass — see chat for confirmation before any remote/push action).
+Remaining real work for a future session: CUDA/x86 hardware verification
+(user will check in on that hardware), then re-run this same audit
+discipline for anything those hardware types surface.
 
 ## Task 8 — CLI + end-to-end verification, 2026-07-19
 - **Chat TUI** (`llm-cli/src/bin/chat.rs`, release build, `--features
