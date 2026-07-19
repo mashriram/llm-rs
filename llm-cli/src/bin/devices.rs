@@ -5,6 +5,7 @@
 
 fn main() {
     tracing_subscriber::fmt::init();
+    llm_cli::log_compiled_backend_support();
     let profile = llm_core::profile::HardwareProfile::get();
 
     println!("llm-rs hardware profile");

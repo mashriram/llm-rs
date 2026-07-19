@@ -1,10 +1,12 @@
 use std::sync::Arc;
 use std::time::Instant;
-use llm_core::backend::LlmBackend;
-use llm_core::backends::candle::CandleBackend;
 use llm_scheduler::engine::ServingEngine;
 use llm_core::types::{InferRequest, SampleParams};
 use clap::Parser;
+use llm_cli::{
+    consume_generation, load_candle_backend, log_compiled_backend_support, maybe_prepend_bos,
+    print_gen_stats, resolve_eos_token_ids,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Benchmark llm-rs inference throughput")]
@@ -29,17 +31,31 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+    log_compiled_backend_support();
+
+    let model_path = std::path::Path::new(&args.model_path);
+    if !model_path.exists() {
+        anyhow::bail!("model file not found at {}: pass a valid --model-path", args.model_path);
+    }
+    let tokenizer_path = std::path::Path::new(&args.tokenizer_path);
+    if !tokenizer_path.exists() {
+        anyhow::bail!(
+            "tokenizer.json not found at {}: pass --tokenizer-path explicitly with a valid path",
+            args.tokenizer_path
+        );
+    }
 
     println!("Loading tokenizer from {}...", args.tokenizer_path);
-    let tokenizer = Arc::new(llm_core::tokenizer::LlmTokenizer::from_file(&args.tokenizer_path)?);
+    let tokenizer = Arc::new(
+        llm_core::tokenizer::LlmTokenizer::from_file(&args.tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("failed to load tokenizer from {}: {}", args.tokenizer_path, e))?,
+    );
 
     println!("Loading model from {}...", args.model_path);
-    let mut backend = Box::new(CandleBackend::new());
-    if args.explicit_dequantize {
-        backend.set_explicit_dequantize(true);
-    }
     let start_load = Instant::now();
-    let meta = backend.load_weights(std::path::Path::new(&args.model_path))?;
+    // benchmark_speed previously never called set_use_vram_embeddings; kept
+    // as `false` here to preserve prior behavior (no CLI flag existed for it).
+    let (backend, meta) = load_candle_backend(model_path, args.explicit_dequantize, false)?;
     println!(
         "Model loaded in {:.2?} (vocab_size: {}, hidden_dim: {})",
         start_load.elapsed(),
@@ -47,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         meta.hidden_dim
     );
 
+    let eos_token_ids = resolve_eos_token_ids(backend.as_ref(), &tokenizer);
     let engine = Arc::new(ServingEngine::new(backend, 1024));
     let mut rx = engine.subscribe();
 
@@ -55,7 +72,12 @@ async fn main() -> anyhow::Result<()> {
     } else {
         format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", args.prompt)
     };
-    let prompt_tokens = tokenizer.encode(&prompt, true)?;
+    let mut prompt_tokens = tokenizer.encode(&prompt, true)?;
+    // Previously missing here (unlike run_model.rs/chat.rs), which meant a
+    // Gemma checkpoint benchmarked through this bin silently generated from
+    // an unprimed prompt (no BOS token) — a real behavioral drift bug fixed
+    // by using the single shared implementation.
+    maybe_prepend_bos(&mut prompt_tokens, &meta);
     let prompt_len = prompt_tokens.len();
     println!("Prompt ({} tokens): \"{}\"", prompt_len, args.prompt);
 
@@ -73,68 +95,23 @@ async fn main() -> anyhow::Result<()> {
     };
 
     println!("Sending inference request...");
-    let start_gen = Instant::now();
     engine.add_request(req)?;
 
-    let mut generated_tokens = Vec::new();
-    let mut ttft = None;
-    let mut last_token_time = start_gen;
-    let mut first_token_time = None;
-
-    while let Ok(event) = rx.recv().await {
-        if event.seq_id == 1 {
-            let now = Instant::now();
-            if ttft.is_none() {
-                ttft = Some(now.duration_since(start_gen));
-                first_token_time = Some(now);
-                print!("Assistant: ");
-            }
-
-            let token_str = tokenizer.decode(&[event.token_id], true)?;
-            if token_str.is_empty() {
-                print!("[ID:{}]", event.token_id);
-            } else {
-                print!("{}", token_str);
-            }
-            std::io::Write::flush(&mut std::io::stdout())?;
-
-            generated_tokens.push(event.token_id);
-            last_token_time = now;
-
-            if event.is_eos {
-                break;
-            }
+    print!("Assistant: ");
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    let result = consume_generation(&mut rx, 1, &tokenizer, &eos_token_ids, args.max_new_tokens, |token_id, text| {
+        if text.is_empty() {
+            print!("[ID:{}]", token_id);
+        } else {
+            print!("{}", text);
         }
-    }
-    println!("\nGenerated token IDs: {:?}", generated_tokens);
+        let _ = std::io::stdout().flush();
+    }).await;
+    println!("\nGenerated token IDs: {:?}", result.tokens);
     println!("\n");
 
-    let total_duration = start_gen.elapsed();
-    let num_generated = generated_tokens.len();
-
-    println!("--------------------------------------");
-    println!("Benchmark Results (llm-rs):");
-    println!("--------------------------------------");
-    if let Some(t) = ttft {
-        println!("Time to First Token (TTFT): {:.2?}", t);
-        println!("Prefill Speed: {:.2} tokens/sec", prompt_len as f64 / t.as_secs_f64());
-    }
-
-    if let Some(first_t) = first_token_time {
-        let decode_duration = last_token_time.duration_since(first_t);
-        println!("Decode Duration: {:.2?}", decode_duration);
-        if num_generated > 1 {
-            println!(
-                "Decode Speed: {:.2} tokens/sec",
-                (num_generated - 1) as f64 / decode_duration.as_secs_f64()
-            );
-        }
-    }
-
-    println!("Total Generation Time: {:.2?}", total_duration);
-    println!("Total Tokens Generated: {}", num_generated);
-    println!("Overall Speed: {:.2} tokens/sec", num_generated as f64 / total_duration.as_secs_f64());
-    println!("--------------------------------------");
+    print_gen_stats(prompt_len, &result);
 
     Ok(())
 }
