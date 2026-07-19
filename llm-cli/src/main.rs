@@ -48,7 +48,9 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Loading tokenizer...");
     let tokenizer_path = if path.is_file() {
-        let parent = path.parent().unwrap();
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("model_path {:?} has no parent directory to look for a tokenizer in", path))?;
         let same_dir = parent.join("tokenizer.json");
         if same_dir.exists() {
             same_dir

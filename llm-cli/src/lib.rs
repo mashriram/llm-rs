@@ -160,7 +160,12 @@ pub async fn chat_completions(
         );
     }
 
-    let created = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    // A clock set before the UNIX epoch would make `duration_since` fail; fall back
+    // to 0 rather than panicking the request handler over a misconfigured clock.
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_secs();
     let model_name = state.model_name.clone();
     let tokenizer = state.tokenizer.clone();
 
@@ -184,8 +189,15 @@ pub async fn chat_completions(
                                 finish_reason: if event.is_eos { Some("stop".to_string()) } else { None },
                             }],
                         };
-                        let json = serde_json::to_string(&chunk).unwrap();
-                        Some(Ok::<Event, std::convert::Infallible>(Event::default().data(json)))
+                        match serde_json::to_string(&chunk) {
+                            Ok(json) => Some(Ok::<Event, std::convert::Infallible>(
+                                Event::default().data(json),
+                            )),
+                            Err(e) => {
+                                error!("Failed to serialize chat completion chunk: {:?}", e);
+                                None
+                            }
+                        }
                     }
                     _ => None,
                 }

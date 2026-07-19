@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::collections::HashMap;
-use anyhow::{Result, anyhow, Context};
+use anyhow::{Result, anyhow, bail, Context};
 use candle_core::{Device, Tensor, DType, Module};
 use candle_core::quantized::QMatMul;
 use parking_lot::Mutex;
@@ -402,14 +402,29 @@ impl LlmBackend for CandleBackend {
                 }
             }
 
+            // `general.architecture` and `tokenizer.ggml.tokens` are mandatory GGUF
+            // fields for any real model file. Guessing "llama"/a fixed vocab size
+            // when they're absent would silently misclassify the architecture (and
+            // thus mis-route arch-specific behavior like Gemma's tied-embedding /
+            // activation heuristics below) or size the lm_head against the wrong
+            // vocabulary — a corrupt/non-model GGUF file must fail loudly here
+            // instead of quietly loading with wrong assumptions.
             let arch = match model.metadata.get("general.architecture") {
                 Some(candle_core::quantized::gguf_file::Value::String(s)) => s.as_str(),
-                _ => "llama",
+                _ => bail!(
+                    "GGUF file {:?} is missing required 'general.architecture' metadata; \
+                     cannot determine model architecture",
+                    path
+                ),
             };
 
             let vocab_size = match model.metadata.get("tokenizer.ggml.tokens") {
                 Some(candle_core::quantized::gguf_file::Value::Array(arr)) => arr.len(),
-                _ => 151936,
+                _ => bail!(
+                    "GGUF file {:?} is missing required 'tokenizer.ggml.tokens' metadata; \
+                     cannot determine vocabulary size",
+                    path
+                ),
             };
 
             let n_layers = meta_u32_agnostic(&model.metadata, "block_count")
@@ -1134,6 +1149,8 @@ impl LlmBackend for CandleBackend {
                 *last_path = active_path.clone();
                 loaded
             } else {
+                // `needs_load` is only `false` when the match above matched the
+                // `Some(_)` cache arm, so `cache` is guaranteed to be populated here.
                 cache.as_ref().unwrap().clone()
             };
             ctx.insert("pixel_values".to_string(), pixel_val);
@@ -1168,6 +1185,8 @@ impl LlmBackend for CandleBackend {
                 *last_path = active_path.clone();
                 loaded
             } else {
+                // `needs_load` is only `false` when the match above matched the
+                // `Some(_)` cache arm, so `cache` is guaranteed to be populated here.
                 cache.as_ref().unwrap().clone()
             };
             ctx.insert("audio_values".to_string(), audio_val);
@@ -1420,6 +1439,8 @@ impl LlmBackend for CandleBackend {
                         let offset = kv_cache.get_seq_len(seq_id);
                         
                         if !is_shared {
+                            // `k_4d`/`v_4d` are `Some(..)` exactly when `!is_shared` (see the
+                            // construction above), so both are guaranteed populated here.
                             let k_4d_val = k_4d.as_ref().unwrap();
                             let v_4d_val = v_4d.as_ref().unwrap();
                             let k_i = k_4d_val.narrow(0, i, 1)?;
@@ -1438,31 +1459,42 @@ impl LlmBackend for CandleBackend {
                                 let k_chunk = k_i.narrow(1, t_start, chunk_len)?;
                                 let v_chunk = v_i.narrow(1, t_start, chunk_len)?;
                                 
-                                let block_data = gpu_cache.entry((*layer_idx, block_id)).or_insert_with(|| {
+                                // `HashMap::entry(..).or_insert_with(..)` requires an infallible
+                                // closure, but `Tensor::zeros` can fail (e.g. allocation
+                                // failure), so we build the entry fallibly outside of
+                                // `or_insert_with` and propagate any error via `?` instead of
+                                // unwrapping inside the closure.
+                                if !gpu_cache.contains_key(&(*layer_idx, block_id)) {
                                     let dev = q_dev;
                                     let dtype = self.kv_config.dtype;
                                     let comp_dtype = self.compute_dtype;
-                                    
+
                                     let (k_block, k_scale) = if dtype == KvDtype::Q8 || dtype == KvDtype::Q4 {
-                                        let d = Tensor::zeros((1, block_size, n_kv_heads, head_dim), DType::U8, dev).unwrap();
-                                        let s = Tensor::zeros((1, block_size, n_kv_heads, 1), comp_dtype, dev).unwrap();
+                                        let d = Tensor::zeros((1, block_size, n_kv_heads, head_dim), DType::U8, dev)?;
+                                        let s = Tensor::zeros((1, block_size, n_kv_heads, 1), comp_dtype, dev)?;
                                         (d, Some(s))
                                     } else {
-                                        let d = Tensor::zeros((1, block_size, n_kv_heads, head_dim), comp_dtype, dev).unwrap();
+                                        let d = Tensor::zeros((1, block_size, n_kv_heads, head_dim), comp_dtype, dev)?;
                                         (d, None)
                                     };
-                                    
+
                                     let (v_block, v_scale) = if dtype == KvDtype::Q8 || dtype == KvDtype::Q4 {
-                                        let d = Tensor::zeros((1, block_size, n_kv_heads, head_dim), DType::U8, dev).unwrap();
-                                        let s = Tensor::zeros((1, block_size, n_kv_heads, 1), comp_dtype, dev).unwrap();
+                                        let d = Tensor::zeros((1, block_size, n_kv_heads, head_dim), DType::U8, dev)?;
+                                        let s = Tensor::zeros((1, block_size, n_kv_heads, 1), comp_dtype, dev)?;
                                         (d, Some(s))
                                     } else {
-                                        let d = Tensor::zeros((1, block_size, n_kv_heads, head_dim), comp_dtype, dev).unwrap();
+                                        let d = Tensor::zeros((1, block_size, n_kv_heads, head_dim), comp_dtype, dev)?;
                                         (d, None)
                                     };
-                                    
-                                    BlockData { k: k_block, k_scale, v: v_block, v_scale }
-                                });
+
+                                    gpu_cache.insert(
+                                        (*layer_idx, block_id),
+                                        BlockData { k: k_block, k_scale, v: v_block, v_scale },
+                                    );
+                                }
+                                let block_data = gpu_cache
+                                    .get_mut(&(*layer_idx, block_id))
+                                    .ok_or_else(|| anyhow!("Block ID {} for layer {} was just inserted but is missing", block_id, layer_idx))?;
                                 
                                 if self.kv_config.dtype == KvDtype::Q8 || self.kv_config.dtype == KvDtype::Q4 {
                                     // Cast to compute_dtype before quantizing (dequantize() returns F32)
@@ -1471,9 +1503,12 @@ impl LlmBackend for CandleBackend {
                                     let (q_k, q_k_scale) = quantize(&k_chunk_cast, self.kv_config.dtype, self.compute_dtype)?;
                                     let (q_v, q_v_scale) = quantize(&v_chunk_cast, self.kv_config.dtype, self.compute_dtype)?;
                                     
+                                    // `k_scale`/`v_scale` are always `Some` for Q8/Q4 blocks:
+                                    // they are created `Some` above whenever `dtype` is Q8/Q4
+                                    // (this same branch condition), and never reset to `None`.
                                     block_data.k = update_block_tensor(&block_data.k, &q_k, start_block_offset, chunk_len)?;
                                     block_data.k_scale = Some(update_block_tensor(block_data.k_scale.as_ref().unwrap(), &q_k_scale, start_block_offset, chunk_len)?);
-                                    
+
                                     block_data.v = update_block_tensor(&block_data.v, &q_v, start_block_offset, chunk_len)?;
                                     block_data.v_scale = Some(update_block_tensor(block_data.v_scale.as_ref().unwrap(), &q_v_scale, start_block_offset, chunk_len)?);
                                 } else {
@@ -1513,12 +1548,14 @@ impl LlmBackend for CandleBackend {
                             let block_data = gpu_cache.get(&(src_layer, block_id))
                                 .ok_or_else(|| anyhow!("Block ID {} not found for layer {}", block_id, src_layer))?;
                             
+                            // Same invariant as above: `k_scale`/`v_scale` are always `Some`
+                            // whenever `kv_config.dtype` is Q8/Q4.
                             let k_deq = if self.kv_config.dtype == KvDtype::Q8 || self.kv_config.dtype == KvDtype::Q4 {
                                 dequantize(&block_data.k, block_data.k_scale.as_ref().unwrap(), self.kv_config.dtype, self.compute_dtype)?
                             } else {
                                 block_data.k.clone()
                             };
-                            
+
                             let v_deq = if self.kv_config.dtype == KvDtype::Q8 || self.kv_config.dtype == KvDtype::Q4 {
                                 dequantize(&block_data.v, block_data.v_scale.as_ref().unwrap(), self.kv_config.dtype, self.compute_dtype)?
                             } else {
@@ -1648,6 +1685,8 @@ impl LlmBackend for CandleBackend {
                             *last_path = active_path.clone();
                             encoded
                         } else {
+                            // `needs_encode` is only `false` when the match above matched
+                            // the `Some(_)` cache arm, so `cache` is guaranteed populated.
                             cache.as_ref().unwrap().clone()
                         }
                     } else if let Some(ref preloaded) = *self.visual_embeddings.lock() {
@@ -1694,6 +1733,8 @@ impl LlmBackend for CandleBackend {
                             *last_path = active_path.clone();
                             encoded
                         } else {
+                            // `needs_encode` is only `false` when the match above matched
+                            // the `Some(_)` cache arm, so `cache` is guaranteed populated.
                             cache.as_ref().unwrap().clone()
                         }
                     } else if let Some(ref preloaded) = *self.audio_embeddings.lock() {

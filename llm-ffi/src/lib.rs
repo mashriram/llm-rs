@@ -139,6 +139,8 @@ pub unsafe extern "C" fn poll_token(engine: *mut c_void, seq_id: u64) -> Generat
         if event.seq_id == seq_id {
             let ch = std::char::from_u32(event.token_id).unwrap_or(' ');
             let s = if ch == '\0' { "".to_string() } else { ch.to_string() };
+            // `CString::new(" ")` cannot fail: the literal " " contains no interior
+            // NUL byte, which is the only failure mode of `CString::new`.
             let c_string = CString::new(s).unwrap_or_else(|_| CString::new(" ").unwrap());
             return GenerationResult {
                 token: event.token_id,

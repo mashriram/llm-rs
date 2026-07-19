@@ -34,8 +34,11 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
 
     let rms_norm_eps = val.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-5) as f32;
     let tie_word_embeddings = val.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Matches candle.rs's GGUF-metadata activation detection: substring match
+    // so variants like "gelu_new"/"gelu_pytorch_tanh" still resolve to GeLU
+    // rather than silently falling through to SiLU.
     let hidden_act = match val.get("hidden_act").and_then(|v| v.as_str()) {
-        Some("gelu") => HiddenAct::GeLU,
+        Some(s) if s.contains("gelu") => HiddenAct::GeLU,
         _ => HiddenAct::SiLU,
     };
 

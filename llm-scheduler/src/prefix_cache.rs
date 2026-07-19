@@ -51,8 +51,7 @@ impl RadixNode {
             }
 
             let next_token = path[path_idx];
-            if node.children.contains_key(&next_token) {
-                let child = node.children.get_mut(&next_token).unwrap();
+            if let Some(child) = node.children.get_mut(&next_token) {
                 let mut match_len = 0;
                 for (i, &t) in child.tokens.iter().enumerate() {
                     if path_idx + i < path.len() && path[path_idx + i] == t {
@@ -68,7 +67,13 @@ impl RadixNode {
                 }
 
                 path_idx += match_len;
-                node = node.children.get_mut(&next_token).unwrap();
+                // `next_token` was just looked up above and `split_node` only
+                // restructures the child's own subtree (it never removes
+                // `next_token` from `node.children`), so the key is still present.
+                node = node
+                    .children
+                    .get_mut(&next_token)
+                    .expect("next_token key was just present in node.children and cannot have been removed");
             } else {
                 // Create a new child
                 let remaining_tokens = path[path_idx..].to_vec();
@@ -318,8 +323,7 @@ impl PrefixCache {
                 break;
             }
             let next_token = path[path_idx];
-            if node.children.contains_key(&next_token) {
-                let child = node.children.get_mut(&next_token).unwrap();
+            if let Some(child) = node.children.get_mut(&next_token) {
                 path_idx += child.tokens.len();
                 node = child;
             } else {

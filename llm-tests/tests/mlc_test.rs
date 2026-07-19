@@ -354,9 +354,9 @@ fn test_safetensors_load_contains_expected_tensor() {
     write_dummy_safetensors(&path);
     let file = llm_core::loader::safetensors::load_safetensors(&path).unwrap();
     assert!(
-        file.tensors.contains_key("weight"),
+        file.contains_tensor("weight"),
         "loaded file must expose the 'weight' tensor; keys = {:?}",
-        file.tensors.keys().collect::<Vec<_>>()
+        file.tensor_names().collect::<Vec<_>>()
     );
 }
 
@@ -365,7 +365,7 @@ fn test_safetensors_load_tensor_shape() {
     let path = std::env::temp_dir().join("st_shape.safetensors");
     write_dummy_safetensors(&path);
     let file = llm_core::loader::safetensors::load_safetensors(&path).unwrap();
-    let view = file.tensors.get("weight").unwrap();
+    let view = file.tensor("weight").unwrap();
     assert_eq!(view.shape, &[2, 2], "tensor shape must be [2, 2]");
 }
 

@@ -55,7 +55,13 @@ impl Scheduler {
             let needed_blocks = (prompt_len + self.block_size - 1) / self.block_size;
 
             if self.block_allocator.free_blocks() >= needed_blocks {
-                let req = self.waiting_queue.pop_front().unwrap();
+                // `waiting_queue.front()` returned `Some` above and `&mut self` gives
+                // us exclusive access with no intervening mutation, so the queue is
+                // still non-empty here.
+                let req = self
+                    .waiting_queue
+                    .pop_front()
+                    .expect("waiting_queue was just observed non-empty via front()");
                 
                 // Allocate blocks
                 let mut block_table = Vec::with_capacity(needed_blocks);
