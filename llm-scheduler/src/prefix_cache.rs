@@ -136,9 +136,18 @@ impl PrefixCache {
         self.seq_to_path.insert(seq_id, Vec::new());
     }
 
-    /// Get the remaining capacity (simulated for compatibility).
+    /// Placeholder capacity accessor.
+    ///
+    /// NOTE: This does NOT reflect any real free capacity -- `PrefixCache`
+    /// does not currently manage or share physical KV-cache blocks at all
+    /// (see the comment at the `insert_sequence` call site in
+    /// `scheduler.rs::step()` for why block sharing isn't wired up yet), so
+    /// there is no "real" capacity to report. This method is currently dead
+    /// code (not called from `scheduler.rs`); the hardcoded value below is
+    /// kept only so it still compiles/returns something sane if a future
+    /// caller reaches for it, but it must not be treated as authoritative
+    /// until this subsystem is actually wired into block allocation.
     pub fn free_capacity(&self) -> usize {
-        // Return a large capacity for testing parity
         64 * 64
     }
 
