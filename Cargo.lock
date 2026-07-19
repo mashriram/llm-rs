@@ -2218,6 +2218,7 @@ name = "llm-py"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "llm-cli",
  "llm-core",
  "llm-scheduler",
  "pyo3",

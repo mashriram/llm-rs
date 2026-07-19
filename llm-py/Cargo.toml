@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 llm-core = { path = "../llm-core" }
 llm-scheduler = { path = "../llm-scheduler" }
+llm-cli = { path = "../llm-cli" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

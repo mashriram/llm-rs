@@ -24,8 +24,13 @@ use pyo3::prelude::*;
 use llm_core::backend::LlmBackend;
 use llm_core::backends::candle::CandleBackend;
 use llm_core::tokenizer::LlmTokenizer;
-use llm_core::types::{InferRequest, SampleParams, SeqId, TokenId};
+use llm_core::types::{InferRequest, ModelMeta, SampleParams, SeqId, TokenId};
 use llm_scheduler::engine::{ServingEngine, TokenEvent};
+
+// Reuse the exact same chat-template rendering `llm-cli`'s HTTP server and
+// chat TUI use, rather than a third independent (and, per a prior audit,
+// inevitably drifting) copy of this logic.
+use llm_cli::{maybe_prepend_bos, render_prompt, ChatMessage};
 
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() > n {
@@ -139,10 +144,7 @@ pub struct LLM {
     eos_token_id: Option<u32>,
     backend_name: String,
     model_name: String,
-    vocab_size: usize,
-    arch: String,
-    has_vision_encoder: bool,
-    has_audio_encoder: bool,
+    meta: Arc<ModelMeta>,
 }
 
 fn resolve_tokenizer_path(model_path: &Path, tokenizer_path: Option<String>) -> PyResult<PathBuf> {
@@ -254,21 +256,27 @@ impl LLM {
             eos_token_id,
             backend_name,
             model_name,
-            vocab_size: meta.vocab_size,
-            arch: meta.arch.clone(),
-            has_vision_encoder: meta.has_vision_encoder,
-            has_audio_encoder: meta.has_audio_encoder,
+            meta: Arc::new(meta),
         })
     }
 
     /// Generate completions for a batch of prompts. Blocking (releases the
     /// GIL while it runs), returns once every prompt has finished.
-    #[pyo3(signature = (prompts, sampling_params=None))]
+    ///
+    /// By default (`apply_chat_template=True`), each prompt is treated as a
+    /// single user turn and rendered through the MODEL'S OWN chat template
+    /// (`meta.chat_template`, Jinja-rendered, with the same architecture-aware
+    /// fallback `llm-cli`'s HTTP server and chat TUI use) before tokenizing —
+    /// so e.g. a Gemma checkpoint gets Gemma's turn format, not a one-size-
+    /// fits-all hardcoded format. Pass `apply_chat_template=False` to send
+    /// `prompts` as raw, already-formatted text instead.
+    #[pyo3(signature = (prompts, sampling_params=None, apply_chat_template=true))]
     fn generate(
         &self,
         py: Python<'_>,
         prompts: Vec<String>,
         sampling_params: Option<SamplingParams>,
+        apply_chat_template: bool,
     ) -> PyResult<Vec<RequestOutput>> {
         if prompts.is_empty() {
             return Ok(Vec::new());
@@ -291,9 +299,21 @@ impl LLM {
         let mut requests: Vec<InferRequest> = Vec::with_capacity(prompts.len());
         let mut prompt_lens: HashMap<SeqId, usize> = HashMap::new();
         for prompt in &prompts {
-            let prompt_tokens = tokenizer.encode(prompt, true).map_err(|e| {
+            let rendered = if apply_chat_template {
+                let messages = [ChatMessage {
+                    role: "user".to_string(),
+                    content: prompt.clone(),
+                }];
+                render_prompt(&messages, &self.meta)
+            } else {
+                prompt.clone()
+            };
+            let mut prompt_tokens = tokenizer.encode(&rendered, true).map_err(|e| {
                 PyRuntimeError::new_err(format!("failed to tokenize prompt: {e:#}"))
             })?;
+            if apply_chat_template {
+                maybe_prepend_bos(&mut prompt_tokens, &self.meta);
+            }
             let seq_id = self.next_seq_id.fetch_add(1, Ordering::Relaxed);
             order.push(seq_id);
             prompt_lens.insert(seq_id, prompt_tokens.len());
@@ -359,28 +379,33 @@ impl LLM {
 
     #[getter]
     fn arch(&self) -> &str {
-        &self.arch
+        &self.meta.arch
     }
 
     #[getter]
     fn vocab_size(&self) -> usize {
-        self.vocab_size
+        self.meta.vocab_size
     }
 
     #[getter]
     fn has_vision_encoder(&self) -> bool {
-        self.has_vision_encoder
+        self.meta.has_vision_encoder
     }
 
     #[getter]
     fn has_audio_encoder(&self) -> bool {
-        self.has_audio_encoder
+        self.meta.has_audio_encoder
+    }
+
+    #[getter]
+    fn has_chat_template(&self) -> bool {
+        self.meta.chat_template.is_some()
     }
 
     fn __repr__(&self) -> String {
         format!(
             "LLM(model_name={:?}, arch={:?}, backend={:?})",
-            self.model_name, self.arch, self.backend_name
+            self.model_name, self.meta.arch, self.backend_name
         )
     }
 }
