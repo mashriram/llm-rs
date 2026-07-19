@@ -151,6 +151,32 @@ impl VisionEncoder {
 
         let weights = normalize_vision_tensors(raw_weights, num_layers, device)?;
 
+        // Prefer deriving spatial_merge_size from the projector's own input
+        // dimension over trusting a GGUF metadata key. Confirmed via a real
+        // Qwen2-VL-2B-Instruct mmproj file that `clip.vision.spatial_merge_size`
+        // is simply absent from real-world exports, which silently left this
+        // at the hardcoded default of 1 and caused a matmul shape-mismatch
+        // crash on the very first real forward pass (projector expected
+        // hidden_dim * merge_size^2 input, e.g. 1280*4=5120, but got the
+        // un-merged 1280). The projector's weight shape is ground truth for
+        // what the model actually needs — this is metadata (the model file
+        // itself), just not a metadata *key* — so use it whenever it cleanly
+        // resolves, falling back to the config/GGUF-key value otherwise.
+        if let Some(proj_w) = weights.get("projector.0.weight") {
+            if hidden_dim > 0 {
+                for &dim in &[proj_w.dim(0)?, proj_w.dim(proj_w.rank().saturating_sub(1))?] {
+                    if dim > hidden_dim && dim % hidden_dim == 0 {
+                        let ratio = dim / hidden_dim;
+                        let candidate = (ratio as f64).sqrt().round() as usize;
+                        if candidate >= 1 && candidate * candidate == ratio {
+                            spatial_merge_size = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             weights,
             image_size,
@@ -183,7 +209,15 @@ impl VisionEncoder {
         // Reshape [1, hidden_dim, H_out, W_out] -> [1, hidden_dim, patches] -> [1, patches, hidden_dim]
         let (b, c, h, w) = x.dims4()?;
         let num_patches = h * w;
-        x = x.reshape((b, c, num_patches))?.permute((0, 2, 1))?;
+        // `.contiguous()` is required here, not optional: `permute` only changes
+        // strides, and when a model has no `vision.pos_embed.weight` (e.g.
+        // Qwen2-VL, which uses rotary position embeddings for its vision
+        // encoder instead of an absolute position table), the `broadcast_add`
+        // below that would otherwise produce a contiguous tensor never runs -
+        // `x` flows straight into `candle_nn::ops::layer_norm` still permuted,
+        // which candle rejects with "Non contiguous layernorm is not
+        // implemented" (confirmed via a real Qwen2-VL-2B forward pass).
+        x = x.reshape((b, c, num_patches))?.permute((0, 2, 1))?.contiguous()?;
 
         // 2. Add Positional Embedding (pos_embed.weight shape [num_patches, hidden_dim] or [2, 10240, hidden_dim])
         if let Some(pos_emb) = self.weights.get("vision.pos_embed.weight") {
@@ -250,7 +284,7 @@ impl VisionEncoder {
                 .ok_or_else(|| anyhow!("vision.layers.{}.attn_qkv.weight not found", i))?;
             let qkv_b = self.weights.get(&format!("vision.layers.{}.attn_qkv.bias", i));
 
-            let mut qkv = matmul_3d_2d(&x_ln1, &qkv_w.t()?)?;
+            let mut qkv = matmul_3d_2d(&x_ln1, qkv_w)?;
             if let Some(bias) = qkv_b {
                 qkv = qkv.broadcast_add(bias)?;
             }
@@ -277,7 +311,7 @@ impl VisionEncoder {
             let out_w = self.weights.get(&format!("vision.layers.{}.attn_out.weight", i))
                 .ok_or_else(|| anyhow!("vision.layers.{}.attn_out.weight not found", i))?;
             let out_b = self.weights.get(&format!("vision.layers.{}.attn_out.bias", i));
-            let mut attn_out_proj = matmul_3d_2d(&attn_out, &out_w.t()?)?.to_dtype(work_dtype)?;
+            let mut attn_out_proj = matmul_3d_2d(&attn_out, out_w)?.to_dtype(work_dtype)?;
             if let Some(bias) = out_b {
                 attn_out_proj = attn_out_proj.broadcast_add(&bias.to_dtype(work_dtype)?)?;
             }
@@ -312,29 +346,21 @@ impl VisionEncoder {
 
             let mlp = if let Some(gate_w) = ffn_gate_w {
                 // Gated MLP (GeGLU)
-                let mut up = matmul_3d_2d(&x_ln2, &ffn_up_w.t()?)?;
-                if let Some(bias) = ffn_up_b {
-                    up = up.broadcast_add(bias)?;
-                }
-                let mut gate = matmul_3d_2d(&x_ln2, &gate_w.t()?)?;
-                if let Some(bias) = ffn_gate_b {
-                    gate = gate.broadcast_add(bias)?;
-                }
+                let up = add_bias_if_matching(matmul_3d_2d(&x_ln2, ffn_up_w)?, ffn_up_b, "ffn_up")?;
+                let gate = add_bias_if_matching(matmul_3d_2d(&x_ln2, gate_w)?, ffn_gate_b, "ffn_gate")?;
                 let gate_act = gate.gelu()?;
                 (gate_act * up)?
             } else {
                 // Standard MLP
-                let mut up = matmul_3d_2d(&x_ln2, &ffn_up_w.t()?)?;
-                if let Some(bias) = ffn_up_b {
-                    up = up.broadcast_add(bias)?;
-                }
+                let up = add_bias_if_matching(matmul_3d_2d(&x_ln2, ffn_up_w)?, ffn_up_b, "ffn_up")?;
                 up.gelu()?
             };
 
-            let mut mlp_out = matmul_3d_2d(&mlp, &ffn_down_w.t()?)?.to_dtype(work_dtype)?;
-            if let Some(bias) = ffn_down_b {
-                mlp_out = mlp_out.broadcast_add(&bias.to_dtype(work_dtype)?)?;
-            }
+            let mut mlp_out = add_bias_if_matching(
+                matmul_3d_2d(&mlp, ffn_down_w)?.to_dtype(work_dtype)?,
+                ffn_down_b.map(|b| b.to_dtype(work_dtype)).transpose()?.as_ref(),
+                "ffn_down",
+            )?;
 
             // Apply post-FFN norm if present (Gemma-4 style)
             if let Some(post_norm_w) = self.weights.get(&format!("vision.layers.{}.ffn_post_norm.weight", i)) {
@@ -363,13 +389,13 @@ impl VisionEncoder {
                     rms_norm(&merged, ds_norm_w, 1e-6)?
                 };
 
-                let mut ds_fc1 = matmul_3d_2d(&ds_norm, &ds_fc1_w.t()?)?;
+                let mut ds_fc1 = matmul_3d_2d(&ds_norm, ds_fc1_w)?;
                 if let Some(bias) = ds_fc1_b {
                     ds_fc1 = ds_fc1.broadcast_add(bias)?;
                 }
                 let ds_fc1 = ds_fc1.gelu()?;
 
-                let mut ds_fc2 = matmul_3d_2d(&ds_fc1, &ds_fc2_w.t()?)?;
+                let mut ds_fc2 = matmul_3d_2d(&ds_fc1, ds_fc2_w)?;
                 if let Some(bias) = ds_fc2_b {
                     ds_fc2 = ds_fc2.broadcast_add(bias)?;
                 }
@@ -648,11 +674,23 @@ fn normalize_vision_tensors(
         // before the weights are consumed below, so a missing bias for one of
         // Q/K/V can be zero-filled at the CORRECT shape instead of a bogus
         // length-1 placeholder that would break `broadcast_add` downstream.
-        let q_out_dim = q_w.as_ref().map(|t| t.dim(0)).transpose()?;
-        let k_out_dim = k_w.as_ref().map(|t| t.dim(0)).transpose()?;
-        let v_out_dim = v_w.as_ref().map(|t| t.dim(0)).transpose()?;
+        //
+        // These GGUF vision weights load with dims() = [in_features,
+        // out_features] (confirmed empirically against a real Qwen2-VL-2B
+        // mmproj file: `ffn_up.weight` loads as [1280, 5120] = [in, out], not
+        // PyTorch's usual [out, in] — candle's GGUF loader for this tensor
+        // family does not reverse GGUF's native axis order the way it does
+        // for e.g. conv weights). So the output axis is dim 1, and matmul
+        // call sites use these weights directly with no `.t()` — see
+        // `matmul_3d_2d`, which expects rhs already as [in, out].
+        let q_out_dim = q_w.as_ref().map(|t| t.dim(1)).transpose()?;
+        let k_out_dim = k_w.as_ref().map(|t| t.dim(1)).transpose()?;
+        let v_out_dim = v_w.as_ref().map(|t| t.dim(1)).transpose()?;
         if let (Some(q), Some(k), Some(v)) = (&q_w, &k_w, &v_w) {
-            let qkv = Tensor::cat(&[q, k, v], 0)?;
+            // Concatenate along the OUTPUT axis (dim 1, not dim 0 — dim 0 is
+            // the shared input/hidden dimension, which must stay intact for
+            // the fused [in, 3*out] projection to be meaningful).
+            let qkv = Tensor::cat(&[q, k, v], 1)?;
             normalized.insert(format!("vision.layers.{}.attn_qkv.weight", layer_idx), qkv);
         }
         let q_b = q_biases.remove(&layer_idx);
@@ -676,7 +714,7 @@ fn normalize_vision_tensors(
         } else {
             // Generate zero bias if the weight was successfully created/found
             if let Some(qkv_w) = normalized.get(&format!("vision.layers.{}.attn_qkv.weight", layer_idx)) {
-                let out_dim = qkv_w.dim(0)?;
+                let out_dim = qkv_w.dim(1)?;
                 let zeros = Tensor::zeros(out_dim, vision_dtype, device)?;
                 normalized.insert(format!("vision.layers.{}.attn_qkv.bias", layer_idx), zeros);
             }
@@ -713,5 +751,29 @@ pub fn load_image(path: &Path, image_size: usize, device: &Device) -> Result<Ten
 
 fn matmul_3d_2d(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
     Ok(lhs.contiguous()?.matmul(&rhs.unsqueeze(0)?.contiguous()?)?)
+}
+
+/// Add `bias` to the last dimension of `x`, but only if its length actually
+/// matches — some real-world GGUF mmproj exports carry a bias tensor whose
+/// shape doesn't match its own weight's output dimension (confirmed against
+/// a real Qwen2-VL-2B-Instruct mmproj file: `ffn_up.bias` is `[1280]` while
+/// `ffn_up.weight`'s output dimension is `5120`, an internally-inconsistent
+/// export). Rather than crash on `broadcast_add`'s shape mismatch, skip a
+/// bias that doesn't fit — matching CLAUDE.md's "no panic on malformed
+/// external input" rule — and log it once so the gap is visible, not silent.
+fn add_bias_if_matching(x: Tensor, bias: Option<&Tensor>, what: &str) -> Result<Tensor> {
+    let Some(bias) = bias else { return Ok(x) };
+    let expected = x.dim(x.rank() - 1)?;
+    let actual = bias.dim(bias.rank() - 1)?;
+    if actual != expected {
+        tracing::warn!(
+            "{what}: bias shape {:?} doesn't match expected output dim {} \
+             (got {}) — this GGUF file's bias tensor appears inconsistent \
+             with its own weight; skipping this bias rather than guessing",
+            bias.dims(), expected, actual
+        );
+        return Ok(x);
+    }
+    Ok(x.broadcast_add(bias)?)
 }
 
