@@ -1,5 +1,89 @@
 # Changelog
 
+## v2026.7.19 (branch, unreleased) — full audit + fix pass
+
+A comprehensive, unbiased audit (7 parallel agents, every crate, no length
+limit) found roughly 100 issues across all severities; nearly all
+critical/high findings are fixed on this branch, plus a new Python
+inference library and the project's first-ever real end-to-end
+multimodal (vision) test.
+
+### Fixed — correctness and safety
+- **HTTP server hardcoded ChatML for every model** regardless of its real
+  chat template (`ModelMeta` was loaded then discarded, never reaching
+  `AppState`) — now uses the served model's own template, same as the
+  chat TUI.
+- **`llm-ffi` (C API)**: `tokio::spawn` with no runtime present (UB risk
+  across the FFI boundary), a fake tokenizer (raw `char as u32` cast), and
+  a silent `DummyBackend` substitution on load failure or a path
+  containing "tmp"/"dummy"/"temp" — all fixed.
+- **Scheduler**: one bad request could abort every other concurrent
+  user's generation; an OOM-preempted sequence never sent its client a
+  terminal event, hanging it forever. Both fixed, with regression tests.
+- **Cluster**: uneven tensor splits silently dropped data in all-reduce
+  and tensor-parallel sharding (fixed, with tests); `llm-cluster`'s
+  `main.rs` does no real networking at all (confirmed via its own code
+  comments) — now logged as an explicit "not functional" warning at
+  startup instead of silently appearing to work.
+- **CUDA/Metal device-init failure previously fell back to CPU silently**
+  — now returns a clear error, per the project's own hardware-dispatch
+  rule.
+- **Confirmed, reproduced crash**: batching two different-length prompts
+  together crashed `forward_pass` (assumed uniform sequence length across
+  a batch). Fixed to use `cu_seqlens` throughout; regression tests added.
+- **Silent multimodal-embedding corruption**: the vision-embedding splice
+  ran unconditionally for any vision-capable model with no check that an
+  image was actually attached, risking corruption of ordinary text
+  containing 16+ repeated tokens. Fixed with an explicit guard.
+- Real vision-pipeline bugs found via the first-ever live multimodal test
+  (a downloaded Qwen2-VL-2B-Instruct GGUF + mmproj, since no local
+  vision-capable checkpoint was available): a non-contiguous-layernorm
+  crash, a backwards matmul-transpose convention affecting 9 call sites,
+  and a `spatial_merge_size` metadata gap causing a shape-mismatch crash.
+  The vision pipeline now runs end-to-end without crashing; output is not
+  yet coherent for Qwen2-VL specifically because its vision transformer's
+  2D rotary position encoding isn't implemented (a real, separate, open
+  feature gap — not silently claimed as working).
+- **Audio mel-spectrogram was fake**: computed only a per-frame scalar
+  energy value fanned out via a fixed sine envelope, with zero real
+  frequency information — affected every audio-capable model regardless
+  of architecture. Replaced with a real log-mel spectrogram (Hann window,
+  DFT power spectrum, triangular mel filterbank, standard normalization).
+  Also fixed: the decoded sample rate was read and discarded, so non-16kHz
+  audio (the common case) was never resampled — added linear-
+  interpolation resampling.
+- Dozens of medium/low findings: duplicated/hardcoded Gemma architecture
+  checks consolidated to one function; hardcoded `qwen2.5-0.5b`/`1.5b`
+  tokenizer-path guesses removed from the server's path-resolution logic;
+  a vision position-embedding off-by-one; a zero-bias placeholder with
+  the wrong shape; several hot-loop inefficiencies; a `cargo clippy`
+  *error* (not just a warning) fixed.
+
+### Added
+- **`llm-py`**: a PyO3-based Python inference library with a vLLM-style
+  API (`LLM(model=...).generate(prompts, sampling_params)`). Binds
+  directly to `llm-core`/`llm-scheduler` (not through `llm-ffi`'s C ABI),
+  owns its own Tokio runtime and a real tokenizer, and applies the
+  served model's chat template by default. No image/audio input support
+  yet (text-only for now).
+- `[profile.release]` workspace-wide build settings.
+- Graceful shutdown for the HTTP server.
+
+### Known gaps (explicitly open, not silently assumed done)
+- CUDA/x86_64 hardware still unverified (unchanged from v1.0.0 — no such
+  hardware in this environment).
+- `llm-cluster` distributed networking remains non-functional scaffolding
+  (now honestly logged as such, not fixed — a multi-week feature, not a
+  bug).
+- Prefix-cache block reuse is implemented but not wired into block
+  allocation (judged too large a change to do safely in this pass).
+- Qwen2-VL's 2D rotary vision position encoding is unimplemented.
+- No CI workflow exists yet.
+- The audio mel-spectrogram fix is unit-tested at the DSP level but not
+  exercised end-to-end against a real audio file + audio-capable model
+  in this session (none was available locally).
+- `llm-py` has no image/audio input support.
+
 ## v1.0.0 — 2026-07-19
 
 First "production v1" release. Unifies the `cpu`, `mlx`, and

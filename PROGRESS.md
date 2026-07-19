@@ -1,13 +1,216 @@
 # Progress
 
 ## Current task
-PHASE COMPLETE (local). v1-unified merged into master, tagged v1.0.0
-locally, cargo check/test clean on master. Pushing to origin / publishing
-a GitHub release is a separate explicit user decision (not done as part
-of this pass — see chat for confirmation before any remote/push action).
-Remaining real work for a future session: CUDA/x86 hardware verification
-(user will check in on that hardware), then re-run this same audit
-discipline for anything those hardware types surface.
+v1.0.0 shipped (tag pushed, GitHub Release published with a macOS/arm64
+binary). Work since then moved to branch **v2026.7.19** (off master): a
+full unbiased audit (7 parallel agents covering every crate), fixing
+essentially every critical/high finding, adding a Python inference
+library (`llm-py`), and — critically — the first-ever real end-to-end
+multimodal (vision) test in this project's history, which found and fixed
+3 more real bugs no prior audit or unit test could have caught. See "v2 —
+Full audit + fix pass" below for the complete account. Remaining open
+work: merge v2026.7.19 to master when ready, CUDA/x86 hardware
+verification (still needs that hardware), Qwen2-VL's missing 2D-RoPE
+vision positional encoding (a real feature gap, not a bug, documented
+below).
+
+## v2 — Full audit + fix pass, branch v2026.7.19, 2026-07-19
+
+### The audit
+Ran 7 parallel adversarial audit agents (no length limits, instructed to
+hide nothing) covering: llm-core (split across 4 sub-passes: candle.rs;
+vision/audio/multimodal/weights/attention; loader/quantization/profile/
+backend; model/graph/sampler/tokenizer/types/conv_template),
+llm-scheduler+llm-cluster, llm-cli+llm-ffi+build-config, and a
+cross-cutting vision/hardcoding/goal.md-promise sweep. Combined findings:
+~100 distinct issues across all severities. Highest-severity themes:
+
+- **`llm-cli`'s HTTP server hardcoded ChatML for every model** —
+  `ModelMeta` was loaded then discarded in `main.rs`, never reaching
+  `AppState`, so `/v1/chat/completions` formatted every request the same
+  way regardless of the served model's actual chat template. The chat TUI
+  did this correctly; the production HTTP API did not. **Fixed.**
+- **`llm-ffi` (C API): `tokio::spawn` with no runtime present** (panics/UB
+  across the FFI boundary for any real C/Python caller), a **fake
+  tokenizer** (raw `char as u32` cast, not `LlmTokenizer`), and a **silent
+  `DummyBackend` substitution** on load failure or on any model path
+  containing "tmp"/"dummy"/"temp". **All fixed.**
+- **`llm-scheduler`: one bad request could kill every other concurrent
+  user's generation** (a single sampling error aborted the whole batch),
+  and an **OOM-preempted sequence never got a terminal event**, hanging
+  its client forever. **Both fixed**, with new regression tests.
+- **`llm-cluster`: uneven tensor splits silently dropped data** in both
+  the all-reduce and tensor-parallel sharding code (any length not evenly
+  divisible by world_size lost its remainder elements with no error), and
+  **the whole crate's `main.rs` does no real networking at all** (mock
+  coordinator/worker, confirmed via its own code comments) — the latter
+  is now logged as an explicit "not functional" warning at startup instead
+  of silently looking like it works. Data-loss bugs **fixed** with tests;
+  the "build a real distributed cluster" gap is a feature, not a bug, and
+  stays open.
+- **`llm-core`: CUDA/Metal device-init failure silently fell back to
+  CPU** instead of erroring — a direct violation of CLAUDE.md's own
+  hardware-dispatch rule. **Fixed** (now propagates a clear `Err`).
+- **A confirmed, reproduced mixed-length-batch crash**: found live via the
+  new Python bindings (`llm.generate()` with two different-length
+  prompts in one batch crashed with a reshape/matmul shape mismatch).
+  `forward_pass` assumed every sequence in a batch had equal length; now
+  correctly uses `cu_seqlens` throughout (packed/varlen layout), with new
+  regression tests. **Fixed.**
+- **Silent multimodal-embedding corruption on ordinary text**: the vision
+  embedding splice ran unconditionally for any vision-capable model, with
+  no check that an image was actually attached — a 16+-token repeated
+  run in ordinary text (padding, repeated punctuation) could trigger a
+  silent splice of zero-valued "image" embeddings over real text. **Fixed**
+  (mirrors the audio path's existing explicit guard).
+- Dozens more medium/low findings (hardcoded Gemma arch-name checks
+  consolidated to one function instead of duplicated in 2 files;
+  hardcoded `qwen2.5-0.5b`/`1.5b` tokenizer-path guesses removed;
+  vision.rs position-embedding off-by-one; zero-bias placeholder wrong
+  shape; hot-loop inefficiencies; `[profile.release]` added; graceful
+  shutdown wired up; etc.) — see individual commit messages on
+  v2026.7.19 for the full itemized list.
+
+### Execution
+Dispatched 3 parallel background agents (isolated git worktrees) to fix
+llm-core, llm-scheduler+llm-cluster, and llm-cli+llm-ffi independently
+(disjoint file ownership to avoid conflicts). One agent (llm-core, the
+largest scope) hit a session/API limit mid-task; resumed it in its
+existing worktree (preserving all uncommitted progress) with a follow-up
+agent rather than restarting. Merged all three branches back into
+v2026.7.19 — two clean merges, one with two small, mechanically-resolved
+conflicts (`llm-scheduler/scheduler.rs`, `llm-cli/bin/chat.rs` — both
+crates' fixes touched the same lines for different reasons; kept both
+sets of changes). Fixed follow-on breakage in `llm-tests` fixtures that
+none of the three agents' scopes covered (constructor signatures changed
+by two different agents independently). **Full workspace test suite
+after every merge/fix round: 252 passed, 0 failed.**
+
+### Python inference library (`llm-py`)
+New crate, PyO3-based, vLLM-style API:
+```python
+from llm_rs import LLM, SamplingParams
+llm = LLM(model="./model.gguf")
+outputs = llm.generate(["Hello!"], SamplingParams(temperature=0.7, max_tokens=64))
+```
+Binds directly to `llm-core`/`llm-scheduler` (not through `llm-ffi`'s C
+ABI) so it owns its own Tokio runtime and a real `LlmTokenizer`,
+sidestepping both FFI bugs above by construction rather than needing them
+fixed first. `SamplingParams` validates at construction (bad values raise
+`ValueError` immediately, not silently clamped). `generate()` applies the
+served model's own chat template by default (wired to the same shared
+`render_prompt`/`manual_format` functions the HTTP server and chat TUI
+use — confirmed via a real Gemma-4 test: without this wiring, output was
+degenerate garbage; with it, correct). Built with `maturin`, verified
+importable and working against Python 3.12 + pyo3 0.22. Real end-to-end
+tests: SmolLM3 and Gemma-4 text generation (correct output, matches CLI);
+mixed-length batch (2 different-length prompts, previously crashed — now
+correct, non-cross-contaminated output for both).
+**Known gap**: no image/audio input support yet in the Python API (the
+chat TUI's `/image`/`/audio` commands have no Python-side equivalent) —
+`generate()` is text-only for now.
+
+### First-ever real multimodal (vision) test — found 3 more real bugs
+No mmproj-capable checkpoint was available locally (the only local
+vision-capable model, gemma-4-E2B, ships without its mmproj file in this
+environment), so downloaded a real `Qwen2-VL-2B-Instruct` GGUF + mmproj
+pair (ggml-org, ~1.7GB) and ran a real image through `/image` in the chat
+TUI — the first time any real image has ever been run through this
+vision pipeline in the project's history. Found and fixed, in order of
+discovery:
+1. **Non-contiguous `layer_norm` crash**: `x` was permuted but never made
+   contiguous before `candle_nn::ops::layer_norm`; harmless for models
+   with an absolute position-embedding table (whose `broadcast_add`
+   happens to produce a contiguous tensor first) but Qwen2-VL has none,
+   so `x` reached `layer_norm` still permuted. **Fixed.**
+2. **Wrong matmul transpose convention**: `vision.rs` called `.t()` on
+   every per-layer attn/ffn weight assuming the standard PyTorch `[out,
+   in]` layout, but this GGUF-loading path actually produces `[in, out]`
+   for these tensors (confirmed empirically via a debug print against
+   real loaded tensors) — removed the incorrect transpose at 9 call
+   sites, and fixed the QKV-fusion logic (wrong concat axis, wrong
+   dimension read for zero-bias sizing) that had the same wrong
+   assumption baked in. Left `.t()` in place for the `mm.0`/`mm.2`
+   projector weights, which DO load as `[out, in]` — a confirmed, real
+   difference in convention between per-layer and projector-level
+   tensors in this export, not an inconsistency to "fix away." **Fixed.**
+3. **`spatial_merge_size` silently defaulting to 1 for Qwen2-VL**:
+   `clip.vision.spatial_merge_size` is simply absent from this real
+   mmproj file's metadata (confirmed via direct GGUF inspection), so the
+   hardcoded default of 1 was always wrong for this architecture
+   (needs 2), causing a matmul shape mismatch against the projector.
+   Now derives the merge factor from the projector's own weight shape
+   (`hidden_dim * merge_size² == projector_input_dim`) when metadata
+   doesn't provide it — model-agnostic, no architecture-name hardcoding,
+   works for any file regardless of whether it happens to export this
+   metadata key. **Fixed.**
+4. Also added a defensive bias-shape check: this specific mmproj export's
+   `ffn_up.bias`/`ffn_down.bias` are internally inconsistent with their
+   own weights' output dimensions (confirmed via direct inspection with
+   the `gguf` Python library — an apparent bug in the exporter itself,
+   not our code). Rather than crash or guess which bias belongs where,
+   skip a mismatched bias with a warning.
+
+**Result**: the vision pipeline now runs end-to-end without crashing for
+a real Qwen2-VL-2B-Instruct model — confirmed exercising the full
+graph-splice/attention/allocation path for the first time ever. **Output
+is not yet coherent for this architecture**: Qwen2-VL's vision
+transformer needs 2D rotary position encoding for patches, which this
+file doesn't implement at all (confirmed: no such tensor or metadata
+exists to read, this is a genuine unimplemented feature, not a bug to
+silently paper over). This is real, scoped, honestly-reported remaining
+work — not claimed as done.
+
+### Fake audio mel-spectrogram — fixed (found in the audit, not live-tested)
+Per the audit, `audio.rs::load_audio` computed only a per-frame scalar RMS
+energy value fanned out across mel bins via a fixed `sin(bin/n * pi)`
+envelope — real-looking but carrying zero frequency information,
+identical in shape for any two inputs of the same loudness. This affected
+every audio-capable model equally (Whisper-style or Gemma-Conformer),
+since the bug was in shared feature extraction. Replaced with a real
+log-mel spectrogram (Hann-windowed frames, direct DFT power spectrum,
+proper triangular mel filterbank, Whisper's standard normalization).
+Also fixed: the decoded audio's real sample rate was read and discarded,
+so any non-16kHz file (the common case) was fed unresampled into a
+16kHz-assuming pipeline — added linear-interpolation resampling. New
+tests prove a 1kHz and 4kHz tone now peak in genuinely different mel
+bins. **Not live-tested against a real audio file + audio-capable
+checkpoint** in this session (no such local model available, and the
+multimodal-download budget for this session went to the vision test
+instead) — the fix is unit-tested at the DSP level but not exercised
+end-to-end through a real audio encoder. Flagging honestly, not claiming
+full verification.
+
+### Also fixed while auditing
+- A `cargo clippy` **error** (not just a warning) in `vision.rs` (a
+  provably-zero multiplication in the image-normalization loop — harmless
+  numerically, but a real clippy blocker). `cargo clippy` now reports
+  zero errors workspace-wide (style warnings remain, not addressed).
+- `[profile.release]` added to the workspace (lto=thin, codegen-units=1,
+  panic=unwind kept for `llm-ffi`'s `catch_unwind` requirement).
+- Graceful shutdown wired into the HTTP server.
+- A minimal `.github/workflows/ci.yml` — explicitly deferred by the
+  cli+ffi agent (out of its assigned file scope) — **still not done**,
+  flagging as open.
+
+### What's still honestly open after this pass
+- CUDA and x86_64: still unverified on real hardware (unchanged from the
+  v1.0.0 gap — no such hardware in this environment).
+- `llm-cluster`'s distributed networking: still non-functional scaffolding
+  (now honestly logged as such at startup instead of looking like it
+  works) — building a real implementation is a multi-week feature, not a
+  bug fix, and was correctly out of scope for this pass.
+- Prefix-cache block reuse: still computed but not wired into actual
+  block allocation (the scheduler agent judged wiring it correctly — with
+  proper ref-counting across recycled sequences — too large a change for
+  this pass; left a loud, accurate comment instead of a misleading one).
+- Qwen2-VL vision positional encoding (2D-RoPE): not implemented (see
+  above).
+- No CI workflow exists yet.
+- `llm-py` has no image/audio input support yet.
+- Real audio end-to-end test not performed (no local model available).
+- v2026.7.19 not yet merged to master (holding for explicit go-ahead,
+  same as the v1.0.0 release-push pattern earlier).
 
 ## Task 8 — CLI + end-to-end verification, 2026-07-19
 - **Chat TUI** (`llm-cli/src/bin/chat.rs`, release build, `--features
