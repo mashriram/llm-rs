@@ -34,7 +34,12 @@ impl ClusterHealthMonitor {
 
         for node_id in &failed_nodes {
             self.heartbeats.remove(node_id);
-            warn!("Node {} has failed (heartbeat timeout). Triggering Pause-Replicate-Retry.", node_id);
+            // NOTE: this only reports the failure - it does not itself trigger any
+            // recovery. goal.md's full Pause-Replicate-Retry (re-partition layers
+            // onto survivors, re-prefill in-flight sequences) is not implemented;
+            // callers (main.rs) evict the node from the active roster and nothing
+            // more. Do not log that recovery happened when it didn't.
+            warn!("Node {} has failed (heartbeat timeout).", node_id);
         }
 
         failed_nodes

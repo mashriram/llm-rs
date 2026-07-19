@@ -17,3 +17,4 @@ llm-py/python/llm_rs/*.so
 llm-py/python/llm_rs/*.pyd
 llm-py/target/
 *.egg-info/
+hwcheck-results/
