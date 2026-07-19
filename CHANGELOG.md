@@ -1,5 +1,69 @@
 # Changelog
 
+## v2026.7.19 (branch, unreleased) — phase 2: model-agnostic + hardware-agnostic push
+
+Follow-up pass on the same branch: a real HF downloader, real TCP
+networking for `llm-cluster` (previously pure mock), and a second round
+of live multimodal testing (Qwen2-VL + Gemma-4, a different real
+checkpoint from phase 1's) that found and fixed 6 more real bugs. Full
+detail, including a per-hardware honest status table (CPU/Metal verified;
+x86/CUDA/Raspberry Pi structurally fine but unverified on real hardware;
+Vulkan/mobile genuinely unimplemented), is in PROGRESS.md's "v3" section.
+
+### Added
+- **`llm pull <model>`**: real Hugging Face downloader. Resolves a search
+  term or `owner/repo`, lists GGUF quant variants with real sizes,
+  recommends the largest one that fits this machine's detected
+  `HardwareProfile` (same 15% headroom rule as model load), downloads
+  weights + tokenizer/config sidecars (with a fallback to a repo's base
+  non-GGUF sibling for `tokenizer.json` when the GGUF repo doesn't ship
+  one), and verifies each download is byte-complete before declaring
+  success.
+- **Pre-quantized-model detection**: bitsandbytes/AWQ/GPTQ repos are now
+  detected via `config.json`'s `quantization_config` both in `llm pull`
+  and directly in `llm-core::model::config::parse_config`, and refused
+  with a clear message rather than silently mis-loaded.
+- **Real `llm-cluster` networking**: length-prefixed JSON wire protocol
+  (`protocol.rs`), a real `TcpListener`-based coordinator that registers
+  workers via Hello/Welcome and tracks them with `ClusterHealthMonitor`
+  (previously never invoked from anywhere, so failure detection was
+  structurally inert), and a real `TcpStream`-based worker sending live
+  heartbeats with reconnect-on-failure backoff. Verified with two real
+  local processes, including a real kill-and-detect failure test.
+- Real log-mel spectrogram computation for audio input (Hann window,
+  DFT power spectrum, triangular mel filterbank, Whisper-style
+  normalization) plus sample-rate detection and linear-interpolation
+  resampling to 16kHz, replacing a placeholder that carried zero real
+  frequency information.
+
+### Fixed — multimodal (found via two live model tests, not static audit)
+- Non-contiguous tensor crash in vision layernorm (Qwen2-VL).
+- Vision-encoder weight matmul assumed a single fixed `[out,in]`
+  orientation; a second real checkpoint (Gemma-4) proved this isn't a
+  fixed convention across GGUF exporters — replaced with a `linear()`
+  helper that detects orientation per-tensor from the input feature dim.
+- `spatial_merge_size` silently defaulted to 1 when absent from GGUF
+  metadata; now inferred from the vision projector's own weight shape.
+- `VisualEmbed` ran the vision encoder on a dummy image and cached the
+  result unconditionally on every request, corrupting later audio-only
+  splicing in the same forward pass — now skips the encoder and the
+  cache write entirely when no image is active, mirroring `AudioEmbed`.
+- Audio placeholder-token count used the encoder's hidden dimension
+  instead of its real output sequence length — now computed per
+  architecture from `audio_num_mel_bins`.
+- `symphonia`'s "pcm" feature was missing, silently failing to decode
+  real WAV files.
+
+### Known gap, precisely diagnosed
+- GGUF files using llama.cpp's newer "IQ" quant types (e.g. IQ4_NL,
+  dtype id 20) fail to load: `candle-core` 0.9.2 has no dequantization
+  support for any IQ-series type, and the failure occurs during header
+  parsing, aborting the whole file. Classic types (F16/F32/BF16, Q4-Q8,
+  the full K-quant family) all confirmed working. Error message now
+  names the likely cause instead of an opaque parse failure. Real fix
+  requires either an upstream candle-core upgrade or a custom GGUF
+  reader with IQ dequant kernels — not attempted this session.
+
 ## v2026.7.19 (branch, unreleased) — full audit + fix pass
 
 A comprehensive, unbiased audit (7 parallel agents, every crate, no length

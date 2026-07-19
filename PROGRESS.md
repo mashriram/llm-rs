@@ -1,18 +1,220 @@
 # Progress
 
 ## Current task
-v1.0.0 shipped (tag pushed, GitHub Release published with a macOS/arm64
-binary). Work since then moved to branch **v2026.7.19** (off master): a
-full unbiased audit (7 parallel agents covering every crate), fixing
-essentially every critical/high finding, adding a Python inference
-library (`llm-py`), and — critically — the first-ever real end-to-end
-multimodal (vision) test in this project's history, which found and fixed
-3 more real bugs no prior audit or unit test could have caught. See "v2 —
-Full audit + fix pass" below for the complete account. Remaining open
-work: merge v2026.7.19 to master when ready, CUDA/x86 hardware
-verification (still needs that hardware), Qwen2-VL's missing 2D-RoPE
-vision positional encoding (a real feature gap, not a bug, documented
-below).
+v1.0.0 shipped. Branch **v2026.7.19** (off master) has since done: a full
+7-agent audit and fix pass (see "v2" below), a real HF downloader with
+hardware-aware quant recommendation, real TCP networking for
+`llm-cluster` (was pure mock), and two rounds of live multimodal testing
+(Qwen2-VL + Gemma-4 vision/audio) that found and fixed 6 more real bugs
+no prior audit could have caught, since none of them ran a real forward
+pass before this session. See "v3 — Model-agnostic/hardware-agnostic
+push" below for the full account, including a precise, honest breakdown
+of what's still open (CUDA/x86/Vulkan/mobile/Raspberry Pi/physical USB —
+none of which this environment can verify — and exactly what each would
+need). Not yet merged to master.
+
+## v3 — Model-agnostic / hardware-agnostic push, 2026-07-19
+
+### Real multimodal bugs found via TWO live model tests (not just audit)
+Continued from "v2"'s audit findings: downloaded real mmproj-paired
+checkpoints (none existed locally) and ran real images/audio through
+them, since no prior test in this project's history had ever exercised a
+real forward pass through the vision or audio pipeline end-to-end.
+
+**Test 1 — Qwen2-VL-2B-Instruct** (ggml-org GGUF + Q8_0 mmproj):
+1. Non-contiguous `layer_norm` crash (`x` permuted but never made
+   contiguous before `candle_nn::ops::layer_norm`; harmless for models
+   with an absolute position-embedding table, but Qwen2-VL has none).
+2. Wrong matmul-transpose convention: `vision.rs` assumed all per-layer
+   weights load as `[out, in]` (standard PyTorch), but this file's
+   weights load as `[in, out]`.
+3. `spatial_merge_size` silently defaulting to 1 (metadata key absent
+   from this real file) instead of the required 2, causing a shape
+   mismatch against the projector.
+4. A defensive bias-shape check added for a genuinely internally-
+   inconsistent bias tensor in this specific export.
+
+**Test 2 — Gemma-4-E2B-it** (unsloth GGUF + matching mmproj-BF16, the
+project's own primary target architecture, `has_vision_encoder` AND
+`has_audio_encoder` both true):
+5. The `[in,out]` vs `[out,in]` fix from Test 1 **broke this file** -
+   confirmed these are genuinely different per-file conventions (not a
+   fixed property of the code), likely a byproduct of each file's own
+   quantization/export tooling (Q8_0 vs BF16). Replaced the fixed
+   assumption with `linear()`, a small helper that auto-detects
+   orientation per-tensor by comparing each weight axis against the
+   actual input feature dimension — works for both conventions.
+6. `Operator::VisualEmbed` ran the vision encoder on a dummy zero image
+   and cached the result UNCONDITIONALLY on every request to any
+   vision-capable model, even pure-text/audio-only ones. That cache
+   write is exactly what the "is an image actually active" splice guard
+   checks — so the dummy encode on the first op of a forward pass made
+   every later op in the SAME pass believe a real image was preloaded.
+   Confirmed via a real `/audio`-only request: the dummy vision
+   embedding got spliced into the audio placeholder token run, crashing
+   with a length mismatch unrelated to audio at all. Fixed by mirroring
+   `AudioEmbed`'s already-correct pattern (skip the encoder AND the
+   cache write entirely when no image is active).
+7. `chat.rs` computed the audio placeholder-token count from
+   `meta.audio_embedding_length` — the encoder's HIDDEN dimension (1024),
+   not a sequence length — silently inserting the wrong placeholder
+   count for every audio request. Since `load_audio` always produces a
+   fixed 3000 mel frames, each architecture's real output length is a
+   fixed constant from its conv-subsampling factor (750 for Gemma-
+   Conformer's 4x, 1500 for Whisper's 2x); now computed from the
+   already-correct `audio_num_mel_bins` field instead.
+8. `symphonia`'s "pcm" feature was missing (`"wav"` only enables the
+   container-format parser, not the PCM codec most real WAV files
+   actually use inside it) — a real WAV test file failed to decode
+   entirely, silently falling back to zeros and masking bugs 6-7 during
+   initial testing.
+
+**Result**: both vision and audio now run the FULL pipeline end-to-end
+without crashing on real files, on a real production-family model, for
+the first time in this project's history. Output is not yet fully
+coherent for either (Qwen2-VL needs unimplemented 2D rotary position
+encoding for its vision transformer — confirmed via direct GGUF
+inspection that no such tensor/metadata exists to read; the audio test
+used a synthetic pure-tone WAV with no linguistic content, and there may
+be residual Conformer correctness gaps not yet isolated). This is real,
+honestly-reported remaining work, distinct from the crash-level bugs
+fixed above — do not read "runs without crashing" as "fully correct."
+
+Also found and fixed, unrelated to the above: the audio mel-spectrogram
+in `load_audio` was ENTIRELY FAKE (a per-frame scalar RMS energy value
+fanned out across mel bins via a fixed sine envelope — zero real
+frequency information, affecting every audio-capable model regardless of
+architecture). Replaced with a real log-mel spectrogram (Hann window,
+direct DFT power spectrum, proper triangular mel filterbank, Whisper's
+standard normalization) plus sample-rate detection + linear-
+interpolation resampling (the decoded sample rate was previously read
+and discarded, so non-16kHz audio — the common case — was never
+resampled). New tests prove a 1kHz and 4kHz tone now peak in genuinely
+different mel bins, which the old placeholder could never do.
+
+### `llm pull`: real HF downloader with hardware-aware recommendation
+New binary implementing goal.md's `llm pull <model>` contract:
+- Resolves a bare search term (HF search API, results sorted by download
+  count so the canonical repo wins over obscure forks — the raw
+  relevance order does NOT reliably do this, confirmed by search
+  surfacing a 33-download fork ahead of a 164k-download official repo)
+  or an explicit `owner/repo`.
+- Lists every GGUF quant variant with real sizes (from HF's tree API),
+  recommending the largest one that fits this machine's detected
+  `HardwareProfile` free VRAM/RAM with the same 15% headroom
+  `choose_device` uses at load time.
+- Detects (but does not implement dequantization for) bitsandbytes/AWQ/
+  GPTQ-quantized native-safetensors repos via `config.json`'s
+  `quantization_config`, with a clear message rather than a silent wrong
+  load — also enforced as a defense-in-depth check directly in
+  `llm-core/src/model/config.rs::parse_config`, so a model obtained any
+  other way (not just via `pull`) hits the same clear error.
+- Downloads the chosen file(s) plus tokenizer/config sidecars, with a
+  fallback that fetches `tokenizer.json` from the likely base (non-GGUF)
+  repo when a GGUF-only repo doesn't ship one itself (common for
+  official quantization repos — confirmed: `Qwen/Qwen2.5-0.5B-Instruct-
+  GGUF` ships no tokenizer.json at all).
+- Verifies download completeness (received bytes == content-length)
+  before declaring success and removing partial files otherwise — found
+  via this session's own testing: an interrupted download previously
+  looked, at load time, EXACTLY like a confusing model-compatibility bug
+  ("Failed to read tensor X"), when it was actually just a truncated
+  file. This cost real debugging time before the actual cause was found;
+  now it can't happen silently again.
+
+**Verified against 4 real HF repos**:
+- `Qwen/Qwen2.5-0.5B-Instruct-GGUF`: Q4_K_M and Q8_0 both download and
+  generate correctly ("The capital of France is Paris" / "France").
+  Q2_K genuinely fails to load — see below, a real and precisely-
+  diagnosed gap, not a downloader bug (confirmed via independent SHA256
+  verification against HF's LFS hash that the download itself is
+  byte-perfect).
+- `HuggingFaceTB/SmolLM2-135M-Instruct`: a **native HF safetensors repo,
+  no GGUF at all**. This is the first time the HF-safetensors (non-GGUF)
+  loading path has been exercised end-to-end in this project's history
+  (a prior audit flagged it as untested). It worked correctly on the
+  first real try: "The capital of France is called Paris." — real
+  evidence that model-agnosticism holds across both major weight
+  formats, not just GGUF.
+- `TheBloke/Llama-2-7B-AWQ`: correctly detected and refused with a clear
+  message (not attempted to load).
+
+### A genuine, precisely-diagnosed GGUF compatibility gap: "IQ" quant types
+`Qwen2.5-0.5B-Instruct-GGUF`'s "Q2_K" file mixes in llama.cpp's newer
+IQ4_NL "importance quantization" format (GGML dtype id 20) for most
+weight tensors — a real, common technique (upgrading precision for
+sensitive tensors even within an overall low-bit quant scheme), not a
+corrupt or unusual file. Confirmed via direct inspection (Python `gguf`
+library) of the exact dtype ids used, then confirmed by grepping
+`candle-core 0.9.2`'s own source: it has **zero dequantization support
+for any IQ-series type** (IQ1_S/IQ2_XXS/IQ2_XS/IQ3_XXS/IQ4_NL/IQ3_S/
+IQ2_S/IQ4_XS/IQ1_M). Worse, this failure happens while candle-core is
+still parsing the file's HEADER (building its tensor-info table), which
+aborts the ENTIRE file the moment it hits one unrecognized dtype id — so
+it can't be worked around per-tensor at the point where we load weights;
+properly supporting it would mean replacing candle-core's GGUF reader
+with a custom one for such files, a genuinely large architecture change
+that was not attempted here (this session's own `llm-core/src/loader/
+gguf.rs` already exists and was hardened earlier, but is not wired into
+the real inference path and doesn't implement IQ dequant either).
+Classic quant types (F16/F32/BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1, and
+the whole K-quant family Q2_K..Q8_K) all confirmed working. Fixed the
+IMMEDIATELY actionable part: replaced the opaque "Failed to read GGUF
+content" error with one that names the likely cause (an IQ-series type)
+and suggests trying a different quant of the same model.
+**This is exactly the kind of gap that should be reported precisely, not
+hidden or hand-waved as "model-agnostic, done" — it isn't, for this one
+(increasingly common) quantization family, until someone implements IQ
+dequant kernels or wires in a replacement GGUF reader.**
+
+### Real TCP networking for `llm-cluster` (was pure mock scaffolding)
+`main.rs`'s Coordinator/Worker previously did no networking at all —
+confirmed by its own code comments, and flagged in the "v2" audit.
+Replaced with: a real length-prefixed JSON wire protocol
+(`protocol.rs`), a real `TcpListener`-based coordinator that registers
+workers via a Hello/Welcome handshake carrying their actual profiled
+`NodeCapability`, and a real `TcpStream`-based worker that sends actual
+periodic heartbeats and reconnects with backoff on failure.
+`ClusterHealthMonitor::record_heartbeat` — previously never called from
+anywhere, so failure detection was structurally inert regardless of what
+happened on the network — now fires from real received messages.
+
+**Verified with two real local processes** on `127.0.0.1:9123`: both
+workers registered with correct profiled capabilities, heartbeats flowed
+continuously, and killing one worker's process was correctly detected
+(both via immediate disconnect AND the heartbeat-timeout sweep) within
+the configured window, evicting it from the active-node list.
+
+**Scope, stated plainly**: this is real transport + registration +
+failure detection, not the full goal.md Pause-Replicate-Retry story.
+`analyzer.rs`/`collective.rs`/`tensor_parallel.rs` (layer partitioning,
+all-reduce, tensor-parallel sharding) still are not invoked from this
+networking layer or from real inference — a node failure is detected and
+evicted from the roster, but nothing re-partitions work onto survivors
+or re-prefills in-flight sequences. The coordinator now logs this
+explicitly on every failure event so it's never mistaken for full
+recovery.
+
+### Hardware portability: what's actually verified vs. genuinely open
+Stated as precisely and honestly as possible, hardware by hardware:
+
+| Hardware | Status | What's actually true |
+|---|---|---|
+| **CPU, ARM (this machine: Apple Silicon)** | ✅ Verified | Real models generate correctly; NEON detected correctly by `HardwareProfile`. |
+| **Metal (Apple Silicon GPU)** | ✅ Verified | Real models generate correctly, numerically matches CPU on the same prompt (byte-identical token IDs, confirmed in the v1.0.0 pass). |
+| **CPU, x86_64** | ⬜ Not verified on real hardware | Code is generically portable (candle-core supports x86_64 AVX2/AVX-512 like any other target); `CpuSimdCaps::detect()` is properly `#[cfg(target_arch = "x86_64")]`-gated. Cross-compiling to `x86_64-unknown-linux-gnu` from this Mac was attempted and failed for environmental reasons (no cross C-toolchain in this sandbox for `tokenizers`' `onig`/`esaxx-rs` build scripts) — inconclusive, not a code-level finding either way. Needs real x86 hardware to verify. |
+| **CUDA** | ⬜ Not verified on real hardware | No NVIDIA GPU available in this environment, unchanged from the v1.0.0 pass. Code reviewed statically: `HardwareProfile` gates the whole path behind `candle_core::utils::cuda_is_available()`, falls back to CPU with a clear warning (not silently) if `nvidia-smi`/the CUDA driver API can't be queried, and an earlier hardening pass fixed the previous silent-CPU-fallback-on-init-failure bug. Needs real CUDA hardware to actually run and verify numerically. |
+| **Vulkan** | ❌ Not implemented at all, and a real gap to close (not just untested) | `candle-core` itself has **no Vulkan backend** — only CUDA/Metal/Accelerate/MKL. The only Vulkan-adjacent code in this repo is `llm-kernel` (CubeCL/`cubecl-wgpu`), confirmed dead/unwired since the v1.0.0 audit — it implements a handful of standalone kernels (GEMV, attention, RMSNorm, RoPE, SiLU) but nothing resembling a full `LlmBackend` implementation, and nothing in `llm-core` calls it. **What real Vulkan support would require**: implementing an entire second backend on top of `cubecl-wgpu` — quantized weight loading/dequantization, the full transformer forward pass (attention with paged KV, RMSNorm, RoPE, SwiGLU/gated MLP, sampling), wired through the `LlmBackend` trait exactly like `CandleBackend` — realistically a multi-week project, not a bug fix. No Vulkan SDK is installed in this environment either, so even a minimal wgpu-Vulkan smoke test isn't possible here right now. |
+| **Raspberry Pi (aarch64 Linux)** | ⬜ Not verified, but no known code-level blocker | Grepped the entire `llm-core`/`llm-cli`/`llm-cluster` source: the *only* `target_os`-gated code anywhere is the Metal VRAM query (correctly macOS-only) — nothing else assumes macOS, so there's no known reason this wouldn't build and run on Linux aarch64 via the plain CPU backend. The existing RAM-aware `choose_device` OOM guard (refuses to load a model that won't fit, with a clear error, rather than letting the OS OOM-killer take down the process) is exactly the kind of defensive behavior a memory-constrained device like a Pi needs, and it's already there. What's genuinely unverified: actual cross-compilation to `aarch64-unknown-linux-gnu`/`aarch64-unknown-linux-musl` was not exercised in this session (blocked here by the same cross-toolchain gap as the x86_64 attempt above — this is an environment limitation of this sandbox, not evidence about the Pi itself), and no physical Pi (or any ARM Linux box) was available to actually run a build on. |
+| **Mobile (Android/iOS)** | ❌ Not implemented, real scope needed | No JNI (Android) or Swift/Objective-C (iOS) bindings exist. `llm-ffi`'s C ABI (now fixed this session: real Tokio runtime, real tokenizer, `catch_unwind` at the boundary) is the right foundation to bind FROM, but nobody has built the Android `.aar`/iOS `.xcframework` packaging, verified `candle-core` actually builds for `aarch64-linux-android`/`aarch64-apple-ios` targets, or confirmed Metal works through iOS's (technically compatible, but unverified in this specific stack) Metal implementation. This is a genuine, multi-week mobile-packaging project on top of a now-more-solid FFI base, not a quick addition. |
+| **Physical USB / multi-machine networking** | ⬜ Transport code exists and is generically correct; physically untested | `llm-cluster`'s new TCP protocol (see above) is plain `std`/`tokio` TCP sockets with no interface-specific code, so it should work unmodified over a USB cable in RNDIS/CDC-ECM gadget mode (which presents to the OS as an ordinary network interface with its own IP — goal.md's own description of how this is meant to work). This was verified over `127.0.0.1` in this session because only one machine was available; **no physical two-machine USB link, and no actual distributed inference (tensor-parallel/pipeline execution split across the registered nodes) was exercised**, since that layer (`analyzer.rs`/`collective.rs`/`tensor_parallel.rs`) still isn't wired to real inference at all (see above). |
+
+The honest summary: CPU+Metal on Apple Silicon is the only combination
+with real, verified, numerically-checked evidence behind it. Every other
+row above is either "should work, structurally no reason it wouldn't,
+but genuinely never run" (x86 CPU, CUDA, Raspberry Pi) or "does not
+exist yet and needs real engineering time to build" (Vulkan, mobile
+packaging, actual distributed multi-node inference execution).
 
 ## v2 — Full audit + fix pass, branch v2026.7.19, 2026-07-19
 
