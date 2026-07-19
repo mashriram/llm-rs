@@ -137,7 +137,7 @@ fn test_prefix_cache_radix_tree() {
 #[test]
 fn test_scheduler_orchestration() {
     let backend = Box::new(MockBackend);
-    let mut scheduler = Scheduler::new(backend, 16);
+    let mut scheduler = Scheduler::new(backend, 16).expect("Scheduler::new failed");
 
     // 1. Add a prefill request
     let req1 = InferRequest {
@@ -173,4 +173,183 @@ fn test_scheduler_orchestration() {
     assert_eq!(step3_res.len(), 1);
     assert_eq!(step3_res[0].1, 42);
     assert!(step3_res[0].2); // Should be finished (reached_max = true)
+}
+
+// Regression test for audit finding #1: when a sequence is preempted due to
+// out-of-memory (no free blocks left to grow its KV cache), the client must
+// still receive a terminal event (is_eos=true) rather than being left hanging
+// forever with no final signal.
+#[test]
+fn test_oom_preemption_sends_terminal_event() {
+    let backend = Box::new(MockBackend);
+    // Only 1 physical block available, block_size=4 tokens/block -> capacity
+    // for a single sequence is exactly 4 tokens with no room to grow.
+    let mut scheduler = Scheduler::new(backend, 1).expect("Scheduler::new failed");
+
+    let req = InferRequest {
+        seq_id: 42,
+        prompt_tokens: vec![1, 2, 3, 4], // exactly fills the only block (4 tokens)
+        sample_params: SampleParams::default(),
+        max_new_tokens: 50, // far more than the pool can ever support
+    };
+    scheduler.add_request(req);
+
+    // Prefill consumes the only block (4/4 tokens used). The generated token
+    // pushes total_tokens to 5, exceeding the 4-token capacity, and there are
+    // no free blocks left to grow into -> OOM preemption on this very step.
+    let step_res = scheduler.step().expect("step failed");
+    assert_eq!(step_res.len(), 1);
+    assert_eq!(step_res[0].0, 42);
+    assert!(
+        step_res[0].2,
+        "OOM-preempted sequence must be signaled with is_eos=true, not left hanging"
+    );
+
+    // The sequence must actually be gone from the running queue (freed, not
+    // silently stuck around waiting for blocks that will never come).
+    assert_eq!(scheduler.running_tasks(), 0);
+}
+
+// Regression test for audit finding #6: a request whose prompt needs more
+// blocks than the pool will EVER have (its total capacity) must be rejected
+// immediately, and must not permanently head-of-line-block every other
+// request queued behind it.
+#[test]
+fn test_oversized_request_rejected_without_blocking_queue() {
+    let backend = Box::new(MockBackend);
+    // Pool capacity: 2 blocks * block_size 4 = 8 tokens, ever.
+    let mut scheduler = Scheduler::new(backend, 2).expect("Scheduler::new failed");
+
+    let oversized_req = InferRequest {
+        seq_id: 1,
+        prompt_tokens: vec![0; 100], // needs 25 blocks; pool can never provide that
+        sample_params: SampleParams::default(),
+        max_new_tokens: 5,
+    };
+    let normal_req = InferRequest {
+        seq_id: 2,
+        prompt_tokens: vec![1, 2],
+        sample_params: SampleParams::default(),
+        max_new_tokens: 3,
+    };
+
+    scheduler.add_request(oversized_req);
+    scheduler.add_request(normal_req);
+
+    let step_res = scheduler.step().expect("step failed");
+
+    // The oversized request must have been rejected with a terminal event...
+    let rejected = step_res.iter().find(|(id, _, _)| *id == 1);
+    assert!(rejected.is_some(), "oversized request must produce a terminal event");
+    assert!(rejected.unwrap().2, "rejected request's event must be terminal (is_eos=true)");
+
+    // ...and must not have blocked the normal request behind it in the queue:
+    // it should have been admitted and processed in this very same step.
+    let normal = step_res.iter().find(|(id, _, _)| *id == 2);
+    assert!(normal.is_some(), "normal request behind an oversized one must still be admitted");
+
+    assert_eq!(scheduler.waiting_tasks(), 0, "queue must not still be stuck behind the oversized request");
+}
+
+// Regression test for audit finding #14: a request for zero new tokens must
+// be completed immediately (not silently produce exactly one generated
+// token as the pre-fix behavior did).
+#[test]
+fn test_zero_max_new_tokens_rejected_upfront() {
+    let backend = Box::new(MockBackend);
+    let mut scheduler = Scheduler::new(backend, 16).expect("Scheduler::new failed");
+
+    let req = InferRequest {
+        seq_id: 7,
+        prompt_tokens: vec![1, 2, 3],
+        sample_params: SampleParams::default(),
+        max_new_tokens: 0,
+    };
+    scheduler.add_request(req);
+
+    let step_res = scheduler.step().expect("step failed");
+    assert_eq!(step_res.len(), 1);
+    assert_eq!(step_res[0].0, 7);
+    assert!(step_res[0].2, "zero-token request must be completed immediately with a terminal event");
+    assert_eq!(scheduler.running_tasks(), 0, "zero-token request must never enter the running queue");
+}
+
+/// A backend whose `sample()` deliberately fails for sequences using a
+/// sentinel `top_k == 999` (standing in for e.g. a NaN/malformed sampling
+/// configuration), while behaving normally for every other sequence. Used to
+/// prove that one bad sequence's sampling failure doesn't take down every
+/// other concurrent sequence's generation (audit finding #2).
+struct FaultyBackend;
+
+impl LlmBackend for FaultyBackend {
+    fn load_weights(&mut self, path: &std::path::Path) -> Result<ModelMeta> {
+        let mut mock = MockBackend;
+        mock.load_weights(path)
+    }
+
+    fn forward_pass(&self, input: &BatchInput) -> Result<BatchOutput> {
+        // Populate logits so that `sample()` is actually invoked per-sequence.
+        let logits = vec![vec![0.0f32; 4]; input.seq_ids.len()];
+        Ok(BatchOutput {
+            seq_ids: input.seq_ids.clone(),
+            next_tokens: vec![42; input.seq_ids.len()],
+            logits: Some(logits),
+        })
+    }
+
+    fn sample(&self, _logits: &[f32], params: &SampleParams, _token_history: &[TokenId]) -> Result<TokenId> {
+        if params.top_k == 999 {
+            Err(anyhow::anyhow!("simulated sampling failure (e.g. NaN logits)"))
+        } else {
+            Ok(42)
+        }
+    }
+
+    fn kv_cache_config(&self) -> KvCacheConfig {
+        MockBackend.kv_cache_config()
+    }
+
+    fn name(&self) -> &str {
+        "faulty"
+    }
+}
+
+#[test]
+fn test_one_bad_sequence_does_not_abort_other_concurrent_sequences() {
+    let backend = Box::new(FaultyBackend);
+    let mut scheduler = Scheduler::new(backend, 16).expect("Scheduler::new failed");
+
+    let good_req = InferRequest {
+        seq_id: 100,
+        prompt_tokens: vec![1, 2, 3],
+        sample_params: SampleParams::default(), // top_k = 0, samples fine
+        max_new_tokens: 5,
+    };
+    let bad_req = InferRequest {
+        seq_id: 200,
+        prompt_tokens: vec![4, 5, 6],
+        sample_params: SampleParams { top_k: 999, ..SampleParams::default() }, // triggers simulated failure
+        max_new_tokens: 5,
+    };
+
+    scheduler.add_request(good_req);
+    scheduler.add_request(bad_req);
+
+    // Prefill step: both get admitted and run through the (faulty) forward pass.
+    let step_res = scheduler.step().expect(
+        "step() must not return Err just because one sequence's sampling failed"
+    );
+
+    let good = step_res.iter().find(|(id, _, _)| *id == 100).expect("good sequence must have a result");
+    let bad = step_res.iter().find(|(id, _, _)| *id == 200).expect("bad sequence must have a terminal event");
+
+    assert!(!good.2, "good sequence must not be terminated by the other sequence's failure");
+    assert!(bad.2, "bad sequence must be terminated with a terminal event after its sampling failure");
+
+    // The good sequence must still be alive and progressing in the running queue.
+    assert_eq!(scheduler.running_sequence_ids(), vec![100]);
+
+    // A further step must keep making progress for the surviving sequence.
+    let step2_res = scheduler.step().expect("subsequent step for surviving sequence must succeed");
+    assert!(step2_res.iter().any(|(id, _, _)| *id == 100));
 }

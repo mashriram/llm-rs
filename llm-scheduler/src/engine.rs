@@ -57,7 +57,7 @@ impl ServingEngine {
         mut request_rx: UnboundedReceiver<InferRequest>,
         event_tx: broadcast::Sender<TokenEvent>,
     ) -> Result<()> {
-        let mut scheduler = Scheduler::new(backend, block_pool_size);
+        let mut scheduler = Scheduler::new(backend, block_pool_size)?;
         info!("ServingEngine background loop started.");
 
         loop {
