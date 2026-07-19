@@ -4,8 +4,62 @@ use anyhow::{Result, anyhow, Context};
 use candle_core::{Tensor, Device, DType};
 use symphonia::core::audio::Signal;
 
+/// Which audio-encoder architecture a loaded checkpoint uses. Detected from
+/// tensor names present in the checkpoint at load time (see
+/// `detect_architecture`) — never user-specified, per the model-agnostic
+/// design: any supported checkpoint should just work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioArchitecture {
+    /// Gemma-4 style Conformer encoder (SubSampleConvProjection + chunked
+    /// local attention with relative position bias). Native GGUF tensor
+    /// names: `a.conv1d.*`, `a.blk.*`.
+    GemmaConformer,
+    /// Whisper-style encoder (Conv1d x2 + absolute positional embedding +
+    /// standard MHA transformer blocks). Tensor names:
+    /// `audio_encoder.*`, `audio_projector.*` (several naming variants
+    /// normalized by `normalize_audio_tensors`).
+    Whisper,
+}
+
+impl AudioArchitecture {
+    /// Expected number of mel-spectrogram bins for this architecture's
+    /// feature extractor. Used by `load_audio` to build the right input
+    /// shape — Whisper checkpoints expect 80 bins, Gemma-4's 128.
+    pub fn num_mel_bins(self) -> usize {
+        match self {
+            AudioArchitecture::GemmaConformer => 128,
+            AudioArchitecture::Whisper => 80,
+        }
+    }
+
+    fn defaults(self) -> (usize, usize, usize, usize) {
+        // (hidden_dim, num_layers, num_heads, projection_dim)
+        match self {
+            AudioArchitecture::GemmaConformer => (1024, 12, 8, 1024),
+            AudioArchitecture::Whisper => (1280, 32, 20, 2560),
+        }
+    }
+}
+
+/// Inspect raw (un-normalized) tensor names to decide which encoder
+/// architecture a checkpoint implements. Whisper-derived checkpoints use
+/// `audio_encoder.*`/`audio_projector.*` naming; Gemma-4's GGUF export uses
+/// `a.conv1d.*`/`a.blk.*` directly, so absence of Whisper naming defaults to
+/// GemmaConformer.
+fn detect_architecture(weights: &HashMap<String, Tensor>) -> AudioArchitecture {
+    let is_whisper = weights.keys().any(|k| {
+        k.contains("audio_encoder.") || k.contains("audio_projector.")
+    });
+    if is_whisper {
+        AudioArchitecture::Whisper
+    } else {
+        AudioArchitecture::GemmaConformer
+    }
+}
+
 pub struct AudioEncoder {
     weights: HashMap<String, Tensor>,
+    pub architecture: AudioArchitecture,
     pub hidden_dim: usize,
     pub num_layers: usize,
     pub num_heads: usize,
@@ -17,10 +71,10 @@ impl AudioEncoder {
         tracing::info!("Loading audio encoder from {:?}", path);
 
         let mut raw_weights = HashMap::new();
-        let mut hidden_dim = 1024;
-        let mut num_layers = 12;
-        let mut num_heads = 8;
-        let mut projection_dim = 1024;
+        let mut hidden_dim_override: Option<usize> = None;
+        let mut num_layers_override: Option<usize> = None;
+        let mut num_heads_override: Option<usize> = None;
+        let mut projection_dim_override: Option<usize> = None;
 
         let is_gguf = path.is_file() && path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_lowercase() == "gguf").unwrap_or(false);
 
@@ -38,10 +92,10 @@ impl AudioEncoder {
                 }
             };
 
-            if let Some(v) = get_metadata_u32("clip.audio.embedding_length") { hidden_dim = v as usize; }
-            if let Some(v) = get_metadata_u32("clip.audio.block_count") { num_layers = v as usize; }
-            if let Some(v) = get_metadata_u32("clip.audio.attention.head_count") { num_heads = v as usize; }
-            if let Some(v) = get_metadata_u32("clip.audio.projection_dim") { projection_dim = v as usize; }
+            if let Some(v) = get_metadata_u32("clip.audio.embedding_length") { hidden_dim_override = Some(v as usize); }
+            if let Some(v) = get_metadata_u32("clip.audio.block_count") { num_layers_override = Some(v as usize); }
+            if let Some(v) = get_metadata_u32("clip.audio.attention.head_count") { num_heads_override = Some(v as usize); }
+            if let Some(v) = get_metadata_u32("clip.audio.projection_dim") { projection_dim_override = Some(v as usize); }
 
             let cpu = Device::Cpu;
             let audio_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
@@ -76,8 +130,26 @@ impl AudioEncoder {
             }
         }
 
+        let architecture = detect_architecture(&raw_weights);
+        let (default_hidden, default_layers, default_heads, default_proj) = architecture.defaults();
+        let hidden_dim = hidden_dim_override.unwrap_or(default_hidden);
+        let num_layers = num_layers_override.unwrap_or(default_layers);
+        let num_heads = num_heads_override.unwrap_or(default_heads);
+        let projection_dim = projection_dim_override.unwrap_or(default_proj);
+
+        tracing::info!(
+            "Detected audio encoder architecture: {:?} (hidden_dim={}, num_layers={}, num_heads={})",
+            architecture, hidden_dim, num_layers, num_heads
+        );
+
+        let weights = match architecture {
+            AudioArchitecture::Whisper => normalize_audio_tensors(raw_weights, num_layers, device)?,
+            AudioArchitecture::GemmaConformer => raw_weights,
+        };
+
         Ok(Self {
-            weights: raw_weights,
+            weights,
+            architecture,
             hidden_dim,
             num_layers,
             num_heads,
@@ -86,6 +158,152 @@ impl AudioEncoder {
     }
 
     pub fn encode(&self, audio_values: &Tensor) -> Result<Tensor> {
+        match self.architecture {
+            AudioArchitecture::GemmaConformer => self.encode_conformer(audio_values),
+            AudioArchitecture::Whisper => self.encode_whisper(audio_values),
+        }
+    }
+
+    /// Whisper-style encoder: Conv1d x2 -> absolute positional embedding ->
+    /// standard MHA transformer blocks -> post-LN -> 2-layer MLP projector.
+    fn encode_whisper(&self, audio_values: &Tensor) -> Result<Tensor> {
+        let conv1_w = self.weights.get("audio.conv1.weight")
+            .ok_or_else(|| anyhow!("audio.conv1.weight not found"))?;
+        let conv1_b = self.weights.get("audio.conv1.bias");
+
+        let conv2_w = self.weights.get("audio.conv2.weight")
+            .ok_or_else(|| anyhow!("audio.conv2.weight not found"))?;
+        let conv2_b = self.weights.get("audio.conv2.bias");
+
+        // Conv1: stride 1, padding 1
+        let mut x = audio_values.conv1d(conv1_w, 1, 1, 1, 1)?;
+        if let Some(bias) = conv1_b {
+            let b = bias.reshape((1, bias.dim(0)?, 1))?;
+            x = x.broadcast_add(&b)?;
+        }
+        x = x.gelu()?;
+
+        // Conv2: stride 2, padding 1
+        x = x.conv1d(conv2_w, 2, 1, 1, 1)?;
+        if let Some(bias) = conv2_b {
+            let b = bias.reshape((1, bias.dim(0)?, 1))?;
+            x = x.broadcast_add(&b)?;
+        }
+        x = x.gelu()?;
+
+        // Transpose to [batch, seq_len, hidden_dim]
+        x = x.transpose(1, 2)?;
+
+        // Positional embeddings
+        if let Some(pos_emb) = self.weights.get("audio.pos_embed.weight") {
+            let seq_len = x.dim(1)?;
+            let emb_len = pos_emb.dim(0)?;
+            let sliced_emb = if seq_len < emb_len {
+                pos_emb.narrow(0, 0, seq_len)?
+            } else {
+                pos_emb.clone()
+            };
+            x = x.broadcast_add(&sliced_emb)?;
+        }
+
+        // Transformer encoder blocks
+        let head_dim = self.hidden_dim / self.num_heads;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        for i in 0..self.num_layers {
+            let ln1_w = self.weights.get(&format!("audio.layers.{}.ln1.weight", i))
+                .ok_or_else(|| anyhow!("audio.layers.{}.ln1.weight not found", i))?;
+            let ln1_b = self.weights.get(&format!("audio.layers.{}.ln1.bias", i))
+                .ok_or_else(|| anyhow!("audio.layers.{}.ln1.bias not found", i))?;
+            let ln2_w = self.weights.get(&format!("audio.layers.{}.ln2.weight", i))
+                .ok_or_else(|| anyhow!("audio.layers.{}.ln2.weight not found", i))?;
+            let ln2_b = self.weights.get(&format!("audio.layers.{}.ln2.bias", i))
+                .ok_or_else(|| anyhow!("audio.layers.{}.ln2.bias not found", i))?;
+
+            let qkv_w = self.weights.get(&format!("audio.layers.{}.attn_qkv.weight", i))
+                .ok_or_else(|| anyhow!("audio.layers.{}.attn_qkv.weight not found", i))?;
+            let qkv_b = self.weights.get(&format!("audio.layers.{}.attn_qkv.bias", i))
+                .ok_or_else(|| anyhow!("audio.layers.{}.attn_qkv.bias not found", i))?;
+
+            let attn_out_w = self.weights.get(&format!("audio.layers.{}.attn_out.weight", i))
+                .ok_or_else(|| anyhow!("audio.layers.{}.attn_out.weight not found", i))?;
+            let attn_out_b = self.weights.get(&format!("audio.layers.{}.attn_out.bias", i))
+                .ok_or_else(|| anyhow!("audio.layers.{}.attn_out.bias not found", i))?;
+
+            let ffn_up_w = self.weights.get(&format!("audio.layers.{}.ffn_up.weight", i))
+                .ok_or_else(|| anyhow!("audio.layers.{}.ffn_up.weight not found", i))?;
+            let ffn_up_b = self.weights.get(&format!("audio.layers.{}.ffn_up.bias", i))
+                .ok_or_else(|| anyhow!("audio.layers.{}.ffn_up.bias not found", i))?;
+            let ffn_down_w = self.weights.get(&format!("audio.layers.{}.ffn_down.weight", i))
+                .ok_or_else(|| anyhow!("audio.layers.{}.ffn_down.weight not found", i))?;
+            let ffn_down_b = self.weights.get(&format!("audio.layers.{}.ffn_down.bias", i))
+                .ok_or_else(|| anyhow!("audio.layers.{}.ffn_down.bias not found", i))?;
+
+            // LN1
+            let norm_x = candle_nn::ops::layer_norm(&x, ln1_w, ln1_b, 1e-5)?;
+
+            // Attention
+            let qkv = matmul_3d_2d(&norm_x, qkv_w)?;
+            let qkv = qkv.broadcast_add(qkv_b)?;
+
+            let (b, seq, three_d) = qkv.dims3()?;
+            let d = three_d / 3;
+
+            let q = qkv.narrow(2, 0, d)?;
+            let k = qkv.narrow(2, d, d)?;
+            let v = qkv.narrow(2, 2 * d, d)?;
+
+            // Reshape for MHA: [b, h, seq, head_dim]
+            let q = q.reshape((b, seq, self.num_heads, head_dim))?.transpose(1, 2)?;
+            let k = k.reshape((b, seq, self.num_heads, head_dim))?.transpose(1, 2)?;
+            let v = v.reshape((b, seq, self.num_heads, head_dim))?.transpose(1, 2)?;
+
+            let scores = q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)?;
+            let scores = (scores * scale)?;
+            let attn = candle_nn::ops::softmax(&scores, 3)?;
+            let context = attn.matmul(&v.contiguous()?)?;
+
+            // Transpose back: [b, seq, hidden_dim]
+            let context = context.transpose(1, 2)?.contiguous()?.reshape((b, seq, d))?;
+            let attn_out = matmul_3d_2d(&context, attn_out_w)?;
+            let attn_out = attn_out.broadcast_add(attn_out_b)?;
+
+            // Residual
+            x = x.add(&attn_out)?;
+
+            // LN2 + FFN
+            let norm_x2 = candle_nn::ops::layer_norm(&x, ln2_w, ln2_b, 1e-5)?;
+            let ffn = matmul_3d_2d(&norm_x2, ffn_up_w)?;
+            let ffn = ffn.broadcast_add(ffn_up_b)?;
+            let ffn = ffn.gelu()?;
+            let ffn = matmul_3d_2d(&ffn, ffn_down_w)?;
+            let ffn = ffn.broadcast_add(ffn_down_b)?;
+
+            // Residual
+            x = x.add(&ffn)?;
+        }
+
+        // Post LN
+        if let (Some(post_ln_w), Some(post_ln_b)) = (self.weights.get("audio.post_ln.weight"), self.weights.get("audio.post_ln.bias")) {
+            x = candle_nn::ops::layer_norm(&x, post_ln_w, post_ln_b, 1e-5)?;
+        }
+
+        // Audio Projector
+        if let (Some(proj_w), Some(proj_b)) = (self.weights.get("projector.0.weight"), self.weights.get("projector.0.bias")) {
+            x = matmul_3d_2d(&x, proj_w)?;
+            x = x.broadcast_add(proj_b)?;
+            x = x.gelu()?;
+        }
+        if let (Some(proj_w), Some(proj_b)) = (self.weights.get("projector.2.weight"), self.weights.get("projector.2.bias")) {
+            x = matmul_3d_2d(&x, proj_w)?;
+            x = x.broadcast_add(proj_b)?;
+        }
+
+        Ok(x)
+    }
+
+    /// Gemma-4 style Conformer encoder.
+    fn encode_conformer(&self, audio_values: &Tensor) -> Result<Tensor> {
         let device = audio_values.device();
         // Dynamically resolve the working dtype from the weights
         let first_w = self.weights.values().next()
@@ -511,7 +729,117 @@ fn rel_shift(x: &Tensor, context_size: usize, _chunk_size: usize) -> Result<Tens
     Ok(x.reshape((batch_size, num_heads, num_blocks, block_size, context_size))?)
 }
 
-pub fn load_audio(path: &Path, device: &Device) -> Result<Tensor> {
+/// Map the several real-world Whisper-derived tensor-naming conventions
+/// (`self_attn.{q,k,v}_proj`, `self_attn.out_proj`/`self_attn.dense`,
+/// `mlp.fc1`/`fc2` or `dense_h_to_4h`/`dense_4h_to_h`, etc.) onto the
+/// canonical `audio.*` names `encode_whisper` expects, and fuses the
+/// separate q/k/v projections into one `attn_qkv` weight per layer.
+fn normalize_audio_tensors(
+    raw: HashMap<String, Tensor>,
+    num_layers: usize,
+    device: &Device,
+) -> Result<HashMap<String, Tensor>> {
+    let mut normalized = HashMap::new();
+    let mut q_weights = HashMap::new();
+    let mut k_weights = HashMap::new();
+    let mut v_weights = HashMap::new();
+    let mut q_biases = HashMap::new();
+    let mut k_biases = HashMap::new();
+    let mut v_biases = HashMap::new();
+
+    for (k, v) in raw {
+        if k.contains("audio_encoder.conv1.weight") {
+            normalized.insert("audio.conv1.weight".to_string(), v);
+        } else if k.contains("audio_encoder.conv1.bias") {
+            normalized.insert("audio.conv1.bias".to_string(), v);
+        } else if k.contains("audio_encoder.conv2.weight") {
+            normalized.insert("audio.conv2.weight".to_string(), v);
+        } else if k.contains("audio_encoder.conv2.bias") {
+            normalized.insert("audio.conv2.bias".to_string(), v);
+        } else if k.contains("audio_encoder.positional_embedding") {
+            normalized.insert("audio.pos_embed.weight".to_string(), v);
+        } else if k.contains("audio_encoder.ln_post.weight") {
+            normalized.insert("audio.post_ln.weight".to_string(), v);
+        } else if k.contains("audio_encoder.ln_post.bias") {
+            normalized.insert("audio.post_ln.bias".to_string(), v);
+        } else if k.contains("audio_projector.linear_1.weight") || k.contains("audio_projector.0.weight") {
+            normalized.insert("projector.0.weight".to_string(), v);
+        } else if k.contains("audio_projector.linear_1.bias") || k.contains("audio_projector.0.bias") {
+            normalized.insert("projector.0.bias".to_string(), v);
+        } else if k.contains("audio_projector.linear_2.weight") || k.contains("audio_projector.2.weight") {
+            normalized.insert("projector.2.weight".to_string(), v);
+        } else if k.contains("audio_projector.linear_2.bias") || k.contains("audio_projector.2.bias") {
+            normalized.insert("projector.2.bias".to_string(), v);
+        } else if k.contains("audio_encoder.layers.") {
+            let parts: Vec<&str> = k.split('.').collect();
+            if let Some(idx_str) = parts.iter().position(|&p| p == "layers").and_then(|pos| parts.get(pos + 1)) {
+                if let Ok(layer_idx) = idx_str.parse::<usize>() {
+                    if k.contains("layer_norm1.weight") {
+                        normalized.insert(format!("audio.layers.{}.ln1.weight", layer_idx), v);
+                    } else if k.contains("layer_norm1.bias") {
+                        normalized.insert(format!("audio.layers.{}.ln1.bias", layer_idx), v);
+                    } else if k.contains("layer_norm2.weight") {
+                        normalized.insert(format!("audio.layers.{}.ln2.weight", layer_idx), v);
+                    } else if k.contains("layer_norm2.bias") {
+                        normalized.insert(format!("audio.layers.{}.ln2.bias", layer_idx), v);
+                    } else if k.contains("self_attn.out_proj.weight") || k.contains("self_attn.dense.weight") {
+                        normalized.insert(format!("audio.layers.{}.attn_out.weight", layer_idx), v);
+                    } else if k.contains("self_attn.out_proj.bias") || k.contains("self_attn.dense.bias") {
+                        normalized.insert(format!("audio.layers.{}.attn_out.bias", layer_idx), v);
+                    } else if k.contains("mlp.fc1.weight") || k.contains("mlp.dense_h_to_4h.weight") {
+                        normalized.insert(format!("audio.layers.{}.ffn_up.weight", layer_idx), v);
+                    } else if k.contains("mlp.fc1.bias") || k.contains("mlp.dense_h_to_4h.bias") {
+                        normalized.insert(format!("audio.layers.{}.ffn_up.bias", layer_idx), v);
+                    } else if k.contains("mlp.fc2.weight") || k.contains("mlp.dense_4h_to_h.weight") {
+                        normalized.insert(format!("audio.layers.{}.ffn_down.weight", layer_idx), v);
+                    } else if k.contains("mlp.fc2.bias") || k.contains("mlp.dense_4h_to_h.bias") {
+                        normalized.insert(format!("audio.layers.{}.ffn_down.bias", layer_idx), v);
+                    } else if k.contains("self_attn.q_proj.weight") {
+                        q_weights.insert(layer_idx, v);
+                    } else if k.contains("self_attn.k_proj.weight") {
+                        k_weights.insert(layer_idx, v);
+                    } else if k.contains("self_attn.v_proj.weight") {
+                        v_weights.insert(layer_idx, v);
+                    } else if k.contains("self_attn.q_proj.bias") {
+                        q_biases.insert(layer_idx, v);
+                    } else if k.contains("self_attn.k_proj.bias") {
+                        k_biases.insert(layer_idx, v);
+                    } else if k.contains("self_attn.v_proj.bias") {
+                        v_biases.insert(layer_idx, v);
+                    }
+                }
+            }
+        }
+    }
+
+    for layer_idx in 0..num_layers {
+        if let (Some(q), Some(k), Some(v)) = (q_weights.remove(&layer_idx), k_weights.remove(&layer_idx), v_weights.remove(&layer_idx)) {
+            let qkv = Tensor::cat(&[&q, &k, &v], 0)?;
+            normalized.insert(format!("audio.layers.{}.attn_qkv.weight", layer_idx), qkv);
+        }
+        let q_b = q_biases.remove(&layer_idx);
+        let k_b = k_biases.remove(&layer_idx);
+        let v_b = v_biases.remove(&layer_idx);
+        if q_b.is_some() || k_b.is_some() || v_b.is_some() {
+            let dtype = q_b.as_ref().or(k_b.as_ref()).or(v_b.as_ref())
+                .map(|t| t.dtype())
+                .ok_or_else(|| anyhow!("no q/k/v bias available for layer {}", layer_idx))?;
+            let q_b = q_b.map(Ok).unwrap_or_else(|| Tensor::zeros(1, dtype, device))?;
+            let k_b = k_b.map(Ok).unwrap_or_else(|| Tensor::zeros(1, dtype, device))?;
+            let v_b = v_b.map(Ok).unwrap_or_else(|| Tensor::zeros(1, dtype, device))?;
+            let qkv_b = Tensor::cat(&[&q_b, &k_b, &v_b], 0)?;
+            normalized.insert(format!("audio.layers.{}.attn_qkv.bias", layer_idx), qkv_b);
+        } else if let Some(qkv_w) = normalized.get(&format!("audio.layers.{}.attn_qkv.weight", layer_idx)) {
+            let out_dim = qkv_w.dim(0)?;
+            let zeros = Tensor::zeros(out_dim, qkv_w.dtype(), device)?;
+            normalized.insert(format!("audio.layers.{}.attn_qkv.bias", layer_idx), zeros);
+        }
+    }
+
+    Ok(normalized)
+}
+
+pub fn load_audio(path: &Path, device: &Device, num_mel_bins: usize) -> Result<Tensor> {
     tracing::info!("Loading audio from {:?}", path);
 
     let src = std::fs::File::open(path)
@@ -592,7 +920,6 @@ pub fn load_audio(path: &Path, device: &Device) -> Result<Tensor> {
         pcm_data.truncate(target_samples);
     }
 
-    let num_mel_bins = 128;
     let mut mel_data = vec![0.0f32; num_mel_bins * 3000];
     for frame in 0..3000 {
         let start_idx = frame * 160;
@@ -618,4 +945,41 @@ pub fn load_audio(path: &Path, device: &Device) -> Result<Tensor> {
 
 fn matmul_3d_2d(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
     Ok(lhs.contiguous()?.matmul(&rhs.t()?.unsqueeze(0)?.contiguous()?)?)
+}
+
+#[cfg(test)]
+mod arch_detection_tests {
+    use super::*;
+
+    fn dummy_tensor() -> Tensor {
+        Tensor::zeros(1, DType::F32, &Device::Cpu).unwrap()
+    }
+
+    #[test]
+    fn detects_whisper_from_audio_encoder_prefix() {
+        let mut weights = HashMap::new();
+        weights.insert("audio_encoder.layers.0.self_attn.q_proj.weight".to_string(), dummy_tensor());
+        assert_eq!(detect_architecture(&weights), AudioArchitecture::Whisper);
+    }
+
+    #[test]
+    fn detects_whisper_from_projector_prefix() {
+        let mut weights = HashMap::new();
+        weights.insert("audio_projector.linear_1.weight".to_string(), dummy_tensor());
+        assert_eq!(detect_architecture(&weights), AudioArchitecture::Whisper);
+    }
+
+    #[test]
+    fn defaults_to_gemma_conformer_for_native_gguf_names() {
+        let mut weights = HashMap::new();
+        weights.insert("a.conv1d.0.weight".to_string(), dummy_tensor());
+        weights.insert("a.blk.0.attn_q.weight".to_string(), dummy_tensor());
+        assert_eq!(detect_architecture(&weights), AudioArchitecture::GemmaConformer);
+    }
+
+    #[test]
+    fn mel_bins_differ_by_architecture() {
+        assert_eq!(AudioArchitecture::Whisper.num_mel_bins(), 80);
+        assert_eq!(AudioArchitecture::GemmaConformer.num_mel_bins(), 128);
+    }
 }

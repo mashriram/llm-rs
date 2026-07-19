@@ -1150,16 +1150,19 @@ impl LlmBackend for CandleBackend {
             };
             let audio_val = if needs_load {
                 let audio_dtype = self.compute_dtype;
+                let num_mel_bins = self.audio_encoder.as_ref()
+                    .map(|e| e.architecture.num_mel_bins())
+                    .unwrap_or(128);
                 let loaded = if let Some(ref path_str) = active_path {
-                    match crate::backends::audio::load_audio(Path::new(path_str), &dev) {
+                    match crate::backends::audio::load_audio(Path::new(path_str), &dev, num_mel_bins) {
                         Ok(t) => t.to_dtype(audio_dtype)?,
                         Err(e) => {
                             tracing::warn!("Failed to load audio from {path_str}: {e}, using zeros");
-                            Tensor::zeros((1, 128, 3000), audio_dtype, &dev)?
+                            Tensor::zeros((1, num_mel_bins, 3000), audio_dtype, &dev)?
                         }
                     }
                 } else {
-                    Tensor::zeros((1, 128, 3000), audio_dtype, &dev)?
+                    Tensor::zeros((1, num_mel_bins, 3000), audio_dtype, &dev)?
                 };
                 *cache = Some(loaded.clone());
                 *last_path = active_path.clone();

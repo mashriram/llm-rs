@@ -1,12 +1,39 @@
 # Progress
 
 ## Current task
-Task 1 DONE (audit). Awaiting user decision on revised Task 2 plan (see
-"Known blockers / open questions" — the original plan assumed real branch
-divergence; that assumption is false, see below).
+v1-unified created from mlx (see revised-Task-2 note below). Whisper
+audio-encoder regression fixed (dual-architecture support landed). Next:
+continue production hardening (unwrap/unsafe audit, hardcoded-dispatch
+audit) across the whole merged tree, per original Task 7.
 
 ## Completed
 - Task 1 — Branch audit (read-only), 2026-07-19.
+- Manual regression pass vs vision-stability, 2026-07-19 (found + will fix
+  the Whisper audio-encoder gap; everything else confirmed clean).
+- Created `v1-unified` branch from `mlx` (fast-forward, cherry-picked the
+  CLAUDE.md/PROGRESS.md commits from `cpu` on top), 2026-07-19.
+- **Fixed the confirmed regression**: `llm-core/src/backends/audio.rs` now
+  supports BOTH the Gemma-4 Conformer encoder and vision-stability's
+  Whisper-style encoder, auto-selected via `detect_architecture()` based
+  on tensor names present in the loaded checkpoint (no user flag, per the
+  model-agnostic principle) — `audio_encoder.*`/`audio_projector.*` naming
+  -> Whisper, else Gemma-4 native `a.conv1d.*`/`a.blk.*` naming ->
+  GemmaConformer. `AudioArchitecture::num_mel_bins()` (80 for Whisper, 128
+  for Gemma-4) now threads through to `load_audio()`'s mel-bin count and
+  `candle.rs`'s audio-tensor fallback-zero shape, replacing the old
+  hardcoded-128 assumption. Also fixed a latent bug while porting: vision-
+  stability's `normalize_audio_tensors` hardcoded `DType::F16` for missing
+  q/k/v bias zero-fill, which would panic/mismatch on CPU (F32 compute
+  dtype) — now infers dtype from whichever bias tensor is actually
+  present. Added 4 unit tests (`arch_detection_tests`) covering
+  architecture detection and mel-bin selection for both variants.
+  `cargo check --workspace --exclude llm-kernel` and
+  `cargo test --workspace --exclude llm-kernel --lib` both pass clean (9
+  tests, 0 failures) on this machine (macOS/CPU backend).
+  Not yet verified: an actual Whisper-derived checkpoint end-to-end
+  (no such checkpoint available on this machine) — architecture
+  detection and tensor-name mapping are unit-tested, but a real load+
+  encode pass against a genuine Whisper mmproj file is still open.
 
 ## Known blockers / open questions
 - **MAJOR REVISION TO v1-plan.md's assumption**: `cpu`, `mlx`,
