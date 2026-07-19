@@ -1809,7 +1809,32 @@ impl LlmBackend for CandleBackend {
                 }
                 Operator::VisualEmbed { pixel_values, output } => {
                     let active_path = crate::backends::ACTIVE_IMAGE_PATH.lock().clone();
-                    let out = if let Some(ref enc) = self.vision_encoder {
+                    // If no image is provided, emit a dummy embedding and skip
+                    // encoding entirely - mirrors AudioEmbed's identical pattern
+                    // just below. Previously this ran the vision encoder on a
+                    // zero-valued dummy image on EVERY request to any vision-
+                    // capable model (even pure-text or audio-only ones) and
+                    // unconditionally cached the result into
+                    // `self.visual_embeddings`. That cache write is exactly
+                    // what SpliceTensors' "is a real image actually active"
+                    // guard checks (`has_preloaded`) - so the dummy encode on
+                    // the first op of a forward pass silently made every
+                    // later op in that SAME pass believe a real image was
+                    // preloaded, defeating the guard it runs into moments
+                    // later. Confirmed via a real /audio-only request to a
+                    // vision+audio-capable model: the dummy vision embedding
+                    // got spliced into the audio placeholder token run,
+                    // producing a length-mismatch crash unrelated to audio at
+                    // all. Never touching the cache when no image is active
+                    // fixes this at the source rather than patching every
+                    // downstream consumer of `has_preloaded`.
+                    let out = if active_path.is_none() {
+                        // Dummy: (1, 1, embed_dim) so downstream SpliceTensors/
+                        // DeepStackFuse are guaranteed no-ops for this request.
+                        let t_emb = ctx.get("text_embeddings")?;
+                        let embed_dim = t_emb.dim(2)?;
+                        Tensor::zeros((1, 1, embed_dim), t_emb.dtype(), t_emb.device())?
+                    } else if let Some(ref enc) = self.vision_encoder {
                         let mut cache = self.visual_embeddings.lock();
                         let mut last_path = self.last_image_path.lock();
                         let needs_encode = match (&active_path, &*last_path, &*cache) {

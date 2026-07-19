@@ -357,7 +357,21 @@ async fn main() -> anyhow::Result<()> {
                 "<|audio|>" // Fallback
             };
 
-            let num_audio_tokens = meta.audio_embedding_length.unwrap_or(750);
+            // `audio_embedding_length` is the encoder's HIDDEN dimension (e.g.
+            // 1024 for Gemma-Conformer), not a token count - using it directly
+            // as a placeholder-token count was a real bug (confirmed via a real
+            // audio file: it produced a splice-length-mismatch crash, since the
+            // encoder's actual output length has nothing to do with its hidden
+            // size). `load_audio`'s mel pipeline always produces a fixed 3000
+            // frames, so each architecture's output token count is a fixed
+            // constant determined only by its conv-subsampling factor: 4x for
+            // Gemma-Conformer (2 stride-2 convs -> 750), 2x for Whisper (one
+            // stride-1 + one stride-2 conv -> 1500). `audio_num_mel_bins`
+            // already tells us which architecture this is (128 vs 80).
+            let num_audio_tokens = match meta.audio_num_mel_bins {
+                Some(80) => 1500,  // Whisper: 3000 / 2
+                _ => 750,          // Gemma-Conformer (128 mel bins): 3000 / 4
+            };
             let pads = pad_token.repeat(num_audio_tokens);
             prompt_str = prompt_str.replace("<audio>", &pads);
         }

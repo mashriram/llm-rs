@@ -253,7 +253,7 @@ impl VisionEncoder {
             // Direct projection
             if let Some(mm_0_w) = self.weights.get("projector.0.weight") {
                 let mm_0_b = self.weights.get("projector.0.bias");
-                x = matmul_3d_2d(&x, &mm_0_w.t()?)?;
+                x = linear(&x, mm_0_w)?;
                 if let Some(b) = mm_0_b {
                     x = x.broadcast_add(b)?;
                 }
@@ -284,7 +284,7 @@ impl VisionEncoder {
                 .ok_or_else(|| anyhow!("vision.layers.{}.attn_qkv.weight not found", i))?;
             let qkv_b = self.weights.get(&format!("vision.layers.{}.attn_qkv.bias", i));
 
-            let mut qkv = matmul_3d_2d(&x_ln1, qkv_w)?;
+            let mut qkv = linear(&x_ln1, qkv_w)?;
             if let Some(bias) = qkv_b {
                 qkv = qkv.broadcast_add(bias)?;
             }
@@ -311,7 +311,7 @@ impl VisionEncoder {
             let out_w = self.weights.get(&format!("vision.layers.{}.attn_out.weight", i))
                 .ok_or_else(|| anyhow!("vision.layers.{}.attn_out.weight not found", i))?;
             let out_b = self.weights.get(&format!("vision.layers.{}.attn_out.bias", i));
-            let mut attn_out_proj = matmul_3d_2d(&attn_out, out_w)?.to_dtype(work_dtype)?;
+            let mut attn_out_proj = linear(&attn_out, out_w)?.to_dtype(work_dtype)?;
             if let Some(bias) = out_b {
                 attn_out_proj = attn_out_proj.broadcast_add(&bias.to_dtype(work_dtype)?)?;
             }
@@ -346,18 +346,18 @@ impl VisionEncoder {
 
             let mlp = if let Some(gate_w) = ffn_gate_w {
                 // Gated MLP (GeGLU)
-                let up = add_bias_if_matching(matmul_3d_2d(&x_ln2, ffn_up_w)?, ffn_up_b, "ffn_up")?;
-                let gate = add_bias_if_matching(matmul_3d_2d(&x_ln2, gate_w)?, ffn_gate_b, "ffn_gate")?;
+                let up = add_bias_if_matching(linear(&x_ln2, ffn_up_w)?, ffn_up_b, "ffn_up")?;
+                let gate = add_bias_if_matching(linear(&x_ln2, gate_w)?, ffn_gate_b, "ffn_gate")?;
                 let gate_act = gate.gelu()?;
                 (gate_act * up)?
             } else {
                 // Standard MLP
-                let up = add_bias_if_matching(matmul_3d_2d(&x_ln2, ffn_up_w)?, ffn_up_b, "ffn_up")?;
+                let up = add_bias_if_matching(linear(&x_ln2, ffn_up_w)?, ffn_up_b, "ffn_up")?;
                 up.gelu()?
             };
 
             let mut mlp_out = add_bias_if_matching(
-                matmul_3d_2d(&mlp, ffn_down_w)?.to_dtype(work_dtype)?,
+                linear(&mlp, ffn_down_w)?.to_dtype(work_dtype)?,
                 ffn_down_b.map(|b| b.to_dtype(work_dtype)).transpose()?.as_ref(),
                 "ffn_down",
             )?;
@@ -389,13 +389,13 @@ impl VisionEncoder {
                     rms_norm(&merged, ds_norm_w, 1e-6)?
                 };
 
-                let mut ds_fc1 = matmul_3d_2d(&ds_norm, ds_fc1_w)?;
+                let mut ds_fc1 = linear(&ds_norm, ds_fc1_w)?;
                 if let Some(bias) = ds_fc1_b {
                     ds_fc1 = ds_fc1.broadcast_add(bias)?;
                 }
                 let ds_fc1 = ds_fc1.gelu()?;
 
-                let mut ds_fc2 = matmul_3d_2d(&ds_fc1, ds_fc2_w)?;
+                let mut ds_fc2 = linear(&ds_fc1, ds_fc2_w)?;
                 if let Some(bias) = ds_fc2_b {
                     ds_fc2 = ds_fc2.broadcast_add(bias)?;
                 }
@@ -424,7 +424,7 @@ impl VisionEncoder {
             .ok_or_else(|| anyhow!("projector.0.weight not found"))?;
         let mm_0_b = self.weights.get("projector.0.bias");
  
-        let mut proj = matmul_3d_2d(&merged, &mm_0_w.t()?)?;
+        let mut proj = linear(&merged, mm_0_w)?;
         if let Some(b) = mm_0_b {
             proj = proj.broadcast_add(b)?;
         }
@@ -432,7 +432,7 @@ impl VisionEncoder {
         if let Some(mm_2_w) = self.weights.get("projector.2.weight") {
             let mm_2_b = self.weights.get("projector.2.bias");
             proj = proj.gelu()?;
-            proj = matmul_3d_2d(&proj, &mm_2_w.t()?)?;
+            proj = linear(&proj, mm_2_w)?;
             if let Some(b) = mm_2_b {
                 proj = proj.broadcast_add(b)?;
             }
@@ -752,6 +752,40 @@ pub fn load_image(path: &Path, image_size: usize, device: &Device) -> Result<Ten
 
 fn matmul_3d_2d(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
     Ok(lhs.contiguous()?.matmul(&rhs.unsqueeze(0)?.contiguous()?)?)
+}
+
+/// `x @ weight`, auto-detecting whether `weight` is stored `[out, in]`
+/// (standard PyTorch/HF convention — needs transposing first) or already
+/// `[in, out]`, by comparing each axis against `x`'s actual feature
+/// dimension. Confirmed empirically that this orientation is NOT a fixed
+/// property of this GGUF-loading code path: a Q8_0 Qwen2-VL-2B mmproj
+/// export loads its per-layer weights as `[in, out]`, while a BF16
+/// Gemma-4-E2B mmproj export (different tool/file, same tensor-name
+/// scheme) loads the *same conceptual* weights as `[out, in]` — almost
+/// certainly a byproduct of each file's own quantization/export tooling,
+/// not something this code controls. Guessing one fixed convention breaks
+/// one file or the other; detecting per-tensor from its actual shape
+/// works for both, and for any other GGUF export regardless of which
+/// convention it happens to use.
+fn linear(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    let in_dim = x.dim(x.rank() - 1)?;
+    let dims = weight.dims();
+    if dims.len() != 2 {
+        anyhow::bail!("linear: expected a 2D weight tensor, got shape {:?}", dims);
+    }
+    if dims[1] == in_dim {
+        // [out, in] - standard orientation, transpose before matmul.
+        matmul_3d_2d(x, &weight.t()?)
+    } else if dims[0] == in_dim {
+        // [in, out] - already in the orientation matmul_3d_2d expects.
+        matmul_3d_2d(x, weight)
+    } else {
+        anyhow::bail!(
+            "linear: weight shape {:?} matches neither axis against input feature dim {} \
+             - cannot determine [in,out] vs [out,in] orientation for this tensor",
+            dims, in_dim
+        )
+    }
 }
 
 /// Add `bias` to the last dimension of `x`, but only if its length actually
