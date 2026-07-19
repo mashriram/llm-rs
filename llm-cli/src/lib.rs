@@ -6,7 +6,7 @@ use axum::{
     Json, Router, Extension,
 };
 use serde::{Deserialize, Serialize};
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tracing::error;
 
@@ -170,11 +170,21 @@ pub async fn chat_completions(
     let tokenizer = state.tokenizer.clone();
 
     if req.stream {
-        let stream = BroadcastStream::new(token_rx)
-            .filter_map(move |res| {
-                match res {
+        // `token_rx` is a broadcast receiver whose sender lives for the whole
+        // server process, so a combinator chain built directly on top of it
+        // (e.g. `take_while`) can only stop *after* observing one more item —
+        // which may never arrive once this seq_id's generation is done,
+        // hanging the HTTP response forever. Instead, forward through a
+        // dedicated mpsc channel from a background task that explicitly
+        // breaks (dropping the sender, which ends the stream) the moment it
+        // sees `is_eos`, with no dependency on further broadcast traffic.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Event>(16);
+        tokio::spawn(async move {
+            loop {
+                match token_rx.recv().await {
                     Ok(event) if event.seq_id == seq_id => {
                         let text = tokenizer.decode(&[event.token_id], true).unwrap_or_else(|_| " ".to_string());
+                        let is_eos = event.is_eos;
                         let chunk = ChatCompletionChunk {
                             id: format!("chatcmpl-{}", seq_id),
                             object: "chat.completion.chunk".to_string(),
@@ -186,23 +196,34 @@ pub async fn chat_completions(
                                     role: None,
                                     content: Some(text),
                                 },
-                                finish_reason: if event.is_eos { Some("stop".to_string()) } else { None },
+                                finish_reason: if is_eos { Some("stop".to_string()) } else { None },
                             }],
                         };
                         match serde_json::to_string(&chunk) {
-                            Ok(json) => Some(Ok::<Event, std::convert::Infallible>(
-                                Event::default().data(json),
-                            )),
+                            Ok(json) => {
+                                if tx.send(Event::default().data(json)).await.is_err() {
+                                    break; // client disconnected
+                                }
+                            }
                             Err(e) => {
                                 error!("Failed to serialize chat completion chunk: {:?}", e);
-                                None
                             }
                         }
+                        if is_eos {
+                            // OpenAI-convention end-of-stream sentinel so clients
+                            // (curl/openai-python) see an explicit close instead
+                            // of hanging after the last content chunk.
+                            let _ = tx.send(Event::default().data("[DONE]")).await;
+                            break;
+                        }
                     }
-                    _ => None,
+                    Ok(_) => continue, // a different request's token, keep waiting
+                    Err(_) => break,   // channel closed or this receiver lagged
                 }
-            });
+            }
+        });
 
+        let stream = ReceiverStream::new(rx).map(|ev| Ok::<Event, std::convert::Infallible>(ev));
         axum::response::IntoResponse::into_response(Sse::new(stream))
     } else {
         let mut full_tokens = Vec::new();

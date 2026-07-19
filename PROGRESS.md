@@ -1,10 +1,95 @@
 # Progress
 
 ## Current task
-Task 7 (production hardening) DONE. Real-model verification on this
-machine (macOS/ARM, CPU + Metal backends) DONE — see below. CUDA/x86
-verification remains open (no such hardware available in this session —
-see "Hardware verification matrix").
+Tasks 7, 8, 9 DONE. Ready for Task 10 (tag v1) pending user confirmation
+on pushing/releasing (see below — local tagging/merge is done, remote
+push is a separate explicit ask per session safety rules).
+
+## Task 8 — CLI + end-to-end verification, 2026-07-19
+- **Chat TUI** (`llm-cli/src/bin/chat.rs`, release build, `--features
+  metal`): multi-turn conversation against SmolLM3-3B-Q4_K_M — Jinja chat
+  template loaded from GGUF and rendered correctly, streaming token
+  output to stdout works, produced a correct answer to "what is 2+2?"
+  with proper stats (TTFT/prefill/decode t/s) printed after each turn.
+  Found and fixed a real bug while testing: the compute graph's first-
+  token debug dump was a bare `println!` firing on every session's first
+  token, spamming stdout with ~60 lines of internal graph ops — not
+  appropriate for a production chat UI. Changed to `tracing::trace!`
+  gated behind `tracing::enabled!(Level::TRACE)` so it's available for
+  debugging but silent by default.
+- **HTTP server** (`llm-cli` main bin, OpenAI-compatible API): verified
+  `/health` (200 OK), `/v1/models` (lists the loaded model), and
+  `/v1/chat/completions` both non-streaming (correct JSON response,
+  correct answer) and streaming (SSE).
+  **Found and fixed a real bug**: the streaming SSE response never
+  terminated the HTTP connection after the final token. Root cause: the
+  handler built the SSE stream directly on top of a `broadcast::Receiver`
+  whose sender lives for the whole server process; a `take_while`-based
+  cutoff (first attempted fix) still needs to observe one more broadcast
+  item before it can stop, which may never arrive once this request's
+  generation is done — so the stream (and the HTTP response) hung until
+  the client's own timeout, which real OpenAI-compatible clients (e.g.
+  the openai-python SDK) don't have, meaning it would have hung forever.
+  Fixed properly: the handler now spawns a small forwarding task that
+  reads from the broadcast receiver into a dedicated `mpsc` channel and
+  explicitly `break`s (dropping the sender, ending the stream) the moment
+  it sees `is_eos`, also emitting an OpenAI-convention `data: [DONE]`
+  sentinel first. Verified: `curl -N .../v1/chat/completions` with
+  `stream:true` now completes and exits 0 (was hanging to the `-m`
+  timeout, exit 28, before the fix). Existing `server_tests.rs` streaming
+  test still passes (it wasn't asserting on termination, only content, so
+  it hadn't caught this).
+- **`llm devices`**: goal.md's CLI spec names this command but no binary
+  implemented it. Added `llm-cli/src/bin/devices.rs` (prints the
+  auto-detected `HardwareProfile`: backend, CPU cores, SIMD caps, RAM,
+  GPU VRAM/Unified Memory). Verified output on this machine matches the
+  actual hardware (Metal, 12 cores, NEON, ~19GB Unified Memory).
+- All of the above re-verified against real GGUF checkpoints in
+  `./models/`, not synthetic/mock data.
+- Full test suite re-run clean after every fix: `cargo test --workspace
+  --exclude llm-kernel --lib` (9/9), `mlc_test` (94/94),
+  `integration_tests` (3/3), `server_tests` (2/2).
+- Hardware verification matrix: unchanged from Task 7 (CPU+Metal ✅ on
+  this machine; CUDA/x86 not verified here, user will check in on that
+  hardware separately).
+
+## Task 9 — Benchmarks, 2026-07-19
+Ran `benchmark_speed` (release, `--features metal`) against both real
+checkpoints on this machine (Apple Silicon, Metal backend):
+- SmolLM3-3B-Q4_K_M: TTFT 242ms, prefill 82.5 tok/s, decode 6.6 tok/s
+  (100 new tokens).
+- Gemma-4-E2B-Q4_K_M: TTFT 262ms, prefill 68.7 tok/s, decode 39.8 tok/s
+  (short completion, model stopped itself early via EOS).
+- **Against goal.md's Verification Matrix — reported honestly, not
+  rounded up**:
+  - Quantized GEMV speed vs llama.cpp: **not measured** — no llama.cpp
+    build available in this session to compare against.
+  - Concurrent throughput (96 concurrent, target >150 req/s) and KV
+    waste (<4%): **not measured** — would require a multi-request load
+    harness against the HTTP server; out of scope for what could be
+    exercised in this session. Logging as an explicit open gap, not
+    silently assumed passing.
+  - Numerical parity vs HuggingFace reference (tolerance 1e-3): **not
+    measured** — no HF reference inference environment (transformers +
+    matching checkpoint) available in this sandbox.
+  - Day-zero model support: partially demonstrated — SmolLM3 (llama-style
+    dense) and Gemma-4 (its own arch, GQA + QK-norm + tied embeddings)
+    both auto-classified and ran correctly with zero model-specific code
+    changes, which is real evidence for the auto-classification claim,
+    but this is 2 architectures, not a genuinely new/unseen release.
+  - Memory safety (`cargo miri`): **not run** — flagging as open; the
+    unsafe-code audit in Task 7 was manual review + fixes, not a miri
+    pass. `cargo miri test` on the CPU path is worth doing in a future
+    session (candle's own CUDA/Metal FFI code is generally not
+    miri-compatible, so this would cover `llm-core`'s own unsafe only —
+    the mmap calls — which is now down to just 2 sites after Task 7's
+    fixes).
+  - Fault recovery (cluster pause-replicate-retry): **not exercised** —
+    would need a multi-node USB/network setup; llm-cluster's code exists
+    (recovery.rs) but wasn't run end-to-end here.
+  These gaps are real and should not be presented as "benchmarked" —
+  they're the honest state after what's feasible on one Apple Silicon
+  laptop in one session.
 
 ## Real-model + cross-backend verification, 2026-07-19
 Ran `llm-cli`'s `run_model` bin (release build) against the two real GGUF

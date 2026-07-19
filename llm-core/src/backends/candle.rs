@@ -1099,9 +1099,12 @@ impl LlmBackend for CandleBackend {
         let kv_cache_mutex = self.kv_cache.as_ref().ok_or_else(|| anyhow!("KV Cache not initialized"))?;
         let mut kv_cache = kv_cache_mutex.lock();
 
-        if batch.seq_ids[0] == 1 && kv_cache.get_seq_len(batch.seq_ids[0]) == 0 {
+        if tracing::enabled!(tracing::Level::TRACE)
+            && batch.seq_ids[0] == 1
+            && kv_cache.get_seq_len(batch.seq_ids[0]) == 0
+        {
             for (idx, op) in graph.ops.iter().enumerate().take(60) {
-                println!("Graph OP idx={}: {:?}", idx, op);
+                tracing::trace!("Graph OP idx={}: {:?}", idx, op);
             }
         }
 
