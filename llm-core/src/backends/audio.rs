@@ -888,6 +888,7 @@ pub fn load_audio(path: &Path, device: &Device, num_mel_bins: usize) -> Result<T
 
     let track_id = track.id;
     let mut pcm_data = Vec::new();
+    let mut source_rate: Option<u32> = None;
 
     loop {
         let packet = match format.next_packet() {
@@ -905,6 +906,7 @@ pub fn load_audio(path: &Path, device: &Device, num_mel_bins: usize) -> Result<T
         match decoder.decode(&packet) {
             Ok(audio_buf) => {
                 let spec = *audio_buf.spec();
+                source_rate.get_or_insert(spec.rate);
                 let mut sample_buf = symphonia::core::audio::AudioBuffer::<f32>::new(audio_buf.capacity() as u64, spec);
                 audio_buf.convert(&mut sample_buf);
 
@@ -931,6 +933,35 @@ pub fn load_audio(path: &Path, device: &Device, num_mel_bins: usize) -> Result<T
 
     tracing::info!("Decoded {} raw mono audio samples", pcm_data.len());
 
+    // The mel-spectrogram below assumes 16kHz input (25ms/400-sample frames,
+    // 10ms/160-sample hop). Previously the source sample rate was decoded
+    // and then silently discarded, so any non-16kHz file (the vast majority
+    // of real-world audio: 44.1kHz/48kHz are far more common than 16kHz) was
+    // fed through as-is, time/pitch-distorting it by ~2.75-3x before even
+    // reaching feature extraction. Resample via linear interpolation
+    // (adequate for feeding a mel-filterbank; not audiophile-grade, but a
+    // real correction rather than silently ignoring the mismatch).
+    if let Some(rate) = source_rate {
+        if rate != 16000 && rate > 0 && !pcm_data.is_empty() {
+            let ratio = 16000.0 / rate as f64;
+            let resampled_len = ((pcm_data.len() as f64) * ratio).round() as usize;
+            let mut resampled = Vec::with_capacity(resampled_len);
+            for i in 0..resampled_len {
+                let src_pos = i as f64 / ratio;
+                let idx0 = src_pos.floor() as usize;
+                let frac = (src_pos - idx0 as f64) as f32;
+                let s0 = pcm_data.get(idx0).copied().unwrap_or(0.0);
+                let s1 = pcm_data.get(idx0 + 1).copied().unwrap_or(s0);
+                resampled.push(s0 + (s1 - s0) * frac);
+            }
+            tracing::info!(
+                "Resampled audio from {} Hz to 16000 Hz ({} -> {} samples)",
+                rate, pcm_data.len(), resampled.len()
+            );
+            pcm_data = resampled;
+        }
+    }
+
     let target_samples = 480000;
     if pcm_data.len() < target_samples {
         pcm_data.resize(target_samples, 0.0);
@@ -938,23 +969,44 @@ pub fn load_audio(path: &Path, device: &Device, num_mel_bins: usize) -> Result<T
         pcm_data.truncate(target_samples);
     }
 
-    let mut mel_data = vec![0.0f32; num_mel_bins * 3000];
-    for frame in 0..3000 {
-        let start_idx = frame * 160;
-        let mut power = 0.0f32;
-        let window_len = 320;
-        for offset in 0..window_len {
-            if start_idx + offset < pcm_data.len() {
-                let sample = pcm_data[start_idx + offset];
-                power += sample * sample;
-            }
-        }
-        power = (power / window_len as f32).sqrt();
+    // Real log-mel spectrogram (Whisper's feature-extraction convention:
+    // 16kHz audio, 25ms/400-sample Hann-windowed frames, 10ms/160-sample hop,
+    // 3000 frames for 30s of audio). This replaces a previous placeholder
+    // that computed only a per-frame scalar RMS energy and fanned it out
+    // across mel bins via a fixed sine envelope — a real but content-blind
+    // "spectrogram" that could not carry any actual frequency information
+    // regardless of what audio encoder architecture consumed it (Whisper or
+    // Gemma-Conformer). Every audio-capable model was affected equally,
+    // since the bug was here, not in any per-architecture encoder code.
+    const N_FFT: usize = 400;
+    const HOP_LENGTH: usize = 160;
+    const SAMPLE_RATE: f32 = 16000.0;
+    let window = hann_window(N_FFT);
+    let mel_filters = build_mel_filterbank(num_mel_bins, N_FFT, SAMPLE_RATE);
 
-        for bin in 0..num_mel_bins {
-            let factor = ((bin as f32 / num_mel_bins as f32) * std::f32::consts::PI).sin();
-            mel_data[bin * 3000 + frame] = power * factor;
+    let mut mel_data = vec![0.0f32; num_mel_bins * 3000];
+    let mut frame_buf = vec![0.0f32; N_FFT];
+    for frame in 0..3000 {
+        let start_idx = frame * HOP_LENGTH;
+        for (i, w) in window.iter().enumerate() {
+            let idx = start_idx + i;
+            let sample = pcm_data.get(idx).copied().unwrap_or(0.0);
+            frame_buf[i] = sample * w;
         }
+        let power_spectrum = dft_power_spectrum(&frame_buf);
+        for (bin, filter) in mel_filters.iter().enumerate() {
+            let energy: f32 = filter.iter().zip(power_spectrum.iter()).map(|(f, p)| f * p).sum();
+            mel_data[bin * 3000 + frame] = energy.max(1e-10).ln();
+        }
+    }
+
+    // Match Whisper's final normalization: clip the dynamic range to the top
+    // 8 natural-log units, then rescale to roughly [-1, 1] so the values fall
+    // in the range the audio encoders were actually trained on.
+    let log_max = mel_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    for v in mel_data.iter_mut() {
+        *v = v.max(log_max - 8.0);
+        *v = (*v + 4.0) / 4.0;
     }
 
     let t = Tensor::from_vec(mel_data, (1, num_mel_bins, 3000), device)?;
@@ -963,6 +1015,82 @@ pub fn load_audio(path: &Path, device: &Device, num_mel_bins: usize) -> Result<T
 
 fn matmul_3d_2d(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
     Ok(lhs.contiguous()?.matmul(&rhs.t()?.unsqueeze(0)?.contiguous()?)?)
+}
+
+fn hann_window(n: usize) -> Vec<f32> {
+    if n <= 1 {
+        return vec![1.0; n];
+    }
+    (0..n)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos())
+        .collect()
+}
+
+fn hz_to_mel(f: f32) -> f32 {
+    2595.0 * (1.0 + f / 700.0).log10()
+}
+
+fn mel_to_hz(m: f32) -> f32 {
+    700.0 * (10f32.powf(m / 2595.0) - 1.0)
+}
+
+/// Triangular mel filterbank (HTK mel scale), one row per mel bin, each row
+/// spanning the `n_fft/2 + 1` real-valued power-spectrum bins. Used to
+/// collapse a linear-frequency power spectrum into a perceptually-scaled
+/// log-mel spectrogram, matching standard Whisper/wav2vec2-style audio
+/// feature extraction.
+fn build_mel_filterbank(num_mel_bins: usize, n_fft: usize, sample_rate: f32) -> Vec<Vec<f32>> {
+    let num_fft_bins = n_fft / 2 + 1;
+    let mel_min = hz_to_mel(0.0);
+    let mel_max = hz_to_mel(sample_rate / 2.0);
+    let mel_points: Vec<f32> = (0..num_mel_bins + 2)
+        .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (num_mel_bins + 1) as f32)
+        .collect();
+    let bin_points: Vec<f32> = mel_points
+        .iter()
+        .map(|&m| (n_fft as f32 + 1.0) * mel_to_hz(m) / sample_rate)
+        .collect();
+
+    let mut filters = vec![vec![0.0f32; num_fft_bins]; num_mel_bins];
+    for (m, filter) in filters.iter_mut().enumerate() {
+        let left = bin_points[m];
+        let center = bin_points[m + 1];
+        let right = bin_points[m + 2];
+        for (k, slot) in filter.iter_mut().enumerate() {
+            let kf = k as f32;
+            if kf >= left && kf <= center && center > left {
+                *slot = (kf - left) / (center - left);
+            } else if kf > center && kf <= right && right > center {
+                *slot = (right - kf) / (right - center);
+            }
+        }
+    }
+    filters
+}
+
+/// Power spectrum (|FFT|^2) of a single already-windowed frame, for the
+/// `n/2 + 1` non-redundant real-input frequency bins. A direct O(n^2) DFT
+/// rather than a radix-2 FFT: `frame.len()` (400, Whisper's standard 25ms
+/// window at 16kHz) isn't a power of 2, and this runs once per ~10ms hop at
+/// audio-load time, not in the per-token decode hot path, so the simplicity
+/// of a direct DFT is worth more here than the extra complexity (and new
+/// dependency) a general-length FFT would need.
+fn dft_power_spectrum(frame: &[f32]) -> Vec<f32> {
+    let n = frame.len();
+    let num_bins = n / 2 + 1;
+    let mut power = vec![0.0f32; num_bins];
+    for (k, slot) in power.iter_mut().enumerate() {
+        let angle_step = -2.0 * std::f32::consts::PI * k as f32 / n as f32;
+        let mut re = 0.0f32;
+        let mut im = 0.0f32;
+        for (i, &sample) in frame.iter().enumerate() {
+            let angle = angle_step * i as f32;
+            re += sample * angle.cos();
+            im += sample * angle.sin();
+        }
+        *slot = re * re + im * im;
+    }
+    power
 }
 
 #[cfg(test)]
@@ -999,5 +1127,53 @@ mod arch_detection_tests {
     fn mel_bins_differ_by_architecture() {
         assert_eq!(AudioArchitecture::Whisper.num_mel_bins(), 80);
         assert_eq!(AudioArchitecture::GemmaConformer.num_mel_bins(), 128);
+    }
+
+    /// Proves the mel-spectrogram is real spectral analysis, not the old
+    /// placeholder (a per-frame scalar energy fanned out via a fixed sine
+    /// envelope, which is architecture/content-blind): a 1kHz tone and a
+    /// 4kHz tone at the same amplitude must peak in genuinely different mel
+    /// bins. The old placeholder could never satisfy this — its shape across
+    /// bins was a fixed `sin(bin/n * pi)` curve independent of input
+    /// frequency, identical for every distinct pure tone.
+    #[test]
+    fn mel_filterbank_distinguishes_different_frequencies() {
+        let n_fft = 400;
+        let sample_rate = 16000.0f32;
+        let num_mel_bins = 80;
+        let window = hann_window(n_fft);
+        let filters = build_mel_filterbank(num_mel_bins, n_fft, sample_rate);
+
+        let tone_bin = |freq_hz: f32| -> usize {
+            let frame: Vec<f32> = (0..n_fft)
+                .map(|i| (2.0 * std::f32::consts::PI * freq_hz * i as f32 / sample_rate).sin() * window[i])
+                .collect();
+            let power = dft_power_spectrum(&frame);
+            filters
+                .iter()
+                .enumerate()
+                .map(|(bin, filter)| {
+                    let energy: f32 = filter.iter().zip(power.iter()).map(|(f, p)| f * p).sum();
+                    (bin, energy)
+                })
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(bin, _)| bin)
+                .unwrap()
+        };
+
+        let low_bin = tone_bin(1000.0);
+        let high_bin = tone_bin(4000.0);
+        assert!(
+            high_bin > low_bin,
+            "a 4kHz tone must peak in a higher mel bin than a 1kHz tone (got {low_bin} vs {high_bin})"
+        );
+    }
+
+    #[test]
+    fn mel_filterbank_rows_are_nonzero() {
+        let filters = build_mel_filterbank(80, 400, 16000.0);
+        for (i, row) in filters.iter().enumerate() {
+            assert!(row.iter().any(|&v| v > 0.0), "mel filter row {i} is all zero");
+        }
     }
 }

@@ -739,9 +739,10 @@ pub fn load_image(path: &Path, image_size: usize, device: &Device) -> Result<Ten
     for y in 0..image_size {
         for x in 0..image_size {
             let pixel = rgb.get_pixel(x as u32, y as u32);
-            data[0 * image_size * image_size + y * image_size + x] = ((pixel[0] as f32 / 255.0) - 0.5) / 0.5;
-            data[1 * image_size * image_size + y * image_size + x] = ((pixel[1] as f32 / 255.0) - 0.5) / 0.5;
-            data[2 * image_size * image_size + y * image_size + x] = ((pixel[2] as f32 / 255.0) - 0.5) / 0.5;
+            let plane = image_size * image_size;
+            data[y * image_size + x] = ((pixel[0] as f32 / 255.0) - 0.5) / 0.5;
+            data[plane + y * image_size + x] = ((pixel[1] as f32 / 255.0) - 0.5) / 0.5;
+            data[2 * plane + y * image_size + x] = ((pixel[2] as f32 / 255.0) - 0.5) / 0.5;
         }
     }
 
