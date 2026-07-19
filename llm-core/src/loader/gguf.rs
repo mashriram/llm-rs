@@ -28,10 +28,44 @@ pub struct TensorView<'a> {
     pub dtype: WeightDtype,
 }
 
+/// Byte offset (to end-of-file, matching this loader's original slicing
+/// behavior) + parsed metadata for one tensor, relative to `GgufFile`'s mmap.
+/// Storing an offset instead of a borrowed slice avoids a self-referential
+/// struct: `tensor()` slices `&self._mmap` on demand, so the returned
+/// `TensorView` can never outlive the mmap that backs it — enforced by the
+/// borrow checker, no `unsafe` required.
+struct StoredTensorMeta {
+    offset: usize,
+    shape: Vec<usize>,
+    dtype: WeightDtype,
+}
+
 pub struct GgufFile {
     _mmap: Mmap,
     pub metadata: HashMap<String, GgufValue>,
-    pub tensors: HashMap<String, TensorView<'static>>,
+    tensor_meta: HashMap<String, StoredTensorMeta>,
+}
+
+impl GgufFile {
+    /// Borrow one tensor's data directly from the mmap. The returned
+    /// `TensorView<'_>` cannot outlive `self`, so it's impossible to hold a
+    /// dangling reference after the file (and its mmap) is dropped.
+    pub fn tensor(&self, name: &str) -> Option<TensorView<'_>> {
+        let meta = self.tensor_meta.get(name)?;
+        Some(TensorView {
+            data: &self._mmap[meta.offset..],
+            shape: meta.shape.clone(),
+            dtype: meta.dtype,
+        })
+    }
+
+    pub fn contains_tensor(&self, name: &str) -> bool {
+        self.tensor_meta.contains_key(name)
+    }
+
+    pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.tensor_meta.keys().map(|s| s.as_str())
+    }
 }
 
 // GGUF Value Types
@@ -63,7 +97,11 @@ impl<'a> Reader<'a> {
         if self.pos + 4 > self.data.len() {
             bail!("Unexpected EOF reading u32");
         }
-        let val = u32::from_le_bytes(self.data[self.pos..self.pos+4].try_into().unwrap());
+        let val = u32::from_le_bytes(
+            self.data[self.pos..self.pos+4]
+                .try_into()
+                .map_err(|_| anyhow!("GGUF truncated at offset {}: expected 4 bytes for u32", self.pos))?
+        );
         self.pos += 4;
         Ok(val)
     }
@@ -72,7 +110,11 @@ impl<'a> Reader<'a> {
         if self.pos + 8 > self.data.len() {
             bail!("Unexpected EOF reading u64");
         }
-        let val = u64::from_le_bytes(self.data[self.pos..self.pos+8].try_into().unwrap());
+        let val = u64::from_le_bytes(
+            self.data[self.pos..self.pos+8]
+                .try_into()
+                .map_err(|_| anyhow!("GGUF truncated at offset {}: expected 8 bytes for u64", self.pos))?
+        );
         self.pos += 8;
         Ok(val)
     }
@@ -81,7 +123,11 @@ impl<'a> Reader<'a> {
         if self.pos + 4 > self.data.len() {
             bail!("Unexpected EOF reading f32");
         }
-        let val = f32::from_le_bytes(self.data[self.pos..self.pos+4].try_into().unwrap());
+        let val = f32::from_le_bytes(
+            self.data[self.pos..self.pos+4]
+                .try_into()
+                .map_err(|_| anyhow!("GGUF truncated at offset {}: expected 4 bytes for f32", self.pos))?
+        );
         self.pos += 4;
         Ok(val)
     }
@@ -90,7 +136,11 @@ impl<'a> Reader<'a> {
         if self.pos + 8 > self.data.len() {
             bail!("Unexpected EOF reading f64");
         }
-        let val = f64::from_le_bytes(self.data[self.pos..self.pos+8].try_into().unwrap());
+        let val = f64::from_le_bytes(
+            self.data[self.pos..self.pos+8]
+                .try_into()
+                .map_err(|_| anyhow!("GGUF truncated at offset {}: expected 8 bytes for f64", self.pos))?
+        );
         self.pos += 8;
         Ok(val)
     }
@@ -116,11 +166,15 @@ impl<'a> Reader<'a> {
             GGUF_VALUE_TYPE_INT8 => Ok(GgufValue::I8(self.read_bytes(1)?[0] as i8)),
             GGUF_VALUE_TYPE_UINT16 => {
                 let b = self.read_bytes(2)?;
-                Ok(GgufValue::U16(u16::from_le_bytes(b.try_into().unwrap())))
+                Ok(GgufValue::U16(u16::from_le_bytes(
+                    b.try_into().map_err(|_| anyhow!("GGUF: invalid u16 bytes"))?
+                )))
             }
             GGUF_VALUE_TYPE_INT16 => {
                 let b = self.read_bytes(2)?;
-                Ok(GgufValue::I16(i16::from_le_bytes(b.try_into().unwrap())))
+                Ok(GgufValue::I16(i16::from_le_bytes(
+                    b.try_into().map_err(|_| anyhow!("GGUF: invalid i16 bytes"))?
+                )))
             }
             GGUF_VALUE_TYPE_UINT32 => Ok(GgufValue::U32(self.read_u32()?)),
             GGUF_VALUE_TYPE_INT32 => Ok(GgufValue::I32(self.read_u32()? as i32)),
@@ -146,10 +200,13 @@ impl<'a> Reader<'a> {
 
 pub fn load_gguf(path: &Path) -> Result<GgufFile> {
     let file = File::open(path)?;
+    // SAFETY: memory-mapping a file is unsafe because the mapping becomes invalid
+    // (and any read is UB / may SIGBUS) if the underlying file is truncated or
+    // otherwise modified by another process while it is mapped. We accept this
+    // standard mmap caveat here: `path` is expected to be a stable model weights
+    // file that is not concurrently written to while the engine is loading it.
     let mmap = unsafe { MmapOptions::new().map(&file)? };
-    
-    // We will do a safe transmutation of lifetime for the tensor data views.
-    // This is safe because GgufFile keeps _mmap alive and is never handed out after GgufFile is dropped.
+
     let data_slice: &[u8] = &mmap;
     let mut r = Reader::new(data_slice);
 
@@ -202,11 +259,14 @@ pub fn load_gguf(path: &Path) -> Result<GgufFile> {
             // 2 = Q4_0, 3 = Q4_1, etc.
             2 => WeightDtype::Q4_0,
             8 => WeightDtype::Q8_0,
-            // mapping others if needed, but Q4_0, Q8_0, F16, F32 are core
-            _ => {
-                // Fallback to Q4_K or something else for unsupported types
-                WeightDtype::Q4_K
-            }
+            // Only F32, F16, Q4_0, Q8_0 are supported today. Silently reinterpreting
+            // an unrecognized GGML quant type as Q4_K would misread the raw tensor
+            // bytes with the wrong block layout/scale format, corrupting weights
+            // without any indication something went wrong — so we reject it instead.
+            other => bail!(
+                "Unsupported GGML tensor type {} for tensor {:?}: only F32(0), F16(1), Q4_0(2), Q8_0(8) are supported",
+                other, name
+            ),
         };
 
         let offset = r.read_u64()?;
@@ -225,25 +285,21 @@ pub fn load_gguf(path: &Path) -> Result<GgufFile> {
     let padding = (alignment - (header_size % alignment)) % alignment;
     let data_section_start = header_size + padding;
 
-    let mut tensors = HashMap::new();
+    // Bounds-check every tensor's start offset up front — a corrupt/truncated
+    // GGUF file with an out-of-range offset must fail loudly here, not panic
+    // later on first access via an out-of-bounds slice index in `tensor()`.
+    let mut tensor_meta = HashMap::new();
     for t in temp_tensors {
         let tensor_start = data_section_start + t.offset as usize;
-        
-        // Calculate size of tensor data (approx or exact depending on type)
-        // Since we don't have exact block sizes for all GGML types, we can slice to the end of the mmap,
-        // but a safer way is to calculate based on shape and dtype if known.
-        // For simplicity and safety, we can slice from tensor_start to the end of the file,
-        // or up to the next tensor's start.
-        let raw_data_ptr = &data_slice[tensor_start..];
-        
-        // Let's perform the unsafe lifetime cast to 'static.
-        // This is safe because `_mmap` is owned by `GgufFile` and will outlive any `TensorView` references.
-        let static_data: &'static [u8] = unsafe {
-            std::slice::from_raw_parts(raw_data_ptr.as_ptr(), raw_data_ptr.len())
-        };
+        if tensor_start > data_slice.len() {
+            bail!(
+                "GGUF tensor {:?} offset {} exceeds file length {}: file is truncated or corrupt",
+                t.name, tensor_start, data_slice.len()
+            );
+        }
 
-        tensors.insert(t.name, TensorView {
-            data: static_data,
+        tensor_meta.insert(t.name, StoredTensorMeta {
+            offset: tensor_start,
             shape: t.shape,
             dtype: t.dtype,
         });
@@ -252,6 +308,6 @@ pub fn load_gguf(path: &Path) -> Result<GgufFile> {
     Ok(GgufFile {
         _mmap: mmap,
         metadata,
-        tensors,
+        tensor_meta,
     })
 }

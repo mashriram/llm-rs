@@ -89,6 +89,11 @@ impl DummyBackend {
                 spatial_merge_size: None,
                 is_deepstack_layers: None,
                 projector_type: None,
+                has_audio_encoder: false,
+                audio_hidden_dim: None,
+                audio_block_count: None,
+                audio_embedding_length: None,
+                audio_num_mel_bins: None,
                 shared_kv_layers: None,
                 sliding_window_pattern: None,
                 sliding_window: None,
@@ -99,6 +104,9 @@ impl DummyBackend {
                 is_gemma: false,
                 ple_dim: None,
                 embed_scale: None,
+                arch: "dummy".to_string(),
+                chat_template: None,
+                eos_token_str: None,
             },
             call_count: std::sync::atomic::AtomicU32::new(0),
         }
@@ -346,9 +354,9 @@ fn test_safetensors_load_contains_expected_tensor() {
     write_dummy_safetensors(&path);
     let file = llm_core::loader::safetensors::load_safetensors(&path).unwrap();
     assert!(
-        file.tensors.contains_key("weight"),
+        file.contains_tensor("weight"),
         "loaded file must expose the 'weight' tensor; keys = {:?}",
-        file.tensors.keys().collect::<Vec<_>>()
+        file.tensor_names().collect::<Vec<_>>()
     );
 }
 
@@ -357,7 +365,7 @@ fn test_safetensors_load_tensor_shape() {
     let path = std::env::temp_dir().join("st_shape.safetensors");
     write_dummy_safetensors(&path);
     let file = llm_core::loader::safetensors::load_safetensors(&path).unwrap();
-    let view = file.tensors.get("weight").unwrap();
+    let view = file.tensor("weight").unwrap();
     assert_eq!(view.shape, &[2, 2], "tensor shape must be [2, 2]");
 }
 
@@ -477,6 +485,11 @@ fn test_weight_dtype_q4k_matches_variant() {
         spatial_merge_size: None,
         is_deepstack_layers: None,
         projector_type: None,
+        has_audio_encoder: false,
+        audio_hidden_dim: None,
+        audio_block_count: None,
+        audio_embedding_length: None,
+        audio_num_mel_bins: None,
         shared_kv_layers: None,
         sliding_window_pattern: None,
         sliding_window: None,
@@ -487,6 +500,9 @@ fn test_weight_dtype_q4k_matches_variant() {
         is_gemma: false,
         ple_dim: None,
         embed_scale: None,
+        arch: "llama".to_string(),
+        chat_template: None,
+        eos_token_str: None,
     };
     assert!(matches!(meta.weight_dtype, WeightDtype::Q4_K));
     // Must NOT match F16
@@ -514,6 +530,11 @@ fn test_weight_dtype_f16_matches_variant() {
         spatial_merge_size: None,
         is_deepstack_layers: None,
         projector_type: None,
+        has_audio_encoder: false,
+        audio_hidden_dim: None,
+        audio_block_count: None,
+        audio_embedding_length: None,
+        audio_num_mel_bins: None,
         shared_kv_layers: None,
         sliding_window_pattern: None,
         sliding_window: None,
@@ -524,6 +545,9 @@ fn test_weight_dtype_f16_matches_variant() {
         is_gemma: false,
         ple_dim: None,
         embed_scale: None,
+        arch: "llama".to_string(),
+        chat_template: None,
+        eos_token_str: None,
     };
     assert!(matches!(meta.weight_dtype, WeightDtype::F16));
     assert!(!matches!(meta.weight_dtype, WeightDtype::Q8_0));

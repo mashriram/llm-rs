@@ -1,0 +1,2 @@
+/image /home/shri/Pictures/Screenshots/Screenshot from 2026-07-04 12-11-03.png describe this screenshot briefly
+/exit

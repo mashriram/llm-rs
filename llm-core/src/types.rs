@@ -11,6 +11,10 @@ pub type TokenId = u32;
 /// Valid range: 0..BlockPool::capacity(). u32 to keep block tables cache-friendly.
 pub type BlockId = u32;
 
+/// Convenience alias for the GGUF metadata map type used throughout the engine.
+pub type GgufMeta = std::collections::HashMap<String, candle_core::quantized::gguf_file::Value>;
+
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HiddenAct {
     SiLU,
@@ -45,6 +49,11 @@ pub struct ModelMeta {
     pub spatial_merge_size: Option<usize>,
     pub is_deepstack_layers: Option<Vec<bool>>,
     pub projector_type: Option<String>,
+    pub has_audio_encoder: bool,
+    pub audio_hidden_dim: Option<usize>,
+    pub audio_block_count: Option<usize>,
+    pub audio_embedding_length: Option<usize>,
+    pub audio_num_mel_bins: Option<usize>,
     pub shared_kv_layers: Option<usize>,
     pub sliding_window_pattern: Option<Vec<bool>>,
     pub sliding_window: Option<usize>,
@@ -55,6 +64,12 @@ pub struct ModelMeta {
     pub is_gemma: bool,
     pub ple_dim: Option<usize>,
     pub embed_scale: Option<f32>,
+    /// GGUF general.architecture value (e.g. "gemma4", "qwen3vl", "smollm3")
+    pub arch: String,
+    /// Raw Jinja2 chat template string from tokenizer.chat_template GGUF metadata
+    pub chat_template: Option<String>,
+    /// EOS token string (e.g. "<|im_end|>", "<end_of_turn>")
+    pub eos_token_str: Option<String>,
 }
 
 impl ModelMeta {
@@ -145,7 +160,8 @@ pub struct KvCacheConfig {
 pub enum KvDtype { 
     F16, 
     BF16, 
-    Q8 
+    Q8,
+    Q4,
 }
 
 /// A single request from the HTTP layer to the scheduler.

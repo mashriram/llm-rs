@@ -35,9 +35,13 @@ impl ExpertRouter {
             let sum_exp: f32 = exp_logits.iter().sum();
             let gates: Vec<f32> = exp_logits.iter().map(|&e| e / sum_exp).collect();
 
-            // Find top-k experts
+            // Find top-k experts. Use `total_cmp` instead of `partial_cmp().unwrap()`:
+            // if a router logit is ever NaN (e.g. from an unstable/misbehaving model),
+            // `partial_cmp` returns `None` and would panic here; `total_cmp` gives a
+            // well-defined total order for all f32 values, including NaN, so routing
+            // stays deterministic instead of crashing the whole batch.
             let mut indexed_gates: Vec<(usize, f32)> = gates.into_iter().enumerate().collect();
-            indexed_gates.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            indexed_gates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
             for k in 0..self.top_k.min(self.num_experts) {
                 let (expert_id, weight) = indexed_gates[k];

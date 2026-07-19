@@ -1,7 +1,8 @@
 use candle_core::quantized::gguf_file;
 
 fn main() -> anyhow::Result<()> {
-    let mut file = std::fs::File::open("/home/mukundan/learning/llm/gemma-4-E2B-it-Q4_K_M.gguf")?;
+    let path = std::env::args().nth(1).unwrap_or_else(|| "models/gemma-4-E2B-it-Q4_K_M.gguf".to_string());
+    let mut file = std::fs::File::open(&path)?;
     let model = gguf_file::Content::read(&mut file)?;
     
     let keys = [

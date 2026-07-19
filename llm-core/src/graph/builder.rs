@@ -13,22 +13,33 @@ pub fn build_graph(meta: &ModelMeta, group: &TensorGroupMap) -> ComputeGraph {
         output: "text_embeddings".to_string(),
     });
 
-    let mut current_hidden = if meta.has_vision_encoder {
-        // Run vision encoder if present
+    let mut current_hidden = "text_embeddings".to_string();
+
+    if meta.has_vision_encoder {
         graph.add_op(Operator::VisualEmbed {
             pixel_values: "pixel_values".to_string(),
             output: "visual_embeddings".to_string(),
         });
-        // Splice visual embeddings into text token embeddings at placeholder positions
         graph.add_op(Operator::SpliceTensors {
-            text_embeds: "text_embeddings".to_string(),
+            text_embeds: current_hidden.clone(),
             visual_embeds: "visual_embeddings".to_string(),
-            output: "spliced_embeddings".to_string(),
+            output: "spliced_visual_embeddings".to_string(),
         });
-        "spliced_embeddings".to_string()
-    } else {
-        "text_embeddings".to_string()
-    };
+        current_hidden = "spliced_visual_embeddings".to_string();
+    }
+
+    if meta.has_audio_encoder {
+        graph.add_op(Operator::AudioEmbed {
+            audio_values: "audio_values".to_string(),
+            output: "audio_embeddings".to_string(),
+        });
+        graph.add_op(Operator::SpliceAudioTensors {
+            text_embeds: current_hidden.clone(),
+            audio_embeds: "audio_embeddings".to_string(),
+            output: "spliced_audio_embeddings".to_string(),
+        });
+        current_hidden = "spliced_audio_embeddings".to_string();
+    }
 
     if let Some(scale) = meta.embed_scale {
         let scaled_out = format!("{}_scaled", current_hidden);
@@ -49,9 +60,12 @@ pub fn build_graph(meta: &ModelMeta, group: &TensorGroupMap) -> ComputeGraph {
         graph.add_op(Operator::PleInput {
             input_ids: "input_ids".to_string(),
             text_embeddings: current_hidden.clone(),
-            per_layer_token_embd: group.per_layer_token_embd.clone().unwrap(),
-            per_layer_model_proj: group.per_layer_model_proj.clone().unwrap(),
-            per_layer_proj_norm: group.per_layer_proj_norm.clone().unwrap(),
+            per_layer_token_embd: group.per_layer_token_embd.clone()
+                .expect("invariant: has_ple is true only when per_layer_token_embd is Some — see has_ple guard above"),
+            per_layer_model_proj: group.per_layer_model_proj.clone()
+                .expect("invariant: has_ple is true only when per_layer_model_proj is Some — see has_ple guard above"),
+            per_layer_proj_norm: group.per_layer_proj_norm.clone()
+                .expect("invariant: has_ple is true only when per_layer_proj_norm is Some — see has_ple guard above"),
             output: "per_layer_combined".to_string(),
         });
     }
@@ -401,8 +415,13 @@ pub fn build_graph(meta: &ModelMeta, group: &TensorGroupMap) -> ComputeGraph {
     });
 
     // 4. LM Head
+    // For tied embeddings, the lm_head uses the same matrix as embed_tokens but we register
+    // a separate "lm_head.weight" entry (CUDA QMatMul) to avoid CPU→GPU transfer every decode step.
+    // For non-tied models, use the explicit lm_head weight if present, else fall back to embed_weight.
     let lm_head_w = if meta.tie_word_embeddings {
-        embed_weight
+        // "lm_head.weight" is loaded onto CUDA as a QMatMul in candle.rs for tied-embedding models.
+        // If it doesn't exist (e.g. explicit_dequantize mode), fall back to embed_weight.
+        "lm_head.weight".to_string()
     } else {
         group.lm_head.clone().unwrap_or(embed_weight)
     };

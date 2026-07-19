@@ -15,6 +15,16 @@ pub struct VisionEncoder {
     pub is_deepstack_layers: Vec<bool>,
 }
 
+fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+    let s = x.sqr()?;
+    let sum = s.sum_keepdim(candle_core::D::Minus1)?;
+    let last_dim = x.dim(candle_core::D::Minus1)?;
+    let mean = (sum / (last_dim as f64))?;
+    let norm = (mean + eps)?.sqrt()?;
+    let x_normed = x.broadcast_div(&norm)?;
+    Ok(x_normed.broadcast_mul(weight)?)
+}
+
 impl VisionEncoder {
     pub fn load(path: &Path, device: &Device) -> Result<Self> {
         tracing::info!("Loading vision encoder mmproj / weights from {:?}", path);
@@ -26,7 +36,11 @@ impl VisionEncoder {
         let mut num_layers = 24;
         let mut num_heads = 16;
         let mut projection_dim = 2560;
-        let mut spatial_merge_size = 2;
+        // Known spatial_merge_size by family (verified against upstream configs):
+        //   Qwen2-VL family: 2
+        //   Gemma-4 vision (SigLIP-derived): 1
+        //   default when metadata absent: 1 (safe: produces MORE tokens than needed, never fewer)
+        let mut spatial_merge_size = 1;
         let mut is_deepstack_layers = vec![false; 24];
 
         let is_gguf = path.is_file() && path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_lowercase() == "gguf").unwrap_or(false);
@@ -39,8 +53,14 @@ impl VisionEncoder {
 
             let get_metadata_u32 = |key: &str| -> Option<u32> {
                 match model.metadata.get(key) {
+                    Some(candle_core::quantized::gguf_file::Value::U8(v)) => Some(*v as u32),
+                    Some(candle_core::quantized::gguf_file::Value::I8(v)) => Some(*v as u32),
+                    Some(candle_core::quantized::gguf_file::Value::U16(v)) => Some(*v as u32),
+                    Some(candle_core::quantized::gguf_file::Value::I16(v)) => Some(*v as u32),
                     Some(candle_core::quantized::gguf_file::Value::U32(v)) => Some(*v),
                     Some(candle_core::quantized::gguf_file::Value::I32(v)) => Some(*v as u32),
+                    Some(candle_core::quantized::gguf_file::Value::U64(v)) => Some(*v as u32),
+                    Some(candle_core::quantized::gguf_file::Value::I64(v)) => Some(*v as u32),
                     _ => None,
                 }
             };
@@ -64,12 +84,22 @@ impl VisionEncoder {
             };
 
             let cpu = Device::Cpu;
+            // Determine the working dtype: F32 on CPU for numerical accuracy,
+            // F16 on GPU for throughput. The vision encoder always computes on the
+            // target device, so we dequantize directly there.
+            let vision_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
             for name in model.tensor_infos.keys() {
+                // Skip quantization scale/min/max tensors (input_max, input_min, output_max, output_min)
+                // These are calibration tensors from quantized models, not actual weights.
+                let last_part = name.rsplit('.').next().unwrap_or("");
+                if matches!(last_part, "input_max" | "input_min" | "output_max" | "output_min") {
+                    continue;
+                }
                 let qtensor = model.tensor(&mut file, name, &cpu)
                     .context(format!("Failed to load mmproj tensor {}", name))?;
                 let tensor = qtensor.dequantize(&cpu)
                     .context(format!("Failed to dequantize mmproj tensor {}", name))?
-                    .to_dtype(DType::F16)?
+                    .to_dtype(vision_dtype)?
                     .to_device(device)?;
                 raw_weights.insert(name.clone(), tensor);
             }
@@ -89,8 +119,9 @@ impl VisionEncoder {
                 candle_core::safetensors::load(path, device)?
             };
 
+            let vision_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
             for (k, v) in loaded {
-                raw_weights.insert(k, v.to_dtype(DType::F16)?);
+                raw_weights.insert(k, v.to_dtype(vision_dtype)?);
             }
 
             // If config.json is present in the parent or same folder, parse it
@@ -142,7 +173,7 @@ impl VisionEncoder {
             .ok_or_else(|| anyhow!("vision.patch_embed.weight weight not found"))?;
         let patch_emb_b = self.weights.get("vision.patch_embed.bias");
 
-        let mut x = pixel_values.conv2d(patch_emb_w, self.patch_size, 0, 1, 1)?;
+        let mut x = pixel_values.conv2d(patch_emb_w, 0, self.patch_size, 1, 1)?;
 
         if let Some(bias) = patch_emb_b {
             let bias_reshaped = bias.reshape((1, self.hidden_dim, 1, 1))?;
@@ -154,16 +185,28 @@ impl VisionEncoder {
         let num_patches = h * w;
         x = x.reshape((b, c, num_patches))?.permute((0, 2, 1))?;
 
-        // 2. Add Positional Embedding (pos_embed.weight shape [num_patches, hidden_dim])
+        // 2. Add Positional Embedding (pos_embed.weight shape [num_patches, hidden_dim] or [2, 10240, hidden_dim])
         if let Some(pos_emb) = self.weights.get("vision.pos_embed.weight") {
-            // Some models include a class token in pos_embed length (e.g. 2305 vs 2304)
-            let pos_len = pos_emb.dim(0)?;
-            let pos_to_add = if pos_len > num_patches {
-                pos_emb.narrow(0, pos_len - num_patches, num_patches)?
+            let pos_shape = pos_emb.shape();
+            if pos_shape.dims().len() == 3 && pos_shape.dims()[0] == 2 {
+                // Factorized 2D position embedding lookup
+                let y_table = pos_emb.get(0)?.narrow(0, 0, h)?; // Shape [h, c]
+                let x_table = pos_emb.get(1)?.narrow(0, 0, w)?; // Shape [w, c]
+                let y_reshaped = y_table.reshape((h, 1, c))?;
+                let x_reshaped = x_table.reshape((1, w, c))?;
+                let grid_pos = y_reshaped.broadcast_add(&x_reshaped)?; // Shape [h, w, c]
+                let pos_to_add = grid_pos.reshape((1, num_patches, c))?;
+                x = x.broadcast_add(&pos_to_add)?;
             } else {
-                pos_emb.clone()
-            };
-            x = x.broadcast_add(&pos_to_add.reshape((1, num_patches, c))?)?;
+                // 1D learned absolute position embedding
+                let pos_len = pos_emb.dim(0)?;
+                let pos_to_add = if pos_len > num_patches {
+                    pos_emb.narrow(0, pos_len - num_patches, num_patches)?
+                } else {
+                    pos_emb.clone()
+                };
+                x = x.broadcast_add(&pos_to_add.reshape((1, num_patches, c))?)?;
+            }
         }
 
         // Fuyu/Unified Bypass: if num_layers is 0, we bypass the trunk entirely and project directly!
@@ -171,7 +214,7 @@ impl VisionEncoder {
             // Direct projection
             if let Some(mm_0_w) = self.weights.get("projector.0.weight") {
                 let mm_0_b = self.weights.get("projector.0.bias");
-                x = x.matmul(&mm_0_w.t()?)?;
+                x = matmul_3d_2d(&x, &mm_0_w.t()?)?;
                 if let Some(b) = mm_0_b {
                     x = x.broadcast_add(b)?;
                 }
@@ -183,64 +226,117 @@ impl VisionEncoder {
         let mut deepstack_outputs = Vec::new();
         let head_dim = self.hidden_dim / self.num_heads;
         let scale = 1.0 / (head_dim as f64).sqrt();
+        // Determine working dtype from the patch embedding weight
+        let work_dtype = patch_emb_w.dtype();
 
         for i in 0..self.num_layers {
             // LayerNorm 1
             let ln1_w = self.weights.get(&format!("vision.layers.{}.ln1.weight", i))
                 .ok_or_else(|| anyhow!("vision.layers.{}.ln1.weight not found", i))?;
-            let ln1_b = self.weights.get(&format!("vision.layers.{}.ln1.bias", i))
-                .ok_or_else(|| anyhow!("vision.layers.{}.ln1.bias not found", i))?;
-            let x_ln1 = candle_nn::ops::layer_norm(&x, ln1_w, ln1_b, 1e-6)?;
+            let ln1_b = self.weights.get(&format!("vision.layers.{}.ln1.bias", i));
+            let x_ln1 = if let Some(bias) = ln1_b {
+                candle_nn::ops::layer_norm(&x, ln1_w, bias, 1e-6)?
+            } else {
+                rms_norm(&x, ln1_w, 1e-6)?
+            };
 
             // Self Attention QKV
             let qkv_w = self.weights.get(&format!("vision.layers.{}.attn_qkv.weight", i))
                 .ok_or_else(|| anyhow!("vision.layers.{}.attn_qkv.weight not found", i))?;
-            let qkv_b = self.weights.get(&format!("vision.layers.{}.attn_qkv.bias", i))
-                .ok_or_else(|| anyhow!("vision.layers.{}.attn_qkv.bias not found", i))?;
+            let qkv_b = self.weights.get(&format!("vision.layers.{}.attn_qkv.bias", i));
 
-            let qkv = x_ln1.matmul(&qkv_w.t()?)?.broadcast_add(qkv_b)?;
+            let mut qkv = matmul_3d_2d(&x_ln1, &qkv_w.t()?)?;
+            if let Some(bias) = qkv_b {
+                qkv = qkv.broadcast_add(bias)?;
+            }
             let qkv_chunks = qkv.chunk(3, 2)?;
-            let q = qkv_chunks[0].reshape((1, num_patches, self.num_heads, head_dim))?.permute((0, 2, 1, 3))?;
-            let k = qkv_chunks[1].reshape((1, num_patches, self.num_heads, head_dim))?.permute((0, 2, 1, 3))?;
+            let mut q = qkv_chunks[0].reshape((1, num_patches, self.num_heads, head_dim))?.permute((0, 2, 1, 3))?;
+            let mut k = qkv_chunks[1].reshape((1, num_patches, self.num_heads, head_dim))?.permute((0, 2, 1, 3))?;
             let v = qkv_chunks[2].reshape((1, num_patches, self.num_heads, head_dim))?.permute((0, 2, 1, 3))?;
 
-            let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-            let attn_probs = candle_nn::ops::softmax(&attn_weights, candle_core::D::Minus1)?;
-            let attn_out = attn_probs.matmul(&v)?;
+            // QK-Norm
+            let q_norm_w = self.weights.get(&format!("vision.layers.{}.attn_q_norm.weight", i));
+            let k_norm_w = self.weights.get(&format!("vision.layers.{}.attn_k_norm.weight", i));
+            if let (Some(qw), Some(kw)) = (q_norm_w, k_norm_w) {
+                q = rms_norm(&q, qw, 1e-6)?;
+                k = rms_norm(&k, kw, 1e-6)?;
+            }
 
-            let attn_out = attn_out.permute((0, 2, 1, 3))?.reshape((1, num_patches, self.hidden_dim))?;
+            let attn_weights = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
+            let attn_probs = candle_nn::ops::softmax(&attn_weights, candle_core::D::Minus1)?;
+            let attn_out = attn_probs.matmul(&v.contiguous()?)?;
+
+            let attn_out = attn_out.permute((0, 2, 1, 3))?.contiguous()?.reshape((1, num_patches, self.hidden_dim))?;
 
             // Output projection
             let out_w = self.weights.get(&format!("vision.layers.{}.attn_out.weight", i))
                 .ok_or_else(|| anyhow!("vision.layers.{}.attn_out.weight not found", i))?;
-            let out_b = self.weights.get(&format!("vision.layers.{}.attn_out.bias", i))
-                .ok_or_else(|| anyhow!("vision.layers.{}.attn_out.bias not found", i))?;
-            let attn_out = attn_out.matmul(&out_w.t()?)?.broadcast_add(out_b)?;
+            let out_b = self.weights.get(&format!("vision.layers.{}.attn_out.bias", i));
+            let mut attn_out_proj = matmul_3d_2d(&attn_out, &out_w.t()?)?.to_dtype(work_dtype)?;
+            if let Some(bias) = out_b {
+                attn_out_proj = attn_out_proj.broadcast_add(&bias.to_dtype(work_dtype)?)?;
+            }
 
-            x = (x + attn_out)?;
+            // Apply post-attention norm if present (Gemma-4 style)
+            if let Some(post_norm_w) = self.weights.get(&format!("vision.layers.{}.attn_post_norm.weight", i)) {
+                attn_out_proj = rms_norm(&attn_out_proj, &post_norm_w.to_dtype(work_dtype)?, 1e-6)?;
+            }
+
+            x = (x.to_dtype(work_dtype)? + attn_out_proj)?;
 
             // LayerNorm 2
             let ln2_w = self.weights.get(&format!("vision.layers.{}.ln2.weight", i))
                 .ok_or_else(|| anyhow!("vision.layers.{}.ln2.weight not found", i))?;
-            let ln2_b = self.weights.get(&format!("vision.layers.{}.ln2.bias", i))
-                .ok_or_else(|| anyhow!("vision.layers.{}.ln2.bias not found", i))?;
-            let x_ln2 = candle_nn::ops::layer_norm(&x, ln2_w, ln2_b, 1e-6)?;
+            let ln2_b = self.weights.get(&format!("vision.layers.{}.ln2.bias", i));
+            let x_ln2 = if let Some(bias) = ln2_b {
+                candle_nn::ops::layer_norm(&x, ln2_w, bias, 1e-6)?
+            } else {
+                rms_norm(&x, ln2_w, 1e-6)?
+            };
 
-            // MLP
+            // MLP (Gated GeGLU or Standard)
             let ffn_up_w = self.weights.get(&format!("vision.layers.{}.ffn_up.weight", i))
                 .ok_or_else(|| anyhow!("vision.layers.{}.ffn_up.weight not found", i))?;
-            let ffn_up_b = self.weights.get(&format!("vision.layers.{}.ffn_up.bias", i))
-                .ok_or_else(|| anyhow!("vision.layers.{}.ffn_up.bias not found", i))?;
+            let ffn_up_b = self.weights.get(&format!("vision.layers.{}.ffn_up.bias", i));
             let ffn_down_w = self.weights.get(&format!("vision.layers.{}.ffn_down.weight", i))
                 .ok_or_else(|| anyhow!("vision.layers.{}.ffn_down.weight not found", i))?;
-            let ffn_down_b = self.weights.get(&format!("vision.layers.{}.ffn_down.bias", i))
-                .ok_or_else(|| anyhow!("vision.layers.{}.ffn_down.bias not found", i))?;
+            let ffn_down_b = self.weights.get(&format!("vision.layers.{}.ffn_down.bias", i));
 
-            let mlp = x_ln2.matmul(&ffn_up_w.t()?)?.broadcast_add(ffn_up_b)?;
-            let mlp = mlp.gelu()?;
-            let mlp = mlp.matmul(&ffn_down_w.t()?)?.broadcast_add(ffn_down_b)?;
+            let ffn_gate_w = self.weights.get(&format!("vision.layers.{}.ffn_gate.weight", i));
+            let ffn_gate_b = self.weights.get(&format!("vision.layers.{}.ffn_gate.bias", i));
 
-            x = (x + mlp)?;
+            let mlp = if let Some(gate_w) = ffn_gate_w {
+                // Gated MLP (GeGLU)
+                let mut up = matmul_3d_2d(&x_ln2, &ffn_up_w.t()?)?;
+                if let Some(bias) = ffn_up_b {
+                    up = up.broadcast_add(bias)?;
+                }
+                let mut gate = matmul_3d_2d(&x_ln2, &gate_w.t()?)?;
+                if let Some(bias) = ffn_gate_b {
+                    gate = gate.broadcast_add(bias)?;
+                }
+                let gate_act = gate.gelu()?;
+                (gate_act * up)?
+            } else {
+                // Standard MLP
+                let mut up = matmul_3d_2d(&x_ln2, &ffn_up_w.t()?)?;
+                if let Some(bias) = ffn_up_b {
+                    up = up.broadcast_add(bias)?;
+                }
+                up.gelu()?
+            };
+
+            let mut mlp_out = matmul_3d_2d(&mlp, &ffn_down_w.t()?)?.to_dtype(work_dtype)?;
+            if let Some(bias) = ffn_down_b {
+                mlp_out = mlp_out.broadcast_add(&bias.to_dtype(work_dtype)?)?;
+            }
+
+            // Apply post-FFN norm if present (Gemma-4 style)
+            if let Some(post_norm_w) = self.weights.get(&format!("vision.layers.{}.ffn_post_norm.weight", i)) {
+                mlp_out = rms_norm(&mlp_out, &post_norm_w.to_dtype(work_dtype)?, 1e-6)?;
+            }
+
+            x = (x.to_dtype(work_dtype)? + mlp_out)?;
 
             // DeepStack integration
             if self.is_deepstack_layers.get(i).copied().unwrap_or(false) {
@@ -248,49 +344,68 @@ impl VisionEncoder {
                 
                 let ds_norm_w = self.weights.get(&format!("deepstack.{}.norm.weight", i))
                     .ok_or_else(|| anyhow!("deepstack.{}.norm.weight not found", i))?;
-                let ds_norm_b = self.weights.get(&format!("deepstack.{}.norm.bias", i))
-                    .ok_or_else(|| anyhow!("deepstack.{}.norm.bias not found", i))?;
+                let ds_norm_b = self.weights.get(&format!("deepstack.{}.norm.bias", i));
                 let ds_fc1_w = self.weights.get(&format!("deepstack.{}.fc1.weight", i))
                     .ok_or_else(|| anyhow!("deepstack.{}.fc1.weight not found", i))?;
-                let ds_fc1_b = self.weights.get(&format!("deepstack.{}.fc1.bias", i))
-                    .ok_or_else(|| anyhow!("deepstack.{}.fc1.bias not found", i))?;
+                let ds_fc1_b = self.weights.get(&format!("deepstack.{}.fc1.bias", i));
                 let ds_fc2_w = self.weights.get(&format!("deepstack.{}.fc2.weight", i))
                     .ok_or_else(|| anyhow!("deepstack.{}.fc2.weight not found", i))?;
-                let ds_fc2_b = self.weights.get(&format!("deepstack.{}.fc2.bias", i))
-                    .ok_or_else(|| anyhow!("deepstack.{}.fc2.bias not found", i))?;
+                let ds_fc2_b = self.weights.get(&format!("deepstack.{}.fc2.bias", i));
 
-                let ds_x = candle_nn::ops::layer_norm(&merged, ds_norm_w, ds_norm_b, 1e-6)?;
-                let ds_x = ds_x.matmul(&ds_fc1_w.t()?)?.broadcast_add(ds_fc1_b)?;
-                let ds_x = ds_x.gelu()?;
-                let ds_x = ds_x.matmul(&ds_fc2_w.t()?)?.broadcast_add(ds_fc2_b)?;
+                let ds_norm = if let Some(bias) = ds_norm_b {
+                    candle_nn::ops::layer_norm(&merged, ds_norm_w, bias, 1e-6)?
+                } else {
+                    rms_norm(&merged, ds_norm_w, 1e-6)?
+                };
 
-                deepstack_outputs.push(ds_x);
+                let mut ds_fc1 = matmul_3d_2d(&ds_norm, &ds_fc1_w.t()?)?;
+                if let Some(bias) = ds_fc1_b {
+                    ds_fc1 = ds_fc1.broadcast_add(bias)?;
+                }
+                let ds_fc1 = ds_fc1.gelu()?;
+
+                let mut ds_fc2 = matmul_3d_2d(&ds_fc1, &ds_fc2_w.t()?)?;
+                if let Some(bias) = ds_fc2_b {
+                    ds_fc2 = ds_fc2.broadcast_add(bias)?;
+                }
+
+                deepstack_outputs.push(ds_fc2);
             }
         }
 
         // 4. Post LN & Projector
-        let post_ln_w = self.weights.get("vision.post_ln.weight")
-            .ok_or_else(|| anyhow!("vision.post_ln.weight not found"))?;
-        let post_ln_b = self.weights.get("vision.post_ln.bias")
-            .ok_or_else(|| anyhow!("vision.post_ln.bias not found"))?;
-        let x_ln = candle_nn::ops::layer_norm(&x, post_ln_w, post_ln_b, 1e-6)?;
+        let x_ln = if let Some(post_ln_w) = self.weights.get("vision.post_ln.weight") {
+            let post_ln_b = self.weights.get("vision.post_ln.bias");
+            if let Some(bias) = post_ln_b {
+                candle_nn::ops::layer_norm(&x, post_ln_w, bias, 1e-6)?
+            } else {
+                rms_norm(&x, post_ln_w, 1e-6)?
+            }
+        } else {
+            x.clone()
+        };
 
         // Spatial Merge final output
         let merged = spatial_merge(&x_ln, self.spatial_merge_size)?;
 
-        // Main Projector
+        // Main Projector (supports both 1-layer and 2-layer MLP projectors)
         let mm_0_w = self.weights.get("projector.0.weight")
             .ok_or_else(|| anyhow!("projector.0.weight not found"))?;
-        let mm_0_b = self.weights.get("projector.0.bias")
-            .ok_or_else(|| anyhow!("projector.0.bias not found"))?;
-        let mm_2_w = self.weights.get("projector.2.weight")
-            .ok_or_else(|| anyhow!("projector.2.weight not found"))?;
-        let mm_2_b = self.weights.get("projector.2.bias")
-            .ok_or_else(|| anyhow!("projector.2.bias not found"))?;
-
-        let proj = merged.matmul(&mm_0_w.t()?)?.broadcast_add(mm_0_b)?;
-        let proj = proj.gelu()?;
-        let proj = proj.matmul(&mm_2_w.t()?)?.broadcast_add(mm_2_b)?;
+        let mm_0_b = self.weights.get("projector.0.bias");
+ 
+        let mut proj = matmul_3d_2d(&merged, &mm_0_w.t()?)?;
+        if let Some(b) = mm_0_b {
+            proj = proj.broadcast_add(b)?;
+        }
+ 
+        if let Some(mm_2_w) = self.weights.get("projector.2.weight") {
+            let mm_2_b = self.weights.get("projector.2.bias");
+            proj = proj.gelu()?;
+            proj = matmul_3d_2d(&proj, &mm_2_w.t()?)?;
+            if let Some(b) = mm_2_b {
+                proj = proj.broadcast_add(b)?;
+            }
+        }
 
         if !deepstack_outputs.is_empty() {
             let mut all_tensors = vec![proj];
@@ -339,23 +454,34 @@ fn normalize_vision_tensors(
                 normalized.insert("vision.post_ln.weight".to_string(), v);
             } else if k == "v.post_ln.bias" {
                 normalized.insert("vision.post_ln.bias".to_string(), v);
-            } else if k == "mm.0.weight" {
+            } else if k == "mm.input_projection.weight" || k == "mm.0.weight" {
                 normalized.insert("projector.0.weight".to_string(), v);
-            } else if k == "mm.0.bias" {
+            } else if k == "mm.input_projection.bias" || k == "mm.0.bias" {
                 normalized.insert("projector.0.bias".to_string(), v);
             } else if k == "mm.2.weight" {
                 normalized.insert("projector.2.weight".to_string(), v);
             } else if k == "mm.2.bias" {
                 normalized.insert("projector.2.bias".to_string(), v);
             } else if k.starts_with("v.blk.") {
-                // e.g. v.blk.0.ln1.weight
+                // e.g. v.blk.0.ln1.weight  OR  v.blk.0.attn_post_norm.weight
                 let parts: Vec<&str> = k.split('.').collect();
+                // Skip quantization calibration tensors (e.g. v.blk.0.attn_k.input_max)
+                let last = parts.last().copied().unwrap_or("");
+                if matches!(last, "input_max" | "input_min" | "output_max" | "output_min") {
+                    continue;
+                }
                 if parts.len() >= 5 {
-                    let layer: usize = parts[2].parse()?;
-                    let component = parts[3];
-                    let param = parts[4];
-                    let norm_key = format!("vision.layers.{}.{}.{}", layer, component, param);
-                    normalized.insert(norm_key, v);
+                    let layer_opt = parts[2].parse::<usize>();
+                    if let Ok(layer) = layer_opt {
+                        let component = parts[3];
+                        let param = parts[4];
+                        // Skip relative position bias (not used in our forward pass)
+                        if component.ends_with("_rel") {
+                            continue;
+                        }
+                        let norm_key = format!("vision.layers.{}.{}.{}", layer, component, param);
+                        normalized.insert(norm_key, v);
+                    }
                 }
             } else if k.starts_with("v.deepstack.") {
                 // e.g. v.deepstack.5.norm.weight
@@ -441,28 +567,94 @@ fn normalize_vision_tensors(
             }
         }
 
-        // Concatenate separate Q, K, V projections into a unified attn_qkv tensor
-        for layer_idx in 0..num_layers {
-            if let (Some(q), Some(k), Some(v)) = (q_weights.remove(&layer_idx), k_weights.remove(&layer_idx), v_weights.remove(&layer_idx)) {
-                let qkv = Tensor::cat(&[&q, &k, &v], 0)?;
-                normalized.insert(format!("vision.layers.{}.attn_qkv.weight", layer_idx), qkv);
-            }
-            let q_b = q_biases.remove(&layer_idx);
-            let k_b = k_biases.remove(&layer_idx);
-            let v_b = v_biases.remove(&layer_idx);
-            if q_b.is_some() || k_b.is_some() || v_b.is_some() {
-                let q_b = q_b.unwrap_or(Tensor::zeros(1, DType::F16, device)?);
-                let k_b = k_b.unwrap_or(Tensor::zeros(1, DType::F16, device)?);
-                let v_b = v_b.unwrap_or(Tensor::zeros(1, DType::F16, device)?);
-                let qkv_b = Tensor::cat(&[&q_b, &k_b, &v_b], 0)?;
-                normalized.insert(format!("vision.layers.{}.attn_qkv.bias", layer_idx), qkv_b);
-            } else {
-                // If there are no biases, insert a zero bias tensor of correct length
-                if let Some(qkv_w) = normalized.get(&format!("vision.layers.{}.attn_qkv.weight", layer_idx)) {
-                    let out_dim = qkv_w.dim(0)?;
-                    let zeros = Tensor::zeros(out_dim, DType::F16, device)?;
-                    normalized.insert(format!("vision.layers.{}.attn_qkv.bias", layer_idx), zeros);
+        // Insert grouped projections back for processing
+        for (layer_idx, v) in q_weights {
+            normalized.insert(format!("vision.layers.{}.attn_q.weight", layer_idx), v);
+        }
+        for (layer_idx, v) in k_weights {
+            normalized.insert(format!("vision.layers.{}.attn_k.weight", layer_idx), v);
+        }
+        for (layer_idx, v) in v_weights {
+            normalized.insert(format!("vision.layers.{}.attn_v.weight", layer_idx), v);
+        }
+        for (layer_idx, v) in q_biases {
+            normalized.insert(format!("vision.layers.{}.attn_q.bias", layer_idx), v);
+        }
+        for (layer_idx, v) in k_biases {
+            normalized.insert(format!("vision.layers.{}.attn_k.bias", layer_idx), v);
+        }
+        for (layer_idx, v) in v_biases {
+            normalized.insert(format!("vision.layers.{}.attn_v.bias", layer_idx), v);
+        }
+    }
+
+    // Shared post-processing to group and concatenate separate Q, K, V projections
+    let mut q_weights = HashMap::new();
+    let mut k_weights = HashMap::new();
+    let mut v_weights = HashMap::new();
+    let mut q_biases = HashMap::new();
+    let mut k_biases = HashMap::new();
+    let mut v_biases = HashMap::new();
+
+    let keys: Vec<String> = normalized.keys().cloned().collect();
+    for k in keys {
+        if k.starts_with("vision.layers.") {
+            let parts: Vec<&str> = k.split('.').collect();
+            if parts.len() >= 5 {
+                if let Ok(layer_idx) = parts[2].parse::<usize>() {
+                    let component = parts[3];
+                    let param = parts[4];
+                    if component == "attn_q" && param == "weight" {
+                        if let Some(v) = normalized.remove(&k) {
+                            q_weights.insert(layer_idx, v);
+                        }
+                    } else if component == "attn_k" && param == "weight" {
+                        if let Some(v) = normalized.remove(&k) {
+                            k_weights.insert(layer_idx, v);
+                        }
+                    } else if component == "attn_v" && param == "weight" {
+                        if let Some(v) = normalized.remove(&k) {
+                            v_weights.insert(layer_idx, v);
+                        }
+                    } else if component == "attn_q" && param == "bias" {
+                        if let Some(v) = normalized.remove(&k) {
+                            q_biases.insert(layer_idx, v);
+                        }
+                    } else if component == "attn_k" && param == "bias" {
+                        if let Some(v) = normalized.remove(&k) {
+                            k_biases.insert(layer_idx, v);
+                        }
+                    } else if component == "attn_v" && param == "bias" {
+                        if let Some(v) = normalized.remove(&k) {
+                            v_biases.insert(layer_idx, v);
+                        }
+                    }
                 }
+            }
+        }
+    }
+
+    let vision_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
+    for layer_idx in 0..num_layers {
+        if let (Some(q), Some(k), Some(v)) = (q_weights.remove(&layer_idx), k_weights.remove(&layer_idx), v_weights.remove(&layer_idx)) {
+            let qkv = Tensor::cat(&[&q, &k, &v], 0)?;
+            normalized.insert(format!("vision.layers.{}.attn_qkv.weight", layer_idx), qkv);
+        }
+        let q_b = q_biases.remove(&layer_idx);
+        let k_b = k_biases.remove(&layer_idx);
+        let v_b = v_biases.remove(&layer_idx);
+        if q_b.is_some() || k_b.is_some() || v_b.is_some() {
+            let q_b = q_b.unwrap_or(Tensor::zeros(1, vision_dtype, device)?);
+            let k_b = k_b.unwrap_or(Tensor::zeros(1, vision_dtype, device)?);
+            let v_b = v_b.unwrap_or(Tensor::zeros(1, vision_dtype, device)?);
+            let qkv_b = Tensor::cat(&[&q_b, &k_b, &v_b], 0)?;
+            normalized.insert(format!("vision.layers.{}.attn_qkv.bias", layer_idx), qkv_b);
+        } else {
+            // Generate zero bias if the weight was successfully created/found
+            if let Some(qkv_w) = normalized.get(&format!("vision.layers.{}.attn_qkv.weight", layer_idx)) {
+                let out_dim = qkv_w.dim(0)?;
+                let zeros = Tensor::zeros(out_dim, vision_dtype, device)?;
+                normalized.insert(format!("vision.layers.{}.attn_qkv.bias", layer_idx), zeros);
             }
         }
     }
@@ -494,3 +686,8 @@ pub fn load_image(path: &Path, image_size: usize, device: &Device) -> Result<Ten
     let t = Tensor::from_vec(data, (1, 3, image_size, image_size), device)?;
     Ok(t)
 }
+
+fn matmul_3d_2d(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
+    Ok(lhs.contiguous()?.matmul(&rhs.unsqueeze(0)?.contiguous()?)?)
+}
+

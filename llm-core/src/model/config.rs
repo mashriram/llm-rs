@@ -34,8 +34,11 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
 
     let rms_norm_eps = val.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-5) as f32;
     let tie_word_embeddings = val.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Matches candle.rs's GGUF-metadata activation detection: substring match
+    // so variants like "gelu_new"/"gelu_pytorch_tanh" still resolve to GeLU
+    // rather than silently falling through to SiLU.
     let hidden_act = match val.get("hidden_act").and_then(|v| v.as_str()) {
-        Some("gelu") => HiddenAct::GeLU,
+        Some(s) if s.contains("gelu") => HiddenAct::GeLU,
         _ => HiddenAct::SiLU,
     };
 
@@ -154,6 +157,11 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
         spatial_merge_size,
         is_deepstack_layers,
         projector_type,
+        has_audio_encoder: false,
+        audio_hidden_dim: None,
+        audio_block_count: None,
+        audio_embedding_length: None,
+        audio_num_mel_bins: None,
         shared_kv_layers: None,
         sliding_window_pattern: None,
         sliding_window: None,
@@ -164,5 +172,8 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
         is_gemma,
         ple_dim,
         embed_scale,
+        arch: model_type.to_string(),
+        chat_template: None,  // Will be populated from tokenizer_config.json in candle.rs
+        eos_token_str: if is_gemma { Some("<end_of_turn>".to_string()) } else { None },
     })
 }

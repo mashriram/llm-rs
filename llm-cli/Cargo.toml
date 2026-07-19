@@ -18,6 +18,9 @@ anyhow = { workspace = true }
 rand = { workspace = true }
 candle-core = { workspace = true }
 tokenizers = { workspace = true }
+image = { workspace = true }
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
@@ -25,3 +28,4 @@ http = { workspace = true }
 
 [features]
 cuda = ["llm-core/cuda"]
+metal = ["llm-core/metal"]

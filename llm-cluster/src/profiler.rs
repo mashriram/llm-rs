@@ -13,30 +13,30 @@ pub struct NodeCapability {
 /// Profile the local node's resources (CPU GFLOPS and memory).
 pub fn profile_node() -> Result<NodeCapability> {
     // 1. Get memory stats
-    let mut sys = System::new_all();
-    sys.refresh_all();
+    let mut sys = System::new();
+    sys.refresh_memory();
     
     let total_memory_gb = sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
     let available_memory_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
 
     // 2. Estimate CPU GFLOPS via a dummy matrix multiplication benchmark
-    let n = 256;
-    let mut a = vec![1.0f32; n * n];
-    let mut b = vec![2.0f32; n * n];
+    let n = 128;
+    let a = vec![1.0f32; n * n];
+    let b = vec![2.0f32; n * n];
     let mut c = vec![0.0f32; n * n];
 
     let start = Instant::now();
     
-    // Perform 50 iterations of GEMM (2 * N^3 operations per GEMM)
-    let iterations = 50;
+    // Perform 10 iterations of GEMM (2 * N^3 operations per GEMM)
+    let iterations = 10;
     for _ in 0..iterations {
+        c.fill(0.0);
         for i in 0..n {
-            for j in 0..n {
-                let mut sum = 0.0;
-                for k in 0..n {
-                    sum += a[i * n + k] * b[k * n + j];
+            for k in 0..n {
+                let a_val = a[i * n + k];
+                for j in 0..n {
+                    c[i * n + j] += a_val * b[k * n + j];
                 }
-                c[i * n + j] = sum;
             }
         }
     }

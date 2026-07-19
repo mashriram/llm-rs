@@ -54,6 +54,11 @@ fn test_loader_parity() {
         spatial_merge_size: None,
         is_deepstack_layers: None,
         projector_type: None,
+        has_audio_encoder: false,
+        audio_hidden_dim: None,
+        audio_block_count: None,
+        audio_embedding_length: None,
+        audio_num_mel_bins: None,
         shared_kv_layers: None,
         sliding_window_pattern: None,
         sliding_window: None,
@@ -64,6 +69,9 @@ fn test_loader_parity() {
         is_gemma: false,
         ple_dim: None,
         embed_scale: None,
+        arch: "llama".to_string(),
+        chat_template: None,
+        eos_token_str: None,
     };
 
     assert_eq!(meta.vocab_size, 32000);
@@ -159,3 +167,32 @@ fn test_conversation_template_parity() {
     assert_eq!(conv.name, "llama-2");
     assert_eq!(conv.system_message, "You are a helpful assistant.");
 }
+
+#[test]
+fn test_audio_keys() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let path = std::path::Path::new(&manifest_dir).join("../models/google_gemma-4-E2B-it-mmproj-BF16.gguf");
+    if path.exists() {
+        let mut file = std::fs::File::open(&path).unwrap();
+        let model = candle_core::quantized::gguf_file::Content::read(&mut file).unwrap();
+        let mut output = String::new();
+        output.push_str("Metadata:\n");
+        for (k, v) in &model.metadata {
+            if k.contains("audio") {
+                output.push_str(&format!("  {}: {:?}\n", k, v));
+            }
+        }
+        output.push_str("Tensors:\n");
+        for (k, v) in &model.tensor_infos {
+            if k.starts_with("a.") {
+                output.push_str(&format!("  {}: {:?}\n", k, v.shape));
+            }
+        }
+        let scratch_dir = std::path::Path::new(&manifest_dir).join("../scratch");
+        let _ = std::fs::create_dir_all(&scratch_dir);
+        std::fs::write(scratch_dir.join("audio_names.txt"), output).unwrap();
+    } else {
+        println!("Model path does not exist, skipping test");
+    }
+}
+

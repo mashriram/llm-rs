@@ -56,6 +56,11 @@ impl DummyBackend {
                 spatial_merge_size: None,
                 is_deepstack_layers: None,
                 projector_type: None,
+                has_audio_encoder: false,
+                audio_hidden_dim: None,
+                audio_block_count: None,
+                audio_embedding_length: None,
+                audio_num_mel_bins: None,
                 shared_kv_layers: None,
                 sliding_window_pattern: None,
                 sliding_window: None,
@@ -66,6 +71,9 @@ impl DummyBackend {
                 is_gemma: false,
                 ple_dim: None,
                 embed_scale: None,
+                arch: "dummy".to_string(),
+                chat_template: None,
+                eos_token_str: None,
             }
         }
     }
@@ -280,6 +288,11 @@ fn test_graph_builder_softcap() {
         spatial_merge_size: None,
         is_deepstack_layers: None,
         projector_type: None,
+        has_audio_encoder: false,
+        audio_hidden_dim: None,
+        audio_block_count: None,
+        audio_embedding_length: None,
+        audio_num_mel_bins: None,
         shared_kv_layers: None,
         sliding_window_pattern: None,
         sliding_window: None,
@@ -290,6 +303,9 @@ fn test_graph_builder_softcap() {
         is_gemma: false,
         ple_dim: None,
         embed_scale: None,
+        arch: "llama".to_string(),
+        chat_template: None,
+        eos_token_str: None,
     };
 
     let group = TensorGroupMap {
@@ -358,6 +374,11 @@ fn test_graph_builder_gemma4_ple() {
         spatial_merge_size: None,
         is_deepstack_layers: None,
         projector_type: None,
+        has_audio_encoder: false,
+        audio_hidden_dim: None,
+        audio_block_count: None,
+        audio_embedding_length: None,
+        audio_num_mel_bins: None,
         shared_kv_layers: None,
         sliding_window_pattern: None,
         sliding_window: None,
@@ -368,6 +389,9 @@ fn test_graph_builder_gemma4_ple() {
         is_gemma: true,
         ple_dim: Some(256),
         embed_scale: Some(39.191835),
+        arch: "gemma4".to_string(),
+        chat_template: None,
+        eos_token_str: None,
     };
 
     let layers = vec![
@@ -503,6 +527,7 @@ fn test_nn_module_paged_kv_cache() {
         KvDtype::F16 => 2,
         KvDtype::BF16 => 2,
         KvDtype::Q8 => 1,
+        KvDtype::Q4 => 1,
     };
     let size_bytes = config.block_size * config.head_dim * config.n_kv_heads * config.n_layers * 2 * bytes_per_element;
     assert_eq!(size_bytes, 16 * 128 * 8 * 32 * 2 * 2);
@@ -535,6 +560,11 @@ fn test_llama2_group_quantization() {
         spatial_merge_size: None,
         is_deepstack_layers: None,
         projector_type: None,
+        has_audio_encoder: false,
+        audio_hidden_dim: None,
+        audio_block_count: None,
+        audio_embedding_length: None,
+        audio_num_mel_bins: None,
         shared_kv_layers: None,
         sliding_window_pattern: None,
         sliding_window: None,
@@ -545,6 +575,9 @@ fn test_llama2_group_quantization() {
         is_gemma: false,
         ple_dim: None,
         embed_scale: None,
+        arch: "llama".to_string(),
+        chat_template: None,
+        eos_token_str: None,
     };
     assert!(matches!(meta.weight_dtype, WeightDtype::Q4_K));
 }
@@ -576,6 +609,11 @@ fn test_llama2_no_quantization() {
         spatial_merge_size: None,
         is_deepstack_layers: None,
         projector_type: None,
+        has_audio_encoder: false,
+        audio_hidden_dim: None,
+        audio_block_count: None,
+        audio_embedding_length: None,
+        audio_num_mel_bins: None,
         shared_kv_layers: None,
         sliding_window_pattern: None,
         sliding_window: None,
@@ -586,6 +624,9 @@ fn test_llama2_no_quantization() {
         is_gemma: false,
         ple_dim: None,
         embed_scale: None,
+        arch: "llama".to_string(),
+        chat_template: None,
+        eos_token_str: None,
     };
     assert!(matches!(meta.weight_dtype, WeightDtype::F16));
 }
