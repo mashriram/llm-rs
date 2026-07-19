@@ -138,7 +138,8 @@ pub unsafe extern "C" fn poll_token(engine: *mut c_void, seq_id: u64) -> Generat
     while let Ok(event) = context.token_rx.recv() {
         if event.seq_id == seq_id {
             let ch = std::char::from_u32(event.token_id).unwrap_or(' ');
-            let c_string = CString::new(ch.to_string()).unwrap();
+            let s = if ch == '\0' { "".to_string() } else { ch.to_string() };
+            let c_string = CString::new(s).unwrap_or_else(|_| CString::new(" ").unwrap());
             return GenerationResult {
                 token: event.token_id,
                 text: c_string.into_raw(),

@@ -246,7 +246,7 @@ impl LlmBackend for CandleBackend {
         match self.device {
             Device::Cpu => "candle-cpu",
             Device::Cuda(_) => "candle-cuda",
-            _ => "candle-unknown",
+            Device::Metal(_) => "candle-metal",
         }
     }
 
@@ -281,41 +281,61 @@ impl LlmBackend for CandleBackend {
     fn load_weights(&mut self, path: &Path) -> Result<ModelMeta> {
         let is_gguf = path.is_file() && path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_lowercase() == "gguf").unwrap_or(false);
 
-        // Auto-detect hardware accelerator: CUDA first, then Metal, falling back to CPU
-        let dev = if candle_core::utils::cuda_is_available() {
-            Device::new_cuda(0).unwrap_or_else(|e| {
-                tracing::warn!("CUDA init failed ({e}), falling back to CPU");
-                Device::Cpu
-            })
-        } else if let Ok(metal_dev) = Device::new_metal(0) {
-            metal_dev
-        } else {
-            Device::Cpu
+        // Estimate model size in bytes from files on disk
+        let mut estimated_bytes = 0;
+        if path.is_file() {
+            estimated_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        } else if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_file() {
+                        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                            let ext_lower = ext.to_lowercase();
+                            if ext_lower == "safetensors" || ext_lower == "bin" || ext_lower == "gguf" {
+                                estimated_bytes += std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Hardware-aware dynamic device selection via HardwareProfile
+        let profile = crate::profile::HardwareProfile::get();
+        let target_backend = profile.choose_device(estimated_bytes).unwrap_or(crate::profile::BackendChoice::Cpu);
+
+        let dev = match target_backend {
+            crate::profile::BackendChoice::Cuda => {
+                Device::new_cuda(0).unwrap_or_else(|e| {
+                    tracing::warn!("CUDA init failed ({e}), falling back to CPU");
+                    Device::Cpu
+                })
+            }
+            crate::profile::BackendChoice::Metal => {
+                Device::new_metal(0).unwrap_or_else(|e| {
+                    tracing::warn!("Metal init failed ({e}), falling back to CPU");
+                    Device::Cpu
+                })
+            }
+            crate::profile::BackendChoice::Cpu => Device::Cpu,
         };
         self.device = dev.clone();
         self.compute_dtype = if dev.is_cpu() { DType::F32 } else { DType::F16 };
 
-        // Query free VRAM for cache budget (leave 2.0 GB headroom for activations/KV cache)
+        // Determine cache budget dynamically (leave 2.0 GB headroom for activations/KV cache)
         let vram_headroom_bytes: u64 = 2_000 * 1024 * 1024;
-        let mut free_vram = if candle_core::utils::cuda_is_available() {
-            std::process::Command::new("nvidia-smi")
-                .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<u64>().ok()))
-                .map(|mib| mib * 1024 * 1024)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        if free_vram == 0 && dev.is_cuda() {
-            tracing::info!("nvidia-smi query returned 0, but CUDA device is active. Falling back to 6.0 GB estimated free VRAM.");
-            free_vram = 6_000 * 1024 * 1024;
+        let mut free_vram = profile.gpu_vram_free_bytes.unwrap_or(0);
+        if free_vram == 0 && !dev.is_cpu() {
+            if dev.is_cuda() {
+                free_vram = 6_000 * 1024 * 1024;
+            } else {
+                free_vram = 8_000 * 1024 * 1024;
+            }
         }
         self.gpu_cache_budget = free_vram.saturating_sub(vram_headroom_bytes);
         tracing::info!(
-            "GPU cache budget: {:.1} GB (free VRAM: {:.1} GB)",
+            "GPU cache budget: {:.1} GB (free VRAM/Unified Memory: {:.1} GB)",
             self.gpu_cache_budget as f64 / 1e9,
             free_vram as f64 / 1e9
         );
@@ -1205,11 +1225,24 @@ impl LlmBackend for CandleBackend {
                         let out_flat = table.index_select(&ids_flat, 0)?;
                         out_flat.reshape((b_sz, seq_len, table.dim(1)?))?
                     };
+                    // Normalize to compute_dtype at the embedding stage so all downstream
+                    // activations flow in a consistent dtype (avoids F32/F16 mix from GGUF dequant)
+                    let out = if out.dtype() != self.compute_dtype {
+                        out.to_dtype(self.compute_dtype)?
+                    } else {
+                        out
+                    };
                     ctx.insert(output.clone(), out);
                 }
                 Operator::RMSNorm { input, weight, output, eps } => {
                     let in_t = ctx.get(input)?;
-                    let w_t = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
+                    let w_t_raw = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
+                    // Align weight dtype to match the input activation dtype
+                    let w_t = if w_t_raw.dtype() != in_t.dtype() {
+                        w_t_raw.to_dtype(in_t.dtype())?
+                    } else {
+                        w_t_raw
+                    };
                     let is_gemma = self.meta.as_ref().map(|m| m.is_gemma).unwrap_or(false);
                     let is_gemma_hf = is_gemma && !self.weights.is_empty();
                     let out = RmsNorm::new(w_t, *eps as f64, is_gemma_hf).forward(&in_t)?;
@@ -1234,30 +1267,48 @@ impl LlmBackend for CandleBackend {
                     } else {
                         let w_t = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
 
-                        // Auto-transpose: weight stored row-major [out_features, in_features]
-                        let last_dim = in_t.dim(in_t.rank() - 1)?;
-                        let w_t_final = if w_t.rank() == 2 && last_dim == w_t.dim(1)? {
-                            w_t.transpose(0, 1)?
+                        // Align dtypes: dequantize() always returns F32, but safetensors weights
+                        // may be F16. Align both to compute_dtype to avoid matmul dtype mismatch.
+                        let in_t_aligned = if in_t.dtype() != self.compute_dtype {
+                            in_t.to_dtype(self.compute_dtype)?
+                        } else {
+                            in_t.clone()
+                        };
+                        let w_t_aligned = if w_t.dtype() != self.compute_dtype {
+                            w_t.to_dtype(self.compute_dtype)?
                         } else {
                             w_t
                         };
 
-                        let rank_in = in_t.rank();
+                        // Auto-transpose: weight stored row-major [out_features, in_features]
+                        let last_dim = in_t_aligned.dim(in_t_aligned.rank() - 1)?;
+                        let w_t_final = if w_t_aligned.rank() == 2 && last_dim == w_t_aligned.dim(1)? {
+                            w_t_aligned.transpose(0, 1)?
+                        } else {
+                            w_t_aligned
+                        };
+
+                        let rank_in = in_t_aligned.rank();
                         if rank_in == 3 {
-                            let (b, m, k) = in_t.dims3()?;
-                            let in_t_2d = in_t.reshape((b * m, k))?;
+                            let (b, m, k) = in_t_aligned.dims3()?;
+                            let in_t_2d = in_t_aligned.reshape((b * m, k))?;
                             let res_2d = in_t_2d.matmul(&w_t_final)?;
                             let n = res_2d.dim(1)?;
                             res_2d.reshape((b, m, n))?
                         } else {
-                            in_t.matmul(&w_t_final)?
+                            in_t_aligned.matmul(&w_t_final)?
                         }
                     };
 
                     let mut out = out;
                     if let Some(bias_name) = bias {
-                        let b_t = self.get_weight(bias_name, &mut local_cache)?.to_device(in_t.device())?;
-                        out = out.broadcast_add(&b_t)?;
+                        let b_t = self.get_weight(bias_name, &mut local_cache)?.to_device(out.device())?;
+                        let b_t_aligned = if b_t.dtype() != out.dtype() {
+                            b_t.to_dtype(out.dtype())?
+                        } else {
+                            b_t
+                        };
+                        out = out.broadcast_add(&b_t_aligned)?;
                     }
 
                     ctx.insert(output.clone(), out);
@@ -1411,8 +1462,11 @@ impl LlmBackend for CandleBackend {
                                 });
                                 
                                 if self.kv_config.dtype == KvDtype::Q8 || self.kv_config.dtype == KvDtype::Q4 {
-                                    let (q_k, q_k_scale) = quantize(&k_chunk, self.kv_config.dtype, self.compute_dtype)?;
-                                    let (q_v, q_v_scale) = quantize(&v_chunk, self.kv_config.dtype, self.compute_dtype)?;
+                                    // Cast to compute_dtype before quantizing (dequantize() returns F32)
+                                    let k_chunk_cast = k_chunk.to_dtype(self.compute_dtype)?;
+                                    let v_chunk_cast = v_chunk.to_dtype(self.compute_dtype)?;
+                                    let (q_k, q_k_scale) = quantize(&k_chunk_cast, self.kv_config.dtype, self.compute_dtype)?;
+                                    let (q_v, q_v_scale) = quantize(&v_chunk_cast, self.kv_config.dtype, self.compute_dtype)?;
                                     
                                     block_data.k = update_block_tensor(&block_data.k, &q_k, start_block_offset, chunk_len)?;
                                     block_data.k_scale = Some(update_block_tensor(block_data.k_scale.as_ref().unwrap(), &q_k_scale, start_block_offset, chunk_len)?);
@@ -1420,8 +1474,19 @@ impl LlmBackend for CandleBackend {
                                     block_data.v = update_block_tensor(&block_data.v, &q_v, start_block_offset, chunk_len)?;
                                     block_data.v_scale = Some(update_block_tensor(block_data.v_scale.as_ref().unwrap(), &q_v_scale, start_block_offset, chunk_len)?);
                                 } else {
-                                    block_data.k = update_block_tensor(&block_data.k, &k_chunk, start_block_offset, chunk_len)?;
-                                    block_data.v = update_block_tensor(&block_data.v, &v_chunk, start_block_offset, chunk_len)?;
+                                    // Ensure dtype matches the initialized block (F16 on Metal/CUDA, F32 on CPU)
+                                    let k_chunk_cast = if k_chunk.dtype() != self.compute_dtype {
+                                        k_chunk.to_dtype(self.compute_dtype)?
+                                    } else {
+                                        k_chunk
+                                    };
+                                    let v_chunk_cast = if v_chunk.dtype() != self.compute_dtype {
+                                        v_chunk.to_dtype(self.compute_dtype)?
+                                    } else {
+                                        v_chunk
+                                    };
+                                    block_data.k = update_block_tensor(&block_data.k, &k_chunk_cast, start_block_offset, chunk_len)?;
+                                    block_data.v = update_block_tensor(&block_data.v, &v_chunk_cast, start_block_offset, chunk_len)?;
                                 }
                                 
                                 t_start = t_end;
@@ -1486,6 +1551,13 @@ impl LlmBackend for CandleBackend {
                         let k_hist_rep = repeat_kv(k_hist_squeezed.transpose(0, 1)?, n_rep)?.contiguous()?;
                         let v_hist_rep = repeat_kv(v_hist_squeezed.transpose(0, 1)?, n_rep)?.contiguous()?;
 
+                        // Align K dtype to Q for scores matmul
+                        let k_hist_rep = if k_hist_rep.dtype() != q_i.dtype() {
+                            k_hist_rep.to_dtype(q_i.dtype())?
+                        } else {
+                            k_hist_rep
+                        };
+
                         let scores = q_i.matmul(&k_hist_rep.transpose(1, 2)?.contiguous()?)?;
                         let scores_scaled = if meta.ple_dim.is_some() {
                             scores
@@ -1512,6 +1584,12 @@ impl LlmBackend for CandleBackend {
                         };
 
                         let probs = candle_nn::ops::softmax(&scores, candle_core::D::Minus1)?;
+                        // Align V dtype to probs (softmax may upcast to F32 on Metal even with F16 input)
+                        let v_hist_rep = if v_hist_rep.dtype() != probs.dtype() {
+                            v_hist_rep.to_dtype(probs.dtype())?
+                        } else {
+                            v_hist_rep
+                        };
                         let out_i = probs.matmul(&v_hist_rep)?;
                         let out_i = out_i.transpose(0, 1)?.contiguous()?; // (seq_len, n_heads, head_dim)
                         let out_i = out_i.reshape((seq_len, layer_n_heads * layer_head_dim))?;
@@ -1532,11 +1610,23 @@ impl LlmBackend for CandleBackend {
                 Operator::Mul { lhs, rhs, output } => {
                     let lhs_t = ctx.get(lhs)?;
                     let rhs_t = ctx.get(rhs)?;
+                    // Align dtypes for element-wise mul
+                    let rhs_t = if rhs_t.dtype() != lhs_t.dtype() {
+                        rhs_t.to_dtype(lhs_t.dtype())?
+                    } else {
+                        rhs_t
+                    };
                     ctx.insert(output.clone(), lhs_t.broadcast_mul(&rhs_t)?);
                 }
                 Operator::Add { lhs, rhs, output } => {
                     let lhs_t = ctx.get(lhs)?;
                     let rhs_t = ctx.get(rhs)?;
+                    // Align dtypes (residual connections can mix F32 and F16)
+                    let rhs_t = if rhs_t.dtype() != lhs_t.dtype() {
+                        rhs_t.to_dtype(lhs_t.dtype())?
+                    } else {
+                        rhs_t
+                    };
                     ctx.insert(output.clone(), lhs_t.broadcast_add(&rhs_t)?);
                 }
                 Operator::VisualEmbed { pixel_values, output } => {
@@ -1677,7 +1767,13 @@ impl LlmBackend for CandleBackend {
                 }
                 Operator::TensorScale { input, scale_tensor, output } => {
                     let in_t = ctx.get(input)?;
-                    let scale = self.get_weight(scale_tensor, &mut local_cache)?.to_device(in_t.device())?;
+                    let scale_raw = self.get_weight(scale_tensor, &mut local_cache)?.to_device(in_t.device())?;
+                    // Align dtype: weight dequant returns F32 but activations may be F16
+                    let scale = if scale_raw.dtype() != in_t.dtype() {
+                        scale_raw.to_dtype(in_t.dtype())?
+                    } else {
+                        scale_raw
+                    };
                     let out = in_t.broadcast_mul(&scale)?;
                     ctx.insert(output.clone(), out);
                 }
@@ -1711,6 +1807,12 @@ impl LlmBackend for CandleBackend {
                         out_flat.reshape((num_tokens, n_layers * ple_dim))?
                     };
 
+                    let lookup_out = if lookup_out.dtype() != self.compute_dtype {
+                        lookup_out.to_dtype(self.compute_dtype)?
+                    } else {
+                        lookup_out
+                    };
+
                     let token_identity = lookup_out.reshape((num_tokens, n_layers, ple_dim))?.contiguous()?;
                     let token_identity = (token_identity * ((ple_dim as f64).sqrt()))?;
 
@@ -1741,8 +1843,14 @@ impl LlmBackend for CandleBackend {
                     let is_gemma_hf = is_gemma && !self.weights.is_empty();
                     let context_aware = RmsNorm::new(norm_w, 1e-6, is_gemma_hf).forward(&context_proj_reshaped)?;
 
+                    let context_aware_aligned = if context_aware.dtype() != token_identity.dtype() {
+                        context_aware.to_dtype(token_identity.dtype())?
+                    } else {
+                        context_aware
+                    };
+
                     // Combined: (token_identity + context_aware) * (1 / sqrt(2))
-                    let combined = ((token_identity + context_aware)? * (1.0 / 2.0f64.sqrt()))?;
+                    let combined = ((token_identity + context_aware_aligned)? * (1.0 / 2.0f64.sqrt()))?;
 
                     ctx.insert(output.clone(), combined);
                 }
@@ -1809,7 +1917,12 @@ impl LlmBackend for CandleBackend {
                     let proj_normed = RmsNorm::new(norm_w, 1e-6, is_gemma_hf).forward(&proj_out)?;
 
                     let proj_normed_3d = proj_normed.reshape((b_sz, seq_len, hidden_dim))?.contiguous()?;
-                    let out = (in_t + proj_normed_3d)?;
+                    let proj_normed_3d_aligned = if proj_normed_3d.dtype() != in_t.dtype() {
+                        proj_normed_3d.to_dtype(in_t.dtype())?
+                    } else {
+                        proj_normed_3d
+                    };
+                    let out = (in_t + proj_normed_3d_aligned)?;
                     ctx.insert(output.clone(), out);
                 }
             }

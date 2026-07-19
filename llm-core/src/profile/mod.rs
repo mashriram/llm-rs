@@ -24,6 +24,7 @@ use sysinfo::{System, SystemExt};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendChoice {
     Cuda,
+    Metal,
     Cpu,
 }
 
@@ -147,8 +148,17 @@ impl HardwareProfile {
                     warn!("LLM_FORCE_CUDA set — assuming 4 GB VRAM. OOM risk if model is larger.");
                 }
             }
+        } else if let Some((total, free)) = query_metal_vram() {
+            gpu_vram_total_bytes = Some(total);
+            gpu_vram_free_bytes = Some(free);
+            backend = BackendChoice::Metal;
+            info!(
+                "GPU: {:.2} MiB Metal Unified Memory limit, {:.2} MiB recommended free (via Metal API)",
+                total as f64 / 1024.0 / 1024.0,
+                free as f64 / 1024.0 / 1024.0
+            );
         } else {
-            info!("CUDA not available. Running on CPU.");
+            info!("Running on CPU.");
         }
 
         Self {
@@ -171,17 +181,17 @@ impl HardwareProfile {
         // 15% headroom for KV cache growth and fragmentation.
         let required = (estimated_bytes as f64 * 1.15) as u64;
 
-        if self.backend == BackendChoice::Cuda {
+        if self.backend == BackendChoice::Cuda || self.backend == BackendChoice::Metal {
             if let Some(free_bytes) = self.gpu_vram_free_bytes {
                 if required < free_bytes {
                     info!(
-                        "Model: {:.2} MB (with 15% headroom: {:.2} MB). Free VRAM: {:.2} MB. → CUDA.",
-                        mb(estimated_bytes), mb(required), mb(free_bytes)
+                        "Model: {:.2} MB (with 15% headroom: {:.2} MB). Free VRAM/Unified Memory: {:.2} MB. → {:?}.",
+                        mb(estimated_bytes), mb(required), mb(free_bytes), self.backend
                     );
-                    return Ok(BackendChoice::Cuda);
+                    return Ok(self.backend);
                 }
                 warn!(
-                    "Model: {:.2} MB (with 15% headroom: {:.2} MB) exceeds free VRAM: {:.2} MB. → CPU.",
+                    "Model: {:.2} MB (with 15% headroom: {:.2} MB) exceeds VRAM/Unified Memory: {:.2} MB. → CPU.",
                     mb(estimated_bytes), mb(required), mb(free_bytes)
                 );
             }
@@ -237,5 +247,26 @@ fn query_cuda_driver() -> Option<(u64, u64)> {
 
 #[cfg(not(feature = "cuda"))]
 fn query_cuda_driver() -> Option<(u64, u64)> {
+    None
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn query_metal_vram() -> Option<(u64, u64)> {
+    if candle_core::Device::new_metal(0).is_ok() {
+        if let Some(dev) = metal::Device::system_default() {
+            let recommended = dev.recommended_max_working_set_size();
+            let current_allocated = dev.current_allocated_size();
+            let free = recommended.saturating_sub(current_allocated);
+            Some((recommended, free))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos")))]
+fn query_metal_vram() -> Option<(u64, u64)> {
     None
 }

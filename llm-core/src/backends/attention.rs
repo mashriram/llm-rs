@@ -60,11 +60,12 @@ impl RmsNorm {
         let last_dim = x_f32.dim(x_f32.rank() - 1)?;
 
         // Gemma HF format stores weights as the delta from 1.0.
-        let w_scaled = if self.is_gemma {
+        let w_scaled_raw = if self.is_gemma {
             self.weight.affine(1.0, 1.0)?
         } else {
             self.weight.clone()
         };
+        let w_scaled = w_scaled_raw.to_dtype(orig_dtype)?;
 
         // QK-Norm case: weight covers a head_dim slice but x has full concat dim.
         if last_dim != w_len && last_dim % w_len == 0 {

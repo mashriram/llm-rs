@@ -28,3 +28,4 @@ http = { workspace = true }
 
 [features]
 cuda = ["llm-core/cuda"]
+metal = ["llm-core/metal"]

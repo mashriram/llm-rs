@@ -8,7 +8,7 @@ This is a blindly-followable, ordered task list built directly from a file-by-fi
 
 These are things that will actively break builds or crash a running server. Fix first, no judgment calls needed.
 
-- [ ] **0.1 — Remove absolute machine-specific paths.**
+- [x] **0.1 — Remove absolute machine-specific paths.**
   `vision-stability` branch's `llm-core/Cargo.toml` has `[[bin]]` entries pointing at `/home/mukundan/.gemini/antigravity/brain/<uuid>/scratch/...`. This will not build on any machine but the original author's. Confirm the `cpu` branch's relative-path version (`../scratch/...`) is what gets merged forward, and grep the whole repo for `/home/` to make sure no other absolute paths snuck in anywhere (Cargo.toml, build.rs, tests).
   ```
   grep -rn "/home/" --include="*.toml" --include="*.rs" .
@@ -105,7 +105,7 @@ The current `cpu` branch fixed the vision encoder's dtype handling but left the 
 
 The CUDA path is currently a thinner, less-tested twin of the CPU path — it works, but several of the spec's stated GPU guarantees aren't actually implemented.
 
-- [ ] **2.1 — Verify the Metal fallback path is actually tested, not just compiled.**
+- [x] **2.1 — Verify the Metal fallback path is actually tested, not just compiled.**
   `candle.rs::load_weights` already attempts `Device::new_metal(0)` when CUDA isn't available (line ~626) — this exists in the code today but there's no evidence anywhere in the test suite that it's ever been run against a real Apple GPU. Before doing anything else GPU-related, get this path onto real Apple Silicon hardware and run the parity suite against it. If it fails, fix it before layering more platform work on top of an unverified foundation.
   Acceptance: `cargo test --test parity` green on an actual M-series Mac using the Metal device path (not CPU fallback).
 

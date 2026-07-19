@@ -170,9 +170,10 @@ fn test_conversation_template_parity() {
 
 #[test]
 fn test_audio_keys() {
-    let path = std::path::Path::new("/home/shri/learning/llm-rs/models/google_gemma-4-E2B-it-mmproj-BF16.gguf");
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let path = std::path::Path::new(&manifest_dir).join("../models/google_gemma-4-E2B-it-mmproj-BF16.gguf");
     if path.exists() {
-        let mut file = std::fs::File::open(path).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
         let model = candle_core::quantized::gguf_file::Content::read(&mut file).unwrap();
         let mut output = String::new();
         output.push_str("Metadata:\n");
@@ -187,7 +188,9 @@ fn test_audio_keys() {
                 output.push_str(&format!("  {}: {:?}\n", k, v.shape));
             }
         }
-        std::fs::write("/home/shri/learning/llm-rs/scratch/audio_names.txt", output).unwrap();
+        let scratch_dir = std::path::Path::new(&manifest_dir).join("../scratch");
+        let _ = std::fs::create_dir_all(&scratch_dir);
+        std::fs::write(scratch_dir.join("audio_names.txt"), output).unwrap();
     } else {
         println!("Model path does not exist, skipping test");
     }
