@@ -10,3 +10,10 @@ gemma-4-E2B-it-Q4_K_M.gguf
 
 qwen3-vl-4b-instruct_Q4_K_M.gguf
 qwen3-vl-4b-instruct.BF16-mmproj.gguf
+
+# Python bindings build artifacts (llm-py)
+llm-py/python/llm_rs/__pycache__/
+llm-py/python/llm_rs/*.so
+llm-py/python/llm_rs/*.pyd
+llm-py/target/
+*.egg-info/
