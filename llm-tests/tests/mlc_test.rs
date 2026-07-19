@@ -1143,7 +1143,9 @@ async fn test_http_chat_completions_returns_200() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let backend = Box::new(DummyBackend::new());
+    let dummy = DummyBackend::new();
+    let meta = std::sync::Arc::new(dummy.meta.clone());
+    let backend = Box::new(dummy);
     let engine = Arc::new(ServingEngine::new(backend, 16));
     let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1154,6 +1156,8 @@ async fn test_http_chat_completions_returns_200() {
         engine,
         model_name: "test-model".to_string(),
         tokenizer,
+        meta: meta.clone(),
+        max_tokens_limit: 4096,
     });
     let app = llm_cli::create_router(state);
 
@@ -1191,7 +1195,9 @@ async fn test_http_chat_completions_response_has_choices() {
     use tower::ServiceExt;
     use http_body_util::BodyExt;
 
-    let backend = Box::new(DummyBackend::new());
+    let dummy = DummyBackend::new();
+    let meta = std::sync::Arc::new(dummy.meta.clone());
+    let backend = Box::new(dummy);
     let engine = Arc::new(ServingEngine::new(backend, 16));
     let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1202,6 +1208,8 @@ async fn test_http_chat_completions_response_has_choices() {
         engine,
         model_name: "test-model".to_string(),
         tokenizer,
+        meta: meta.clone(),
+        max_tokens_limit: 4096,
     });
     let app = llm_cli::create_router(state);
 
@@ -1243,7 +1251,9 @@ async fn test_http_health_endpoint_returns_200() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let backend = Box::new(DummyBackend::new());
+    let dummy = DummyBackend::new();
+    let meta = std::sync::Arc::new(dummy.meta.clone());
+    let backend = Box::new(dummy);
     let engine = Arc::new(ServingEngine::new(backend, 16));
     let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1254,6 +1264,8 @@ async fn test_http_health_endpoint_returns_200() {
         engine,
         model_name: "test-model".to_string(),
         tokenizer,
+        meta: meta.clone(),
+        max_tokens_limit: 4096,
     });
     let app = llm_cli::create_router(state);
 
@@ -1278,7 +1290,9 @@ async fn test_http_models_endpoint_lists_model() {
     use tower::ServiceExt;
     use http_body_util::BodyExt;
 
-    let backend = Box::new(DummyBackend::new());
+    let dummy = DummyBackend::new();
+    let meta = std::sync::Arc::new(dummy.meta.clone());
+    let backend = Box::new(dummy);
     let engine = Arc::new(ServingEngine::new(backend, 16));
     let model_name = "my-test-model".to_string();
     let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1286,7 +1300,7 @@ async fn test_http_models_endpoint_lists_model() {
         .unwrap()
         .join("qwen2.5-0.5b/tokenizer.json");
     let tokenizer = Arc::new(llm_core::tokenizer::LlmTokenizer::from_file(tokenizer_path).unwrap());
-    let state = Arc::new(llm_cli::AppState { engine, model_name: model_name.clone(), tokenizer });
+    let state = Arc::new(llm_cli::AppState { engine, model_name: model_name.clone(), tokenizer, meta: meta.clone(), max_tokens_limit: 4096 });
     let app = llm_cli::create_router(state);
 
     let response = app
@@ -1316,7 +1330,9 @@ async fn test_http_missing_content_type_returns_415() {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let backend = Box::new(DummyBackend::new());
+    let dummy = DummyBackend::new();
+    let meta = std::sync::Arc::new(dummy.meta.clone());
+    let backend = Box::new(dummy);
     let engine = Arc::new(ServingEngine::new(backend, 16));
     let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1326,6 +1342,8 @@ async fn test_http_missing_content_type_returns_415() {
     let state = Arc::new(llm_cli::AppState {
         engine, model_name: "m".to_string(),
         tokenizer,
+        meta: meta.clone(),
+        max_tokens_limit: 4096,
     });
     let app = llm_cli::create_router(state);
 

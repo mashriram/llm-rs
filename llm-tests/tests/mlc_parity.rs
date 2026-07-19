@@ -947,7 +947,9 @@ fn test_openai_v1_models() {
 
 #[tokio::test]
 async fn test_openai_v1_completions() {
-    let backend = Box::new(DummyBackend::new());
+    let dummy = DummyBackend::new();
+    let meta = std::sync::Arc::new(dummy.meta.clone());
+    let backend = Box::new(dummy);
     let engine = Arc::new(ServingEngine::new(backend, 16));
     let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -958,6 +960,8 @@ async fn test_openai_v1_completions() {
         engine,
         model_name: "test-model".to_string(),
         tokenizer,
+        meta: meta.clone(),
+        max_tokens_limit: 4096,
     });
 
     let app = llm_cli::create_router(state);
@@ -1591,8 +1595,8 @@ fn test_rollback() {
 #[test]
 fn test_engine_basic() {
     let backend = DummyBackend::new();
-    let mut scheduler = Scheduler::new(Box::new(backend), 32);
-    
+    let mut scheduler = Scheduler::new(Box::new(backend), 32).expect("DummyBackend reports a nonzero block_size");
+
     // Add multiple requests to test continuous batching
     scheduler.add_request(InferRequest {
         seq_id: 1,
@@ -1662,7 +1666,13 @@ async fn test_ffi_engine_lifecycle() {
     let c_path = std::ffi::CString::new(temp_dir.to_str().unwrap()).unwrap();
     let config = llm_ffi::EngineConfig {
         model_path: c_path.as_ptr(),
+        tokenizer_path: std::ptr::null(),
         block_pool_size: 16,
+        // This test exercises the FFI plumbing with a dummy config.json/
+        // safetensors pair, not a real loadable model - explicitly opt into
+        // the dummy backend rather than relying on `model_path` happening to
+        // contain "tmp" (the removed, unsafe-to-rely-on substring heuristic).
+        use_dummy: true,
     };
 
     unsafe {
