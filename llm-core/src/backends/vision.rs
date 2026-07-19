@@ -200,8 +200,13 @@ impl VisionEncoder {
             } else {
                 // 1D learned absolute position embedding
                 let pos_len = pos_emb.dim(0)?;
+                // Take the FIRST `num_patches` rows of the position embedding table
+                // (position 0 must align with patch 0). Slicing from the end
+                // (`pos_len - num_patches`) was an off-by-one/wrong-end bug: it
+                // would apply the tail of a longer table's positions to the
+                // beginning of the patch sequence, misaligning every position.
                 let pos_to_add = if pos_len > num_patches {
-                    pos_emb.narrow(0, pos_len - num_patches, num_patches)?
+                    pos_emb.narrow(0, 0, num_patches)?
                 } else {
                     pos_emb.clone()
                 };
@@ -636,17 +641,36 @@ fn normalize_vision_tensors(
 
     let vision_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
     for layer_idx in 0..num_layers {
-        if let (Some(q), Some(k), Some(v)) = (q_weights.remove(&layer_idx), k_weights.remove(&layer_idx), v_weights.remove(&layer_idx)) {
-            let qkv = Tensor::cat(&[&q, &k, &v], 0)?;
+        let q_w = q_weights.remove(&layer_idx);
+        let k_w = k_weights.remove(&layer_idx);
+        let v_w = v_weights.remove(&layer_idx);
+        // Remember each projection's actual output dimension (from its weight)
+        // before the weights are consumed below, so a missing bias for one of
+        // Q/K/V can be zero-filled at the CORRECT shape instead of a bogus
+        // length-1 placeholder that would break `broadcast_add` downstream.
+        let q_out_dim = q_w.as_ref().map(|t| t.dim(0)).transpose()?;
+        let k_out_dim = k_w.as_ref().map(|t| t.dim(0)).transpose()?;
+        let v_out_dim = v_w.as_ref().map(|t| t.dim(0)).transpose()?;
+        if let (Some(q), Some(k), Some(v)) = (&q_w, &k_w, &v_w) {
+            let qkv = Tensor::cat(&[q, k, v], 0)?;
             normalized.insert(format!("vision.layers.{}.attn_qkv.weight", layer_idx), qkv);
         }
         let q_b = q_biases.remove(&layer_idx);
         let k_b = k_biases.remove(&layer_idx);
         let v_b = v_biases.remove(&layer_idx);
         if q_b.is_some() || k_b.is_some() || v_b.is_some() {
-            let q_b = q_b.unwrap_or(Tensor::zeros(1, vision_dtype, device)?);
-            let k_b = k_b.unwrap_or(Tensor::zeros(1, vision_dtype, device)?);
-            let v_b = v_b.unwrap_or(Tensor::zeros(1, vision_dtype, device)?);
+            let q_b = match q_b {
+                Some(t) => t,
+                None => Tensor::zeros(q_out_dim.unwrap_or(1), vision_dtype, device)?,
+            };
+            let k_b = match k_b {
+                Some(t) => t,
+                None => Tensor::zeros(k_out_dim.unwrap_or(1), vision_dtype, device)?,
+            };
+            let v_b = match v_b {
+                Some(t) => t,
+                None => Tensor::zeros(v_out_dim.unwrap_or(1), vision_dtype, device)?,
+            };
             let qkv_b = Tensor::cat(&[&q_b, &k_b, &v_b], 0)?;
             normalized.insert(format!("vision.layers.{}.attn_qkv.bias", layer_idx), qkv_b);
         } else {

@@ -98,6 +98,115 @@ fn dequantize(u8_tensor: &Tensor, scale: &Tensor, dtype: KvDtype, comp_dtype: DT
     Ok(dequantized)
 }
 
+/// Best-effort EOS token id resolution from a GGUF file's `tokenizer.ggml.tokens`
+/// vocabulary array, tried only when the explicit `tokenizer.ggml.eos_token_id`
+/// metadata key is absent. GGUF's tokens array is index-addressed by token id,
+/// so a candidate string's array position IS its token id.
+fn find_eos_in_gguf_tokens(
+    metadata: &std::collections::HashMap<String, candle_core::quantized::gguf_file::Value>,
+    candidates: &[&str],
+) -> Option<u32> {
+    if let Some(candle_core::quantized::gguf_file::Value::Array(arr)) = metadata.get("tokenizer.ggml.tokens") {
+        for cand in candidates {
+            if let Some(idx) = arr.iter().position(
+                |v| matches!(v, candle_core::quantized::gguf_file::Value::String(s) if s == cand)
+            ) {
+                return Some(idx as u32);
+            }
+        }
+    }
+    None
+}
+
+/// Best-effort EOS token id resolution from a HF model directory's
+/// `tokenizer_config.json` (`added_tokens_decoder`) or `tokenizer.json`
+/// (`added_tokens`), tried only when `config.json`'s `eos_token_id` is absent.
+fn find_eos_in_hf_tokenizer_files(model_dir: &Path, candidates: &[&str]) -> Option<u32> {
+    for fname in ["tokenizer_config.json", "tokenizer.json"] {
+        let Ok(contents) = std::fs::read_to_string(model_dir.join(fname)) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&contents) else { continue };
+
+        if let Some(decoder) = v.get("added_tokens_decoder").and_then(|d| d.as_object()) {
+            for (id_str, tok) in decoder {
+                if let Some(content) = tok.get("content").and_then(|c| c.as_str()) {
+                    if candidates.contains(&content) {
+                        if let Ok(id) = id_str.parse::<u32>() {
+                            return Some(id);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(arr) = v.get("added_tokens").and_then(|a| a.as_array()) {
+            for tok in arr {
+                if let Some(content) = tok.get("content").and_then(|c| c.as_str()) {
+                    if candidates.contains(&content) {
+                        if let Some(id) = tok.get("id").and_then(|i| i.as_u64()) {
+                            return Some(id as u32);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Model-agnostic mmproj (multimodal projector) file discovery for a GGUF base
+/// model path: strips the base model's extension/quantization-tag suffix and
+/// tries a handful of common mmproj filename patterns, falling back to a
+/// same-directory scan for any `*mmproj*.gguf` file. Returns `None` if nothing
+/// is found (callers decide their own fallback — e.g. some fall back to the
+/// base model path itself, on the assumption the vision/audio tower may be
+/// embedded in the same GGUF file; others just skip the encoder).
+///
+/// Previously this ~50-line block was duplicated 3 times (once each for
+/// mmproj-metadata merging, VisionEncoder loading, and AudioEncoder loading) —
+/// factored into this single helper so the discovery logic can't drift.
+fn find_mmproj_path(base_path: &Path) -> Option<std::path::PathBuf> {
+    let base = base_path.to_string_lossy();
+    // Strip any quantisation suffix (e.g. .Q4_K_M, .Q8_0, .BF16, .F16) and the
+    // .gguf extension to get the base model name stem.
+    let stem = if let Some(pos) = base.rfind('.') {
+        let without_ext = &base[..pos]; // remove .gguf
+        if let Some(q_pos) = without_ext.rfind('.') {
+            without_ext[..q_pos].to_string()
+        } else {
+            without_ext.to_string()
+        }
+    } else {
+        base.to_string()
+    };
+    let suffixes = [
+        "-mmproj-f16.gguf",
+        ".mmproj.gguf",
+        "-mmproj.gguf",
+        ".BF16-mmproj.gguf",
+        "-mmproj-f32.gguf",
+    ];
+    for suffix in &suffixes {
+        let candidate = format!("{}{}", stem, suffix);
+        if std::path::Path::new(&candidate).exists() {
+            return Some(std::path::PathBuf::from(candidate));
+        }
+    }
+    // Fall back to a same-directory scan for any file matching `*mmproj*.gguf`.
+    if let Some(parent) = base_path.parent() {
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() {
+                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                    if name.contains("mmproj") && name.ends_with(".gguf") {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn update_block_tensor(
     block_tensor: &Tensor,
     slice_tensor: &Tensor,
@@ -151,7 +260,10 @@ pub struct CandleBackend {
     meta: Option<ModelMeta>,
     kv_cache: Option<Mutex<RawKvCache>>,
     kv_config: KvCacheConfig,
-    eos_token_id: u32,
+    /// `None` when no EOS token id could be determined from model metadata/config
+    /// or a best-effort tokenizer lookup — see `LlmBackend::eos_token_id`'s doc
+    /// comment for why this must not silently default to Llama's `2`.
+    eos_token_id: Option<u32>,
     /// Primary compute device (CUDA or CPU)
     device: Device,
     /// Compute dtype: F32 on CPU (prevents f16 overflow), F16 on CUDA.
@@ -196,7 +308,7 @@ impl CandleBackend {
                     _ => KvDtype::F16,
                 },
             },
-            eos_token_id: 2,
+            eos_token_id: None,
             device: Device::Cpu,
             // F32 on CPU prevents f16 accumulation overflow in matmul;
             // updated to F16 when CUDA device is selected at load time.
@@ -250,7 +362,7 @@ impl LlmBackend for CandleBackend {
         }
     }
 
-    fn eos_token_id(&self) -> u32 {
+    fn eos_token_id(&self) -> Option<u32> {
         self.eos_token_id
     }
 
@@ -301,22 +413,58 @@ impl LlmBackend for CandleBackend {
             }
         }
 
-        // Hardware-aware dynamic device selection via HardwareProfile
+        // Hardware-aware dynamic device selection via HardwareProfile.
+        // `choose_device` deliberately returns `Err` when the model won't fit in
+        // either VRAM or system RAM ("clean error > OS kill" — see its doc comment);
+        // swallowing that with `unwrap_or(Cpu)` would defeat that safety mechanism
+        // entirely, so we propagate it instead of guessing.
         let profile = crate::profile::HardwareProfile::get();
-        let target_backend = profile.choose_device(estimated_bytes).unwrap_or(crate::profile::BackendChoice::Cpu);
+        let target_backend = profile.choose_device(estimated_bytes)
+            .map_err(|e| anyhow!("Refusing to load model: {e}"))?;
 
+        // Explicit, narrow opt-in escape hatch: if a GPU device fails to initialize
+        // (driver/runtime issue, not a capacity issue — HardwareProfile already
+        // decided the model fits), the default is a hard `Err` per CLAUDE.md's
+        // "no silent fallback to a different backend" rule. Setting
+        // LLM_ALLOW_CPU_FALLBACK=1 opts into the old silent-downgrade behavior,
+        // loudly logged, for environments that would rather run slow than not run.
+        let allow_cpu_fallback = std::env::var("LLM_ALLOW_CPU_FALLBACK").is_ok();
         let dev = match target_backend {
             crate::profile::BackendChoice::Cuda => {
-                Device::new_cuda(0).unwrap_or_else(|e| {
-                    tracing::warn!("CUDA init failed ({e}), falling back to CPU");
-                    Device::Cpu
-                })
+                match Device::new_cuda(0) {
+                    Ok(d) => d,
+                    Err(e) if allow_cpu_fallback => {
+                        tracing::warn!(
+                            "CUDA init failed ({e}); LLM_ALLOW_CPU_FALLBACK=1 set, falling back to CPU (SLOW)"
+                        );
+                        Device::Cpu
+                    }
+                    Err(e) => {
+                        return Err(anyhow!(
+                            "CUDA device init failed ({e}) and HardwareProfile selected CUDA \
+                             for this model. Not silently falling back to CPU (set \
+                             LLM_ALLOW_CPU_FALLBACK=1 to opt into that instead)."
+                        ));
+                    }
+                }
             }
             crate::profile::BackendChoice::Metal => {
-                Device::new_metal(0).unwrap_or_else(|e| {
-                    tracing::warn!("Metal init failed ({e}), falling back to CPU");
-                    Device::Cpu
-                })
+                match Device::new_metal(0) {
+                    Ok(d) => d,
+                    Err(e) if allow_cpu_fallback => {
+                        tracing::warn!(
+                            "Metal init failed ({e}); LLM_ALLOW_CPU_FALLBACK=1 set, falling back to CPU (SLOW)"
+                        );
+                        Device::Cpu
+                    }
+                    Err(e) => {
+                        return Err(anyhow!(
+                            "Metal device init failed ({e}) and HardwareProfile selected Metal \
+                             for this model. Not silently falling back to CPU (set \
+                             LLM_ALLOW_CPU_FALLBACK=1 to opt into that instead)."
+                        ));
+                    }
+                }
             }
             crate::profile::BackendChoice::Cpu => Device::Cpu,
         };
@@ -327,11 +475,19 @@ impl LlmBackend for CandleBackend {
         let vram_headroom_bytes: u64 = 2_000 * 1024 * 1024;
         let mut free_vram = profile.gpu_vram_free_bytes.unwrap_or(0);
         if free_vram == 0 && !dev.is_cpu() {
-            if dev.is_cuda() {
-                free_vram = 6_000 * 1024 * 1024;
-            } else {
-                free_vram = 8_000 * 1024 * 1024;
-            }
+            // HardwareProfile could not measure free VRAM/unified memory. Rather than
+            // guessing a generous 6-8 GB is available (which contradicts this project's
+            // own HardwareProfile design of never guessing VRAM — see choose_device's
+            // "clean error > OS kill" doc comment), fall back to a small, conservative
+            // fixed budget and say so loudly. Worst case this under-utilizes VRAM;
+            // it will never overcommit it.
+            const CONSERVATIVE_UNMEASURED_VRAM_BYTES: u64 = 1_500 * 1024 * 1024; // 1.5 GB
+            tracing::warn!(
+                "Free VRAM/Unified Memory could not be measured for {:?}; using a conservative \
+                 {:.1} GB budget instead of assuming several GB are free.",
+                dev, CONSERVATIVE_UNMEASURED_VRAM_BYTES as f64 / 1e9
+            );
+            free_vram = CONSERVATIVE_UNMEASURED_VRAM_BYTES;
         }
         self.gpu_cache_budget = free_vram.saturating_sub(vram_headroom_bytes);
         tracing::info!(
@@ -351,48 +507,7 @@ impl LlmBackend for CandleBackend {
 
             // Discover and load mmproj metadata if a matching mmproj file exists
             let mut mmproj_metadata = HashMap::new();
-            let base = path.to_string_lossy();
-            let stem = if let Some(pos) = base.rfind('.') {
-                let without_ext = &base[..pos];
-                if let Some(q_pos) = without_ext.rfind('.') {
-                    without_ext[..q_pos].to_string()
-                } else {
-                    without_ext.to_string()
-                }
-            } else {
-                base.to_string()
-            };
-            let suffixes = [
-                "-mmproj-f16.gguf",
-                ".mmproj.gguf",
-                "-mmproj.gguf",
-                ".BF16-mmproj.gguf",
-                "-mmproj-f32.gguf",
-            ];
-            let mut mmproj_path = None;
-            for suffix in &suffixes {
-                let candidate = format!("{}{}", stem, suffix);
-                if std::path::Path::new(&candidate).exists() {
-                    mmproj_path = Some(std::path::PathBuf::from(candidate));
-                    break;
-                }
-            }
-            if mmproj_path.is_none() {
-                if let Some(parent) = path.parent() {
-                    if let Ok(entries) = std::fs::read_dir(parent) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            if p.is_file() {
-                                let name = p.file_name().unwrap_or_default().to_string_lossy();
-                                if name.contains("mmproj") && name.ends_with(".gguf") {
-                                    mmproj_path = Some(p);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let mmproj_path = find_mmproj_path(path);
             if let Some(ref mp_path) = mmproj_path {
                 tracing::info!("Discovered mmproj file at {:?}; loading its metadata...", mp_path);
                 if let Ok(mut mp_file) = std::fs::File::open(mp_path) {
@@ -460,12 +575,45 @@ impl LlmBackend for CandleBackend {
             let rms_norm_eps = meta_f32_agnostic(&model.metadata, "attention.layer_norm_rms_epsilon")
                 .unwrap_or(1e-6);
 
+            // Do not silently assume Llama's EOS id (2) when metadata lacks an
+            // explicit one — try the tokenizer's own vocabulary for common EOS
+            // strings as a best-effort fallback, and if that also fails, leave
+            // it as `None` (loudly logged) rather than guessing wrong.
             let eos_token_id = meta_u32(&model.metadata, "tokenizer.ggml.eos_token_id")
-                .unwrap_or(2);
+                .or_else(|| find_eos_in_gguf_tokens(
+                    &model.metadata,
+                    &["<end_of_turn>", "<|im_end|>", "<|endoftext|>", "</s>"],
+                ));
+            if eos_token_id.is_none() {
+                tracing::warn!(
+                    "Could not determine an EOS token id for {:?} from GGUF metadata or \
+                     common tokenizer vocab entries; generation will not stop on EOS \
+                     (only max_new_tokens bounds it) unless the caller resolves \
+                     additional EOS candidates itself.",
+                    path
+                );
+            }
             self.eos_token_id = eos_token_id;
 
             tracing::info!("Loading {} GGUF tensors as QTensor", model.tensor_infos.len());
-            let tie_word_embeddings = arch == "gemma" || arch == "gemma2" || arch == "gemma4"; // pre-check, refined below
+
+            // Single source of truth for Gemma-family detection, shared with model/config.rs
+            // (see `is_gemma_arch`'s doc comment). GGUF only exposes a single
+            // `general.architecture` string, so `architectures` is empty here.
+            let is_gemma = crate::types::is_gemma_arch(arch, &[]);
+
+            // Detect tied embeddings from GGUF tensor presence rather than arch name.
+            // If neither "output.weight" nor "lm_head.weight" exists as a tensor, the model
+            // uses tied embeddings (shares token_embd.weight for both input and output projection).
+            // Computed up-front (tensor_infos is fully populated before any tensor is read) so the
+            // VRAM-preload fast path below can use this generic, metadata-driven flag directly
+            // instead of re-deriving a Gemma-only arch-name check.
+            let has_dedicated_lm_head = model.tensor_infos.contains_key("output.weight")
+                || model.tensor_infos.contains_key("lm_head.weight")
+                || model.tensor_infos.contains_key("output_norm.weight") && model.tensor_infos.contains_key("output.weight");
+            // For Gemma, always tie (embed_scale requires the shared weight).
+            let tie_word_embeddings = is_gemma || !has_dedicated_lm_head;
+
             let mut remaining_vram_budget = self.gpu_cache_budget;
             for name in model.tensor_infos.keys() {
                 let name_lower = name.to_lowercase();
@@ -608,8 +756,6 @@ impl LlmBackend for CandleBackend {
             let ple_dim = meta_u32_agnostic(&model.metadata, "embedding_length_per_layer_input")
                 .map(|v| v as usize);
 
-            let is_gemma = arch == "gemma" || arch == "gemma2" || arch == "gemma4";
-
             // Detect activation function from GGUF metadata first, then fall back to arch heuristic.
             // GGUF key: "<arch>.feed_forward_type" (e.g. "llama.feed_forward_type" = "SiLU")
             let feed_forward_type = find_meta_key(&model.metadata, "feed_forward_type")
@@ -621,15 +767,6 @@ impl LlmBackend for CandleBackend {
                 // Fallback: Gemma family uses GeLU, everything else (LLaMA/Qwen/Mistral) uses SiLU.
                 _ => if is_gemma { HiddenAct::GeLU } else { HiddenAct::SiLU },
             };
-
-            // Detect tied embeddings from GGUF tensor presence rather than arch name.
-            // If neither "output.weight" nor "lm_head.weight" exists as a tensor, the model
-            // uses tied embeddings (shares token_embd.weight for both input and output projection).
-            let has_dedicated_lm_head = model.tensor_infos.contains_key("output.weight")
-                || model.tensor_infos.contains_key("lm_head.weight")
-                || model.tensor_infos.contains_key("output_norm.weight") && model.tensor_infos.contains_key("output.weight");
-            // For Gemma, always tie (embed_scale requires the shared weight).
-            let tie_word_embeddings = is_gemma || !has_dedicated_lm_head;
 
             let embed_scale = if is_gemma {
                 Some((hidden_dim as f32).sqrt())
@@ -717,8 +854,23 @@ impl LlmBackend for CandleBackend {
                 v.get("eos_token_id")
                     .and_then(|id| id.as_u64())
                     .map(|id| id as u32)
-                    .unwrap_or(2)
+                    // Do not silently assume Llama's EOS id (2) when config.json
+                    // lacks an explicit one — try the tokenizer files' own special
+                    // tokens for common EOS strings as a best-effort fallback.
+                    .or_else(|| find_eos_in_hf_tokenizer_files(
+                        path,
+                        &["<|im_end|>", "<end_of_turn>", "<|endoftext|>", "</s>"],
+                    ))
             };
+            if eos_token_id.is_none() {
+                tracing::warn!(
+                    "Could not determine an EOS token id for {:?} from config.json or \
+                     tokenizer files; generation will not stop on EOS (only \
+                     max_new_tokens bounds it) unless the caller resolves additional \
+                     EOS candidates itself.",
+                    path
+                );
+            }
             self.eos_token_id = eos_token_id;
 
             let mut sf_files = Vec::new();
@@ -981,53 +1133,10 @@ impl LlmBackend for CandleBackend {
         }
 
         if meta.has_vision_encoder {
-            // Model-agnostic mmproj discovery: strip the last extension component
-            // and try common multimodal projection suffixes
+            // Model-agnostic mmproj discovery, falling back to the base model
+            // path itself (the vision tower may be embedded in the same GGUF file).
             let vision_path = if is_gguf {
-                let base = path.to_string_lossy();
-                // Strip any quantisation suffix (e.g. .Q4_K_M, .Q8_0, .BF16, .F16)
-                let stem = if let Some(pos) = base.rfind('.') {
-                    // Find the base name up to the quantisation marker
-                    let without_ext = &base[..pos]; // remove .gguf
-                    // Remove quantisation tag if present (e.g. .Q4_K_M)
-                    if let Some(q_pos) = without_ext.rfind('.') {
-                        without_ext[..q_pos].to_string()
-                    } else {
-                        without_ext.to_string()
-                    }
-                } else {
-                    base.to_string()
-                };
-                let suffixes = [
-                    "-mmproj-f16.gguf",
-                    ".mmproj.gguf",
-                    "-mmproj.gguf",
-                    ".BF16-mmproj.gguf",
-                    "-mmproj-f32.gguf",
-                ];
-                let mut found = None;
-                for suffix in &suffixes {
-                    let candidate = format!("{}{}", stem, suffix);
-                    if std::path::Path::new(&candidate).exists() {
-                        found = Some(std::path::PathBuf::from(candidate));
-                        break;
-                    }
-                }
-                // Also try same directory pattern matching
-                if found.is_none() {
-                    if let Some(parent) = path.parent() {
-                        if let Ok(entries) = std::fs::read_dir(parent) {
-                            for entry in entries.flatten() {
-                                let n = entry.file_name().to_string_lossy().to_lowercase();
-                                if n.contains("mmproj") && n.ends_with(".gguf") {
-                                    found = Some(entry.path());
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                found.unwrap_or_else(|| path.to_path_buf())
+                find_mmproj_path(path).unwrap_or_else(|| path.to_path_buf())
             } else {
                 path.to_path_buf()
             };
@@ -1040,46 +1149,7 @@ impl LlmBackend for CandleBackend {
 
         if meta.has_audio_encoder {
             let audio_path = if is_gguf {
-                let base = path.to_string_lossy();
-                let stem = if let Some(pos) = base.rfind('.') {
-                    let without_ext = &base[..pos]; // remove .gguf
-                    if let Some(q_pos) = without_ext.rfind('.') {
-                        without_ext[..q_pos].to_string()
-                    } else {
-                        without_ext.to_string()
-                    }
-                } else {
-                    base.to_string()
-                };
-                let suffixes = [
-                    "-mmproj-f16.gguf",
-                    ".mmproj.gguf",
-                    "-mmproj.gguf",
-                    ".BF16-mmproj.gguf",
-                    "-mmproj-f32.gguf",
-                ];
-                let mut found = None;
-                for suffix in &suffixes {
-                    let candidate = format!("{}{}", stem, suffix);
-                    if std::path::Path::new(&candidate).exists() {
-                        found = Some(std::path::PathBuf::from(candidate));
-                        break;
-                    }
-                }
-                if found.is_none() {
-                    if let Some(parent) = path.parent() {
-                        if let Ok(entries) = std::fs::read_dir(parent) {
-                            for entry in entries.flatten() {
-                                let n = entry.file_name().to_string_lossy().to_lowercase();
-                                if n.contains("mmproj") && n.ends_with(".gguf") {
-                                    found = Some(entry.path());
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                found.unwrap_or_else(|| path.to_path_buf())
+                find_mmproj_path(path).unwrap_or_else(|| path.to_path_buf())
             } else {
                 path.to_path_buf()
             };
@@ -1094,6 +1164,30 @@ impl LlmBackend for CandleBackend {
     }
 
     fn forward_pass(&self, batch: &BatchInput) -> Result<BatchOutput> {
+        if batch.seq_ids.is_empty() {
+            return Err(anyhow!("empty batch: seq_ids is empty"));
+        }
+        // Validate the packed (varlen) batch shape up-front, before touching any
+        // model state: `cu_seqlens` must have exactly one more entry than
+        // `seq_ids` (N sequence boundaries for N sequences), and its last entry
+        // must equal the total token count — otherwise the per-sequence slicing
+        // done throughout this function (RoPE position ids, PagedAttention's
+        // token-axis narrowing, next-token logit extraction) would silently read
+        // out-of-range or mis-attributed data instead of erroring.
+        let num_seqs = batch.seq_ids.len();
+        let total_tokens = batch.token_ids.len();
+        if batch.cu_seqlens.len() != num_seqs + 1 {
+            return Err(anyhow!(
+                "forward_pass: cu_seqlens length {} does not match seq_ids length {} + 1",
+                batch.cu_seqlens.len(), num_seqs
+            ));
+        }
+        if batch.cu_seqlens.last().copied() != Some(total_tokens as u32) {
+            return Err(anyhow!(
+                "forward_pass: cu_seqlens last entry ({:?}) does not match total token count ({})",
+                batch.cu_seqlens.last(), total_tokens
+            ));
+        }
         let graph = self.graph.as_ref().ok_or_else(|| anyhow!("Compute graph not built"))?;
         let meta = self.meta.as_ref().ok_or_else(|| anyhow!("Model metadata not loaded"))?;
         let kv_cache_mutex = self.kv_cache.as_ref().ok_or_else(|| anyhow!("KV Cache not initialized"))?;
@@ -1117,12 +1211,33 @@ impl LlmBackend for CandleBackend {
             cache.clone()
         };
 
-        // Feed input_ids to context
+        // Feed input_ids to context.
+        //
+        // IMPORTANT: `batch.token_ids` is a PACKED (varlen) buffer — the scheduler
+        // concatenates each sequence's tokens back-to-back (a prefill sequence
+        // contributes its full prompt length, a decode sequence contributes exactly
+        // 1 token), with `batch.cu_seqlens` giving each sequence's boundary in that
+        // flat buffer. Sequences in the same batch are NOT required to have equal
+        // length (mixed prefill+decode, or multiple prefills of different prompt
+        // lengths, is the normal/expected case — see `Scheduler::step`). Reshaping
+        // to `(num_seqs, uniform_len)` here would therefore be WRONG whenever
+        // lengths differ (previously caused `shape mismatch in reshape` panics on
+        // exactly this scenario).
+        //
+        // Instead we thread the whole batch through the graph as a single
+        // "batch of 1" packed sequence of shape `(1, total_tokens)`. This is
+        // shape-compatible with every other operator in this function (Embed,
+        // RMSNorm, MatMul, Activation, Mul, Add, Scale, TensorScale, Softcap,
+        // PleInput/PleLayer all only care about `num_tokens = b_sz * seq_len`,
+        // not how it is factored into `(b_sz, seq_len)`). The two operators that
+        // DO need real per-sequence boundaries — RoPE position ids (`apply_rope`/
+        // `apply_rope_q`, via `cu_seqlens`) and `PagedAttention` (which narrows
+        // along the token axis using `cu_seqlens` per sequence, see below) — are
+        // updated accordingly.
         let dev = self.device.clone();
+        // `num_seqs`/`total_tokens` are validated against `batch.cu_seqlens` above.
         let tokens_t = Tensor::new(batch.token_ids.as_slice(), &dev)?;
-        let b_sz = batch.seq_ids.len();
-        let seq_len = batch.token_ids.len() / b_sz;
-        let tokens_t = tokens_t.reshape((b_sz, seq_len))?;
+        let tokens_t = tokens_t.reshape((1, total_tokens))?;
         ctx.insert("input_ids".to_string(), tokens_t);
 
         // Feed pixel_values if vision encoder is present
@@ -1435,28 +1550,40 @@ impl LlmBackend for CandleBackend {
 
                     let mut gpu_cache = self.gpu_kv_cache.lock();
                     let block_size = self.kv_config.block_size;
-                    let mut att_outputs = Vec::with_capacity(b_sz);
+                    let mut att_outputs = Vec::with_capacity(batch.seq_ids.len());
 
                     for (i, &seq_id) in batch.seq_ids.iter().enumerate() {
                         let block_table = &batch.block_tables[i];
                         let offset = kv_cache.get_seq_len(seq_id);
-                        
+                        // `q_4d`/`k_4d`/`v_4d` are packed as `(1, total_tokens, ...)` (see the
+                        // `input_ids` construction earlier in `forward_pass`), so this
+                        // sequence's slice of the token axis is `cu_seqlens[i]..cu_seqlens[i+1]`
+                        // — NOT `narrow(0, i, 1)`, which would assume (incorrectly, whenever
+                        // sequences in this batch have different lengths) that dim 0 is a
+                        // per-sequence batch axis of matching uniform length.
+                        let tok_start = batch.cu_seqlens[i] as usize;
+                        let this_seq_len = (batch.cu_seqlens[i + 1] - batch.cu_seqlens[i]) as usize;
+
                         if !is_shared {
                             // `k_4d`/`v_4d` are `Some(..)` exactly when `!is_shared` (see the
                             // construction above), so both are guaranteed populated here.
                             let k_4d_val = k_4d.as_ref().unwrap();
                             let v_4d_val = v_4d.as_ref().unwrap();
-                            let k_i = k_4d_val.narrow(0, i, 1)?;
-                            let v_i = v_4d_val.narrow(0, i, 1)?;
-                            
+                            let k_i = k_4d_val.narrow(1, tok_start, this_seq_len)?;
+                            let v_i = v_4d_val.narrow(1, tok_start, this_seq_len)?;
+
                             let mut t_start = 0;
-                            while t_start < seq_len {
+                            while t_start < this_seq_len {
                                 let abs_idx = offset + t_start;
                                 let block_idx = abs_idx / block_size;
                                 let start_block_offset = abs_idx % block_size;
-                                let block_id = block_table[block_idx];
-                                
-                                let chunk_len = std::cmp::min(seq_len - t_start, block_size - start_block_offset);
+                                let block_id = *block_table.get(block_idx).ok_or_else(|| anyhow!(
+                                    "block_idx {} out of range for this sequence's block_table \
+                                     (len={}) — scheduler/backend KV-allocation mismatch",
+                                    block_idx, block_table.len()
+                                ))?;
+
+                                let chunk_len = std::cmp::min(this_seq_len - t_start, block_size - start_block_offset);
                                 let t_end = t_start + chunk_len;
                                 
                                 let k_chunk = k_i.narrow(1, t_start, chunk_len)?;
@@ -1541,7 +1668,7 @@ impl LlmBackend for CandleBackend {
                         };
 
                         let num_active_blocks = std::cmp::min(
-                            (offset + seq_len + block_size - 1) / block_size,
+                            (offset + this_seq_len + block_size - 1) / block_size,
                             block_table.len()
                         );
                         let mut k_blocks = Vec::with_capacity(num_active_blocks);
@@ -1572,7 +1699,7 @@ impl LlmBackend for CandleBackend {
                         let mut k_hist_squeezed = Tensor::cat(&k_blocks, 0)?;
                         let mut v_hist_squeezed = Tensor::cat(&v_blocks, 0)?;
 
-                        let total_len = offset + seq_len;
+                        let total_len = offset + this_seq_len;
                         k_hist_squeezed = k_hist_squeezed.narrow(0, 0, total_len)?;
                         v_hist_squeezed = v_hist_squeezed.narrow(0, 0, total_len)?;
 
@@ -1587,8 +1714,8 @@ impl LlmBackend for CandleBackend {
                         let total_seq_len = k_hist_squeezed.dim(0)?;
                         let layer_n_kv_heads = k_hist_squeezed.dim(1)?;
 
-                        let q_i = q_4d_rotated.narrow(0, i, 1)?.squeeze(0)?;
-                        let q_i = q_i.transpose(0, 1)?.contiguous()?; // (n_heads, seq_len, head_dim)
+                        let q_i = q_4d_rotated.narrow(1, tok_start, this_seq_len)?.squeeze(0)?;
+                        let q_i = q_i.transpose(0, 1)?.contiguous()?; // (n_heads, this_seq_len, head_dim)
                         
                         let n_rep = layer_n_heads / layer_n_kv_heads;
                         let k_hist_rep = repeat_kv(k_hist_squeezed.transpose(0, 1)?, n_rep)?.contiguous()?;
@@ -1608,7 +1735,7 @@ impl LlmBackend for CandleBackend {
                             (scores / (layer_head_dim as f64).sqrt())?
                         };
 
-                        let num_tokens = seq_len;
+                        let num_tokens = this_seq_len;
                         let seq_len_before = total_seq_len - num_tokens;
 
                         let scores = if num_tokens > 1 {
@@ -1634,12 +1761,20 @@ impl LlmBackend for CandleBackend {
                             v_hist_rep
                         };
                         let out_i = probs.matmul(&v_hist_rep)?;
-                        let out_i = out_i.transpose(0, 1)?.contiguous()?; // (seq_len, n_heads, head_dim)
-                        let out_i = out_i.reshape((seq_len, layer_n_heads * layer_head_dim))?;
+                        let out_i = out_i.transpose(0, 1)?.contiguous()?; // (this_seq_len, n_heads, head_dim)
+                        let out_i = out_i.reshape((this_seq_len, layer_n_heads * layer_head_dim))?;
                         att_outputs.push(out_i);
                     }
 
-                    let att_out = Tensor::stack(&att_outputs, 0)?;
+                    // Concatenate along the TOKEN axis (not stack along a batch axis):
+                    // each `out_i` has its own `this_seq_len`, which need not match across
+                    // sequences in this batch, so `Tensor::stack` (which requires identical
+                    // shapes) would panic on a mixed-length batch. Concatenating back-to-back
+                    // in `cu_seqlens` order reconstructs the same packed `(1, total_tokens, ..)`
+                    // layout as every other tensor flowing through this graph.
+                    let att_out_flat = Tensor::cat(&att_outputs, 0)?;
+                    let total_tokens_out = att_out_flat.dim(0)?;
+                    let att_out = att_out_flat.reshape((1, total_tokens_out, layer_n_heads * layer_head_dim))?;
                     ctx.insert(output.clone(), att_out);
                 }
                 Operator::Activation { input, output, act } => {
@@ -1701,16 +1836,27 @@ impl LlmBackend for CandleBackend {
                 }
                 Operator::SpliceTensors { text_embeds, visual_embeds, output } => {
                     let t_emb = ctx.get(text_embeds)?;
-                    let v_emb = ctx.get(visual_embeds)?;
-                    // Unify dtypes: visual embeddings (may be F32 on CPU) must match text embedding dtype
-                    let v_emb = v_emb.to_dtype(t_emb.dtype())?;
-                    let v_emb_narrowed = if v_emb.dim(2)? > t_emb.dim(2)? {
-                        v_emb.narrow(2, 0, t_emb.dim(2)?)?
+                    // Only splice if an image is actually attached to this request.
+                    // Mirrors the audio path's SpliceAudioTensors guard below: without this
+                    // check, ordinary text containing a run of >=16 identical token IDs
+                    // (e.g. padding or repeated punctuation) would be silently overwritten
+                    // with a zero-valued dummy visual embedding on every vision-capable model.
+                    let active_image = crate::backends::ACTIVE_IMAGE_PATH.lock().clone();
+                    let has_preloaded = self.visual_embeddings.lock().is_some();
+                    let out = if active_image.is_none() && !has_preloaded {
+                        t_emb.clone()
                     } else {
-                        v_emb.clone()
+                        let v_emb = ctx.get(visual_embeds)?;
+                        // Unify dtypes: visual embeddings (may be F32 on CPU) must match text embedding dtype
+                        let v_emb = v_emb.to_dtype(t_emb.dtype())?;
+                        let v_emb_narrowed = if v_emb.dim(2)? > t_emb.dim(2)? {
+                            v_emb.narrow(2, 0, t_emb.dim(2)?)?
+                        } else {
+                            v_emb.clone()
+                        };
+                        let token_ids = &batch.token_ids;
+                        splice_visual_embeddings(&t_emb, &v_emb_narrowed, token_ids, 0, 0)?
                     };
-                    let token_ids = &batch.token_ids;
-                    let out = splice_visual_embeddings(&t_emb, &v_emb_narrowed, token_ids, 0, 0)?;
                     ctx.insert(output.clone(), out);
                 }
                 Operator::AudioEmbed { audio_values, output } => {
@@ -1791,7 +1937,14 @@ impl LlmBackend for CandleBackend {
                         }
                     }
                     
-                    if let Some(idx) = ds_idx {
+                    let active_image = crate::backends::ACTIVE_IMAGE_PATH.lock().clone();
+                    let has_preloaded = self.visual_embeddings.lock().is_some();
+                    if active_image.is_none() && !has_preloaded {
+                        // No image attached to this request: DeepStack fusion must not
+                        // splice the (meaningless, zero-input-derived) vision features
+                        // into ordinary text — same guard as SpliceTensors above.
+                        ctx.insert(output.clone(), in_t.clone());
+                    } else if let Some(idx) = ds_idx {
                         let ds_feat = vis_embeds.narrow(2, (1 + idx) * hidden_dim, hidden_dim)?;
                         let token_ids = &batch.token_ids;
                         let fused = splice_visual_embeddings(&in_t, &ds_feat, token_ids, 0, 0)?;
@@ -2000,12 +2153,31 @@ impl LlmBackend for CandleBackend {
             kv_cache.set_seq_len(seq_id, seq_len_before + num_tokens);
         }
 
-        // Extract logits for next token prediction
-        let mut next_tokens = Vec::with_capacity(b_sz);
-        let mut batch_logits = Vec::with_capacity(b_sz);
+        // Extract logits for next token prediction.
+        //
+        // `logits` is `(1, total_tokens, vocab)` — the whole batch packed as a
+        // single row (see the `input_ids` construction above). Each sequence's
+        // next-token logits live at the ABSOLUTE token-axis position of that
+        // sequence's LAST token, i.e. `cu_seqlens[i + 1] - 1`, not at a shared
+        // `seq_len - 1` offset (which was only ever correct when every sequence
+        // in the batch had the same length).
+        let mut next_tokens = Vec::with_capacity(num_seqs);
+        let mut batch_logits = Vec::with_capacity(num_seqs);
 
-        for i in 0..b_sz {
-            let seq_logits_t = logits.narrow(0, i, 1)?.narrow(1, seq_len - 1, 1)?.squeeze(0)?.squeeze(0)?;
+        for i in 0..num_seqs {
+            // Per-sequence length (from cu_seqlens, the authoritative source of how many
+            // tokens sequence `i` actually contributed to this batch) must be > 0 before
+            // we can subtract 1 to index the last token's logits — a batch entry with
+            // zero tokens would otherwise underflow (usize) and panic/wrap.
+            let this_seq_len = (batch.cu_seqlens[i + 1] - batch.cu_seqlens[i]) as usize;
+            if this_seq_len == 0 {
+                return Err(anyhow!(
+                    "forward_pass: sequence at batch index {} has zero tokens (cu_seqlens[{}]={}, cu_seqlens[{}]={}) — cannot extract next-token logits",
+                    i, i, batch.cu_seqlens[i], i + 1, batch.cu_seqlens[i + 1]
+                ));
+            }
+            let last_abs_idx = batch.cu_seqlens[i + 1] as usize - 1;
+            let seq_logits_t = logits.narrow(0, 0, 1)?.narrow(1, last_abs_idx, 1)?.squeeze(0)?.squeeze(0)?;
             let seq_logits = seq_logits_t.to_dtype(DType::F32)?.to_vec1::<f32>()?;
 
 
@@ -2085,5 +2257,58 @@ mod tests {
         let diff = (&x - &deq).unwrap().abs().unwrap();
         let max_diff = diff.max_all().unwrap().to_scalar::<f32>().unwrap();
         assert!(max_diff < 0.7, "Q4 quantization loss too high: max diff = {}", max_diff);
+    }
+
+    /// Regression test: `forward_pass` must reject a batch whose `cu_seqlens`
+    /// doesn't match `token_ids`'s actual total length, rather than silently
+    /// reshaping to a wrong uniform `(num_seqs, len)` grid (the original bug —
+    /// see `let seq_len = batch.token_ids.len() / b_sz` in the pre-fix code,
+    /// which either panicked with a candle "shape mismatch in reshape" error
+    /// on a genuinely mixed-length batch, or — worse — silently produced a
+    /// wrong-but-valid reshape whenever `token_ids.len()` happened to be evenly
+    /// divisible by `seq_ids.len()` despite the per-sequence lengths differing).
+    /// This validation runs before the compute graph is touched, so it is
+    /// exercised here even on a `CandleBackend` with no model loaded.
+    #[test]
+    fn forward_pass_rejects_cu_seqlens_mismatched_with_token_ids() {
+        let backend = CandleBackend::new();
+
+        // Two sequences of DIFFERENT lengths (3 and 5 tokens) packed back to
+        // back, exactly as `Scheduler::step` would build them — but with a
+        // deliberately wrong `cu_seqlens` last entry to prove the check fires.
+        let batch = BatchInput {
+            seq_ids: vec![1, 2],
+            token_ids: vec![0u32; 8],
+            cu_seqlens: vec![0, 3, 7], // wrong: should end at 8
+            block_tables: vec![vec![0], vec![1]],
+            is_prefill: vec![true, true],
+        };
+
+        let err = backend.forward_pass(&batch).expect_err(
+            "cu_seqlens whose last entry doesn't match total token count must be a hard error"
+        );
+        assert!(
+            err.to_string().contains("cu_seqlens"),
+            "expected a cu_seqlens-related error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn forward_pass_rejects_cu_seqlens_wrong_length() {
+        let backend = CandleBackend::new();
+        let batch = BatchInput {
+            seq_ids: vec![1, 2],
+            token_ids: vec![0u32; 8],
+            cu_seqlens: vec![0, 8], // wrong: needs 3 entries for 2 sequences
+            block_tables: vec![vec![0], vec![1]],
+            is_prefill: vec![true, true],
+        };
+        let err = backend.forward_pass(&batch).expect_err(
+            "cu_seqlens with the wrong number of entries must be a hard error"
+        );
+        assert!(
+            err.to_string().contains("cu_seqlens"),
+            "expected a cu_seqlens-related error, got: {err}"
+        );
     }
 }

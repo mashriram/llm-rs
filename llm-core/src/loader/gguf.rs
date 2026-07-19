@@ -2,7 +2,7 @@ use memmap2::{Mmap, MmapOptions};
 use std::fs::File;
 use std::path::Path;
 use std::collections::HashMap;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail, Context};
 use crate::types::WeightDtype;
 
 #[derive(Debug, Clone)]
@@ -28,6 +28,20 @@ pub struct TensorView<'a> {
     pub dtype: WeightDtype,
 }
 
+/// Upper bound on any file-derived count (metadata KV pairs, array elements,
+/// tensor count, tensor dimensionality). GGUF headers store these as untrusted
+/// u32/u64 values read straight from the file; without a sanity cap, a
+/// corrupt or malicious file can make us `Vec::with_capacity(huge_number)`
+/// and OOM/DoS before any real validation happens. 10 million is generous for
+/// any legitimate model file (a 10M-dim tensor axis or 10M metadata KVs would
+/// already be nonsensical) while still being cheap to check.
+const MAX_REASONABLE_COUNT: u64 = 10_000_000;
+
+/// Cap on nested `GgufValue::Array` recursion depth. GGUF arrays can (per
+/// spec) contain arrays of arrays; without a depth cap, a crafted file could
+/// force unbounded recursion (stack overflow) via deeply nested empty arrays.
+const MAX_ARRAY_NESTING_DEPTH: u32 = 32;
+
 /// Byte offset (to end-of-file, matching this loader's original slicing
 /// behavior) + parsed metadata for one tensor, relative to `GgufFile`'s mmap.
 /// Storing an offset instead of a borrowed slice avoids a self-referential
@@ -36,8 +50,32 @@ pub struct TensorView<'a> {
 /// borrow checker, no `unsafe` required.
 struct StoredTensorMeta {
     offset: usize,
+    len: usize,
     shape: Vec<usize>,
     dtype: WeightDtype,
+}
+
+/// Number of raw bytes needed to store `elem_count` elements of `dtype`, in
+/// GGML's on-disk layout. Used to validate that a declared tensor doesn't
+/// claim more data than actually exists between its offset and EOF.
+fn dtype_byte_len(dtype: WeightDtype, elem_count: usize) -> Result<usize> {
+    const Q_BLOCK_ELEMS: usize = 32;
+    match dtype {
+        WeightDtype::F32 => Ok(elem_count * 4),
+        WeightDtype::F16 | WeightDtype::BF16 => Ok(elem_count * 2),
+        WeightDtype::I8 => Ok(elem_count),
+        WeightDtype::Q8_0 => {
+            // 34 bytes per 32-element block: 2-byte f16 scale + 32 i8 values.
+            let blocks = elem_count.div_ceil(Q_BLOCK_ELEMS);
+            Ok(blocks * 34)
+        }
+        WeightDtype::Q4_0 => {
+            // 18 bytes per 32-element block: 2-byte f16 scale + 16 bytes of packed 4-bit values.
+            let blocks = elem_count.div_ceil(Q_BLOCK_ELEMS);
+            Ok(blocks * 18)
+        }
+        WeightDtype::Q4_K => bail!("Q4_K byte-length validation not implemented in this loader"),
+    }
 }
 
 pub struct GgufFile {
@@ -53,7 +91,7 @@ impl GgufFile {
     pub fn tensor(&self, name: &str) -> Option<TensorView<'_>> {
         let meta = self.tensor_meta.get(name)?;
         Some(TensorView {
-            data: &self._mmap[meta.offset..],
+            data: &self._mmap[meta.offset..meta.offset + meta.len],
             shape: meta.shape.clone(),
             dtype: meta.dtype,
         })
@@ -161,6 +199,16 @@ impl<'a> Reader<'a> {
     }
 
     fn read_value(&mut self, value_type: u32) -> Result<GgufValue> {
+        self.read_value_depth(value_type, 0)
+    }
+
+    fn read_value_depth(&mut self, value_type: u32, depth: u32) -> Result<GgufValue> {
+        if depth > MAX_ARRAY_NESTING_DEPTH {
+            bail!(
+                "GGUF array nesting depth {} exceeds max {} — corrupt/malicious file",
+                depth, MAX_ARRAY_NESTING_DEPTH
+            );
+        }
         match value_type {
             GGUF_VALUE_TYPE_UINT8 => Ok(GgufValue::U8(self.read_bytes(1)?[0])),
             GGUF_VALUE_TYPE_INT8 => Ok(GgufValue::I8(self.read_bytes(1)?[0] as i8)),
@@ -183,10 +231,17 @@ impl<'a> Reader<'a> {
             GGUF_VALUE_TYPE_STRING => Ok(GgufValue::String(self.read_string()?)),
             GGUF_VALUE_TYPE_ARRAY => {
                 let item_type = self.read_u32()?;
-                let len = self.read_u64()? as usize;
+                let len = self.read_u64()?;
+                if len > MAX_REASONABLE_COUNT {
+                    bail!(
+                        "GGUF array length {} exceeds sanity bound {} — corrupt/malicious file",
+                        len, MAX_REASONABLE_COUNT
+                    );
+                }
+                let len = len as usize;
                 let mut items = Vec::with_capacity(len);
                 for _ in 0..len {
-                    items.push(self.read_value(item_type)?);
+                    items.push(self.read_value_depth(item_type, depth + 1)?);
                 }
                 Ok(GgufValue::Array(items))
             }
@@ -223,8 +278,22 @@ pub fn load_gguf(path: &Path) -> Result<GgufFile> {
     }
 
     // 3. Counts
-    let tensor_count = r.read_u64()? as usize;
-    let metadata_kv_count = r.read_u64()? as usize;
+    let tensor_count_raw = r.read_u64()?;
+    let metadata_kv_count_raw = r.read_u64()?;
+    if tensor_count_raw > MAX_REASONABLE_COUNT {
+        bail!(
+            "GGUF tensor_count {} exceeds sanity bound {} — corrupt/malicious file",
+            tensor_count_raw, MAX_REASONABLE_COUNT
+        );
+    }
+    if metadata_kv_count_raw > MAX_REASONABLE_COUNT {
+        bail!(
+            "GGUF metadata_kv_count {} exceeds sanity bound {} — corrupt/malicious file",
+            metadata_kv_count_raw, MAX_REASONABLE_COUNT
+        );
+    }
+    let tensor_count = tensor_count_raw as usize;
+    let metadata_kv_count = metadata_kv_count_raw as usize;
 
     // 4. Metadata
     let mut metadata = HashMap::new();
@@ -246,7 +315,14 @@ pub fn load_gguf(path: &Path) -> Result<GgufFile> {
     let mut temp_tensors = Vec::with_capacity(tensor_count);
     for _ in 0..tensor_count {
         let name = r.read_string()?;
-        let ndim = r.read_u32()? as usize;
+        let ndim_raw = r.read_u32()?;
+        if ndim_raw as u64 > MAX_REASONABLE_COUNT {
+            bail!(
+                "GGUF tensor {:?} has ndim {} exceeding sanity bound {} — corrupt/malicious file",
+                name, ndim_raw, MAX_REASONABLE_COUNT
+            );
+        }
+        let ndim = ndim_raw as usize;
         let mut shape = Vec::with_capacity(ndim);
         for _ in 0..ndim {
             shape.push(r.read_u64()? as usize);
@@ -280,14 +356,21 @@ pub fn load_gguf(path: &Path) -> Result<GgufFile> {
         Some(GgufValue::I32(align)) => *align as usize,
         _ => 32, // default alignment
     };
+    // `general.alignment: 0` (or a negative i32 that lands on 0) would divide-by-zero
+    // in the padding computation below — reject it explicitly instead of panicking.
+    if alignment == 0 {
+        bail!("GGUF general.alignment is 0 — corrupt/malicious file (alignment must be nonzero)");
+    }
 
     let header_size = r.pos;
     let padding = (alignment - (header_size % alignment)) % alignment;
     let data_section_start = header_size + padding;
 
-    // Bounds-check every tensor's start offset up front — a corrupt/truncated
-    // GGUF file with an out-of-range offset must fail loudly here, not panic
-    // later on first access via an out-of-bounds slice index in `tensor()`.
+    // Bounds-check every tensor's start offset AND declared byte length up
+    // front — a corrupt/truncated GGUF file with an out-of-range offset or a
+    // tensor whose (shape, dtype) claims more bytes than exist between its
+    // offset and EOF must fail loudly here, not panic/read-out-of-bounds
+    // later on first access via `tensor()`.
     let mut tensor_meta = HashMap::new();
     for t in temp_tensors {
         let tensor_start = data_section_start + t.offset as usize;
@@ -298,8 +381,27 @@ pub fn load_gguf(path: &Path) -> Result<GgufFile> {
             );
         }
 
+        let elem_count: usize = t.shape.iter().product();
+        let byte_len = dtype_byte_len(t.dtype, elem_count)
+            .with_context(|| format!("tensor {:?}", t.name))?;
+        if tensor_start + byte_len > data_slice.len() {
+            bail!(
+                "GGUF tensor {:?} declares {} bytes (shape {:?}, dtype {:?}) starting at offset \
+                 {}, but the file only has {} bytes remaining: file is truncated or corrupt",
+                t.name, byte_len, t.shape, t.dtype, tensor_start, data_slice.len() - tensor_start
+            );
+        }
+
+        // Silently overwriting a duplicate tensor name would leave `tensor_meta`
+        // pointing at whichever of the two entries won the race, hiding a
+        // malformed/ambiguous file instead of failing loudly.
+        if tensor_meta.contains_key(&t.name) {
+            bail!("GGUF file declares tensor {:?} more than once", t.name);
+        }
+
         tensor_meta.insert(t.name, StoredTensorMeta {
             offset: tensor_start,
+            len: byte_len,
             shape: t.shape,
             dtype: t.dtype,
         });

@@ -339,7 +339,12 @@ async fn main() -> anyhow::Result<()> {
     }
     println!();
 
-    let mut eos_token_ids = vec![backend.eos_token_id()];
+    let mut eos_token_ids: Vec<u32> = Vec::new();
+    if let Some(id) = backend.eos_token_id() {
+        eos_token_ids.push(id);
+    } else {
+        eprintln!("Warning: no EOS token id could be determined for this model; relying on --max-new-tokens and known chat-template stop strings only.");
+    }
     for tok in &["<|im_end|>", "<end_of_turn>", "<turn|>"] {
         if let Some(id) = tokenizer.token_to_id(tok) {
             eos_token_ids.push(id);

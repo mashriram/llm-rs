@@ -33,9 +33,17 @@ pub trait LlmBackend: Send + Sync {
     /// Clean up any resources associated with the sequence.
     fn clear_sequence(&self, _seq_id: SeqId) {}
 
-    /// Get the EOS token ID for this backend.
-    fn eos_token_id(&self) -> u32 {
-        2
+    /// Get the EOS token ID for this backend, if one could be determined.
+    ///
+    /// Returns `None` rather than guessing when no EOS id can be resolved from
+    /// GGUF metadata (`tokenizer.ggml.eos_token_id`), HF config
+    /// (`eos_token_id`), or a best-effort tokenizer lookup — silently assuming
+    /// Llama's `2` is correct for every model is wrong for many non-Llama
+    /// tokenizers and causes generation to never stop correctly. Callers must
+    /// handle `None` explicitly (e.g. rely on `max_new_tokens` alone, or
+    /// resolve additional EOS candidates via the tokenizer as `chat.rs` does).
+    fn eos_token_id(&self) -> Option<u32> {
+        None
     }
 
     /// Set whether the backend should explicitly dequantize weights to F16.

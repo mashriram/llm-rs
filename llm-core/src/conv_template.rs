@@ -104,12 +104,18 @@ impl Conversation {
                 }
             };
             
-            let role_tmpl = self.role_templates.get(&msg.role).cloned()
-                .unwrap_or_else(|| "{anchor}".to_string());
-            
-            let formatted_msg = role_tmpl
-                .replace(&format!("{{{}_message}}", msg.role), &content_str)
-                .replace(&format!("{{{}}}", msg.role), &content_str);
+            // Fall back to emitting the content directly when no role template is
+            // configured for this role. The previous fallback literal "{anchor}" was
+            // never substituted by the `.replace()` calls below (which only ever
+            // target "{role}_message"/"{role}" patterns) — it always rendered as the
+            // literal text "{anchor}", silently dropping the message content
+            // entirely. Emitting the raw content instead guarantees it is never lost.
+            let formatted_msg = match self.role_templates.get(&msg.role) {
+                Some(role_tmpl) => role_tmpl
+                    .replace(&format!("{{{}_message}}", msg.role), &content_str)
+                    .replace(&format!("{{{}}}", msg.role), &content_str),
+                None => content_str.clone(),
+            };
 
             prompt.push_str(&role_name);
             prompt.push_str(&self.role_content_sep);

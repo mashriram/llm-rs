@@ -357,6 +357,8 @@ impl AudioEncoder {
 
         // 2. Position Embeddings
         // Gemma4AudioRelPositionalEncoding
+        // See the comment on the identical constant in the attention forward pass
+        // below: this is a fixed architectural constant, not GGUF-metadata-exposable.
         let chunk_size = 12;
         let rel_len = chunk_size + 1;
 
@@ -467,6 +469,12 @@ impl AudioEncoder {
         let (batch_size, seq_len, hidden_size) = q.dims3()?;
         let num_heads = self.num_heads;
         let head_dim = self.hidden_dim / self.num_heads;
+        // These are NOT exposed as GGUF metadata keys anywhere in llama.cpp's/HF's
+        // Gemma-4-Conformer export (unlike `hidden_dim`/`num_layers` above, which
+        // come from `clip.audio.embedding_length`/`clip.audio.block_count`) — they
+        // are fixed architectural constants of this specific Conformer variant's
+        // local/chunked attention window, not a per-checkpoint hyperparameter.
+        // Intentionally hardcoded; not a model-agnosticism bug.
         let chunk_size = 12;
         let max_past_horizon = 12;
         let max_future_horizon = 0;
@@ -813,8 +821,18 @@ fn normalize_audio_tensors(
     }
 
     for layer_idx in 0..num_layers {
-        if let (Some(q), Some(k), Some(v)) = (q_weights.remove(&layer_idx), k_weights.remove(&layer_idx), v_weights.remove(&layer_idx)) {
-            let qkv = Tensor::cat(&[&q, &k, &v], 0)?;
+        let q_w = q_weights.remove(&layer_idx);
+        let k_w = k_weights.remove(&layer_idx);
+        let v_w = v_weights.remove(&layer_idx);
+        // Remember each projection's actual output dimension (from its weight)
+        // before the weights are consumed below, so a missing bias for one of
+        // Q/K/V can be zero-filled at the CORRECT shape instead of a bogus
+        // length-1 placeholder that would break `broadcast_add` downstream.
+        let q_out_dim = q_w.as_ref().map(|t| t.dim(0)).transpose()?;
+        let k_out_dim = k_w.as_ref().map(|t| t.dim(0)).transpose()?;
+        let v_out_dim = v_w.as_ref().map(|t| t.dim(0)).transpose()?;
+        if let (Some(q), Some(k), Some(v)) = (&q_w, &k_w, &v_w) {
+            let qkv = Tensor::cat(&[q, k, v], 0)?;
             normalized.insert(format!("audio.layers.{}.attn_qkv.weight", layer_idx), qkv);
         }
         let q_b = q_biases.remove(&layer_idx);
@@ -824,9 +842,9 @@ fn normalize_audio_tensors(
             let dtype = q_b.as_ref().or(k_b.as_ref()).or(v_b.as_ref())
                 .map(|t| t.dtype())
                 .ok_or_else(|| anyhow!("no q/k/v bias available for layer {}", layer_idx))?;
-            let q_b = q_b.map(Ok).unwrap_or_else(|| Tensor::zeros(1, dtype, device))?;
-            let k_b = k_b.map(Ok).unwrap_or_else(|| Tensor::zeros(1, dtype, device))?;
-            let v_b = v_b.map(Ok).unwrap_or_else(|| Tensor::zeros(1, dtype, device))?;
+            let q_b = q_b.map(Ok).unwrap_or_else(|| Tensor::zeros(q_out_dim.unwrap_or(1), dtype, device))?;
+            let k_b = k_b.map(Ok).unwrap_or_else(|| Tensor::zeros(k_out_dim.unwrap_or(1), dtype, device))?;
+            let v_b = v_b.map(Ok).unwrap_or_else(|| Tensor::zeros(v_out_dim.unwrap_or(1), dtype, device))?;
             let qkv_b = Tensor::cat(&[&q_b, &k_b, &v_b], 0)?;
             normalized.insert(format!("audio.layers.{}.attn_qkv.bias", layer_idx), qkv_b);
         } else if let Some(qkv_w) = normalized.get(&format!("audio.layers.{}.attn_qkv.weight", layer_idx)) {

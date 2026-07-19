@@ -16,7 +16,10 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
     let hidden_size = val.get("hidden_size").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("hidden_size missing from config"))? as usize;
     let num_hidden_layers = val.get("num_hidden_layers").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("num_hidden_layers missing from config"))? as usize;
     let num_attention_heads = val.get("num_attention_heads").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("num_attention_heads missing from config"))? as usize;
-    
+    if num_attention_heads == 0 {
+        return Err(anyhow!("num_attention_heads must be nonzero (malformed config.json)"));
+    }
+
     let num_key_value_heads = val.get("num_key_value_heads").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(num_attention_heads);
     let head_dim = val.get("head_dim").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(hidden_size / num_attention_heads);
     
@@ -69,12 +72,32 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
     let mut is_deepstack_layers = None;
     let mut projector_type = None;
 
-    let modalities = ["vision_config", "vision_config_dict", "audio_config", "audio_config_dict", "image_config", "multimodal_config"];
-    let mut config_block = None;
-    for m in modalities {
+    let mut has_audio_encoder = false;
+    let mut audio_hidden_dim = None;
+    let mut audio_block_count = None;
+    let mut audio_embedding_length = None;
+    let mut audio_num_mel_bins = None;
+
+    // Vision and audio modalities are detected (and their config blocks resolved)
+    // SEPARATELY: audio_config/audio_*-prefixed keys are evidence of an AUDIO
+    // encoder, not a vision one — treating them as vision (as a previous version
+    // of this function did) mislabeled audio-only multimodal models.
+    let vision_keys = ["vision_config", "vision_config_dict", "image_config", "multimodal_config"];
+    let mut vision_config_block = None;
+    for m in vision_keys {
         if let Some(block) = val.get(m) {
-            config_block = Some(block);
+            vision_config_block = Some(block);
             has_vision_encoder = true;
+            break;
+        }
+    }
+
+    let audio_keys = ["audio_config", "audio_config_dict"];
+    let mut audio_config_block = None;
+    for m in audio_keys {
+        if let Some(block) = val.get(m) {
+            audio_config_block = Some(block);
+            has_audio_encoder = true;
             break;
         }
     }
@@ -82,15 +105,25 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
     if !has_vision_encoder {
         if let Some(obj) = val.as_object() {
             for key in obj.keys() {
-                if key.starts_with("vision_") || key.starts_with("image_") || key.starts_with("audio_") || key.starts_with("video_") || key.starts_with("multimodal_") {
+                if key.starts_with("vision_") || key.starts_with("image_") || key.starts_with("video_") || key.starts_with("multimodal_") {
                     has_vision_encoder = true;
                     break;
                 }
             }
         }
     }
+    if !has_audio_encoder {
+        if let Some(obj) = val.as_object() {
+            for key in obj.keys() {
+                if key.starts_with("audio_") {
+                    has_audio_encoder = true;
+                    break;
+                }
+            }
+        }
+    }
 
-    if let Some(vc) = config_block {
+    if let Some(vc) = vision_config_block {
         vision_hidden_dim = vc.get("hidden_size").or_else(|| vc.get("hidden_dim")).and_then(|v| v.as_u64()).map(|v| v as usize);
         vision_patch_size = vc.get("patch_size").and_then(|v| v.as_u64()).map(|v| v as usize);
         vision_image_size = vc.get("image_size").and_then(|v| v.as_u64()).map(|v| v as usize);
@@ -98,7 +131,7 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
         vision_num_heads = vc.get("num_attention_heads").or_else(|| vc.get("num_heads")).and_then(|v| v.as_u64()).map(|v| v as usize);
         vision_projection_dim = vc.get("projection_dim").or_else(|| vc.get("projection_size")).and_then(|v| v.as_u64()).map(|v| v as usize);
         spatial_merge_size = vc.get("spatial_merge_size").and_then(|v| v.as_u64()).map(|v| v as usize);
-        
+
         is_deepstack_layers = vc.get("is_deepstack_layers").and_then(|v| v.as_array()).map(|arr| {
             arr.iter().map(|item| item.as_bool().unwrap_or(false)).collect::<Vec<bool>>()
         });
@@ -114,16 +147,28 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
         projector_type = val.get("projector_type").and_then(|v| v.as_str()).map(|s| s.to_string());
     }
 
+    if let Some(ac) = audio_config_block {
+        audio_hidden_dim = ac.get("hidden_size").or_else(|| ac.get("hidden_dim")).or_else(|| ac.get("d_model")).and_then(|v| v.as_u64()).map(|v| v as usize);
+        audio_block_count = ac.get("num_hidden_layers").or_else(|| ac.get("num_layers")).or_else(|| ac.get("encoder_layers")).and_then(|v| v.as_u64()).map(|v| v as usize);
+        audio_embedding_length = ac.get("embedding_length").or_else(|| ac.get("hidden_size")).and_then(|v| v.as_u64()).map(|v| v as usize);
+        audio_num_mel_bins = ac.get("num_mel_bins").or_else(|| ac.get("n_mels")).and_then(|v| v.as_u64()).map(|v| v as usize);
+    } else if has_audio_encoder {
+        audio_hidden_dim = val.get("audio_hidden_size").or_else(|| val.get("audio_hidden_dim")).and_then(|v| v.as_u64()).map(|v| v as usize);
+        audio_block_count = val.get("audio_num_hidden_layers").or_else(|| val.get("audio_num_layers")).and_then(|v| v.as_u64()).map(|v| v as usize);
+        audio_embedding_length = val.get("audio_embedding_length").and_then(|v| v.as_u64()).map(|v| v as usize);
+        audio_num_mel_bins = val.get("audio_num_mel_bins").and_then(|v| v.as_u64()).map(|v| v as usize);
+    }
+
     let final_logit_softcapping = val.get("final_logit_softcapping").and_then(|v| v.as_f64()).map(|v| v as f32);
 
     let model_type = val.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
-    let is_gemma = model_type == "gemma" || model_type == "gemma2" || model_type == "gemma4" ||
-        val.get("architectures")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().any(|arch| {
-                let arch_str = arch.as_str().unwrap_or("");
-                arch_str.contains("Gemma")
-            })).unwrap_or(false);
+    let architectures: Vec<String> = val.get("architectures")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|a| a.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    // Single source of truth shared with backends/candle.rs's GGUF loading path —
+    // see `is_gemma_arch`'s doc comment for why this must not be duplicated independently.
+    let is_gemma = crate::types::is_gemma_arch(model_type, &architectures);
 
     let ple_dim = val.get("hidden_size_per_layer_input").and_then(|v| v.as_u64()).map(|v| v as usize);
     let embed_scale = if is_gemma {
@@ -157,11 +202,11 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
         spatial_merge_size,
         is_deepstack_layers,
         projector_type,
-        has_audio_encoder: false,
-        audio_hidden_dim: None,
-        audio_block_count: None,
-        audio_embedding_length: None,
-        audio_num_mel_bins: None,
+        has_audio_encoder,
+        audio_hidden_dim,
+        audio_block_count,
+        audio_embedding_length,
+        audio_num_mel_bins,
         shared_kv_layers: None,
         sliding_window_pattern: None,
         sliding_window: None,

@@ -254,7 +254,16 @@ fn test_gemma4_agnostic_metadata() {
     assert_eq!(meta.head_dim, 128);
     assert_eq!(meta.intermediate_dim, 4096);
     assert_eq!(meta.max_seq_len, 131072);
-    assert!(meta.has_vision_encoder);
+    // This config only declares an `audio_config` block (no vision_config/image_config/
+    // etc.) — it's an audio-only multimodal model. Previously, model/config.rs's
+    // modality-detection loop treated `audio_config`/`audio_*`-prefixed keys as
+    // evidence of a VISION encoder (a confirmed bug: audio configs were mislabeled
+    // as vision), so this test asserted `has_vision_encoder == true` here — that was
+    // asserting the BUG, not the correct behavior. Vision and audio are now detected
+    // independently: this config has has_audio_encoder == true and
+    // has_vision_encoder == false, which is correct.
+    assert!(meta.has_audio_encoder);
+    assert!(!meta.has_vision_encoder);
 }
 
 #[test]
@@ -1691,15 +1700,29 @@ fn test_dequantize_weight() {
 
 #[test]
 fn test_q8_block_parse_scale_is_f16() {
+    // A real GGML Q8_0 block is EXACTLY 34 bytes: 2-byte f16 scale + 32 i8
+    // values. `parse_q8_0_block` now rejects any other length (previously it
+    // silently accepted a truncated block and returned partial/garbage
+    // results) — build a full-size block here instead of a 6-byte stub.
     let scale_f16 = half::f16::from_f32(0.5f32);
     let scale_bytes = scale_f16.to_le_bytes();
     let mut block = Vec::new();
     block.extend_from_slice(&scale_bytes);
     block.extend_from_slice(&[10u8, 20u8, 226u8, 0u8]); // 226 is -30 as u8
+    block.extend(std::iter::repeat(0u8).take(28)); // pad remaining 28 values to reach 32 total
 
-    let (scale, values) = llm_core::quantization::parse_q8_0_block(&block);
+    let (scale, values) = llm_core::quantization::parse_q8_0_block(&block).unwrap();
     assert!((scale - 0.5).abs() < 1e-5);
-    assert_eq!(values, vec![10, 20, -30, 0]);
+    assert_eq!(values.len(), 32);
+    assert_eq!(&values[..4], &[10, 20, -30, 0]);
+}
+
+#[test]
+fn test_q8_block_parse_rejects_wrong_size() {
+    // Anything other than exactly 34 bytes is not a valid Q8_0 block and must
+    // error instead of silently returning `(0.0, vec![])`.
+    assert!(llm_core::quantization::parse_q8_0_block(&[0u8; 6]).is_err());
+    assert!(llm_core::quantization::parse_q8_0_block(&[]).is_err());
 }
 
 #[test]
