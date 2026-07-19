@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "llm-rs"
+version = "0.1.0"
+description = "Hardware-agnostic, model-agnostic LLM inference engine — Python bindings"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+module-name = "llm_rs._llm_rs_native"
+python-source = "python"
+manifest-path = "Cargo.toml"

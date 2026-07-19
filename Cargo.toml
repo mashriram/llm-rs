@@ -7,6 +7,7 @@ members = [
     "llm-cluster",
     "llm-ffi",
     "llm-tests",
+    "llm-py",
 ]
 resolver = "2"
 
