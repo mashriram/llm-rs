@@ -502,8 +502,39 @@ impl LlmBackend for CandleBackend {
         let meta = if is_gguf {
             let mut file = std::fs::File::open(path)
                 .context(format!("Failed to open GGUF file: {:?}", path))?;
-            let model = candle_core::quantized::gguf_file::Content::read(&mut file)
-                .context("Failed to read GGUF content")?;
+            let model = candle_core::quantized::gguf_file::Content::read(&mut file).map_err(|e| {
+                // candle-core's GGUF header parser aborts the ENTIRE file scan
+                // (not just the offending tensor) the moment it hits a GGML
+                // tensor dtype id it doesn't recognize - confirmed via a real
+                // GGUF file (a Qwen2.5-0.5B "Q2_K" export that mixes in
+                // llama.cpp's newer IQ4_NL "importance quantization" format
+                // for most weight tensors, dtype id 20). candle-core 0.9.2
+                // has no dequantization support for ANY IQ-series type
+                // (IQ1_S/IQ2_XXS/IQ2_XS/IQ3_XXS/IQ4_NL/IQ3_S/IQ2_S/IQ4_XS/
+                // IQ1_M - confirmed by grepping its source), so this is a
+                // real, currently-unsupported quantization family, not a
+                // corrupt file. Give an actionable message instead of the
+                // raw parser error, which just says "unknown dtype for
+                // tensor N" with no indication of what that means or what
+                // to do about it.
+                let msg = e.to_string();
+                if msg.contains("unknown dtype for tensor") {
+                    anyhow!(
+                        "GGUF file {:?} uses a quantization format this build doesn't support \
+                         yet ({msg}). This usually means an \"IQ\"-series type (IQ4_NL, IQ2_XXS, \
+                         etc. - llama.cpp's newer \"importance quantization\" formats), which the \
+                         underlying candle-core tensor library has no dequantization support for \
+                         at all. Classic quant types (F16/F32/BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1, \
+                         and the K-quant family Q2_K..Q8_K) all work fine - try a different quant \
+                         of the same model (Q4_K_M and Q8_0 are usually safe choices; `llm pull` \
+                         warns about this before downloading when it can detect it from the \
+                         filename).",
+                        path
+                    )
+                } else {
+                    anyhow::Error::new(e).context("Failed to read GGUF content")
+                }
+            })?;
 
             // Discover and load mmproj metadata if a matching mmproj file exists
             let mut mmproj_metadata = HashMap::new();

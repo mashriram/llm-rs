@@ -12,6 +12,25 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
     let val: serde_json::Value = serde_json::from_str(&contents)
         .map_err(|e| anyhow!("Failed to parse config.json: {}", e))?;
 
+    // Reject pre-quantized safetensors formats we don't implement dequant
+    // kernels for (bitsandbytes NF4/FP4, AWQ, GPTQ each pack weights with
+    // their own group-scale/zero-point layout) with a clear error, rather
+    // than silently loading the packed bytes as if they were plain
+    // F16/BF16 weights - which would load "successfully" and produce
+    // meaningless output with no indication anything is wrong. This is a
+    // defense-in-depth check for models loaded directly from disk (not
+    // via `llm pull`, which already warns about this before download).
+    if let Some(qc) = val.get("quantization_config") {
+        let method = qc.get("quant_method").and_then(|v| v.as_str()).unwrap_or("unknown");
+        if matches!(method.to_lowercase().as_str(), "bitsandbytes" | "bnb" | "bnb_4bit" | "awq" | "gptq") {
+            return Err(anyhow!(
+                "this model is pre-quantized with '{method}', which llm-rs does not yet support \
+                 (no dequantization kernel for this packed-weight format) - use a GGUF-quantized \
+                 version of this model instead, or its unquantized/F16 safetensors version",
+            ));
+        }
+    }
+
     let vocab_size = val.get("vocab_size").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("vocab_size missing from config"))? as usize;
     let hidden_size = val.get("hidden_size").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("hidden_size missing from config"))? as usize;
     let num_hidden_layers = val.get("num_hidden_layers").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("num_hidden_layers missing from config"))? as usize;
