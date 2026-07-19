@@ -57,6 +57,40 @@ divergence; that assumption is false, see below).
   coverage). vision-stability's code here predates and was superseded by
   cpu's own vision/audio work — not something to port forward.
 
+## Manual regression pass (cpu/mlx vs vision-stability), 2026-07-19
+Per user request, did a deep line-by-line diff review (via subagent) beyond
+the Task 1 skim, specifically hunting for functionality present in
+vision-stability that cpu/mlx silently dropped.
+
+- **CONFIRMED REGRESSION**: `llm-core/src/backends/audio.rs` — vision-
+  stability's Whisper-style audio encoder (Conv1d x2 → abs. pos embed →
+  standard MHA transformer blocks, tensor names like
+  `audio_encoder.layers.N.self_attn.{q,k,v}_proj`, defaults matching
+  Whisper-large-v3: hidden_dim=1280/layers=32/heads=20) was fully replaced,
+  not relocated, by a Gemma-4-style Conformer audio encoder (SubSample
+  Conv2d, chunked local attention, `a.conv1d.N.*`/`a.blk.N.*` tensor names,
+  defaults 1024/12/8). Confirmed via full-tree grep: no remnant of the old
+  Whisper naming/architecture exists in cpu or mlx (mlx == cpu here,
+  byte-identical). **Any checkpoint with a Whisper-derived audio encoder
+  that vision-stability could load will fail or produce garbage on
+  cpu/mlx.** This is a real loss of model-family support that needs an
+  explicit decision (see below), not something to silently accept.
+- Minor/unconfirmed: in `candle.rs`, `splice_visual_embeddings(...)` calls
+  now pass hardcoded `vision_start_id=0, vision_end_id=0` instead of
+  vision-stability's Qwen2-VL-specific `151652/151653`. Likely mitigated
+  by a new "longest-run" placeholder-detection heuristic in
+  `multimodal.rs` used as the primary strategy, with marker IDs as
+  fallback only — but for small images where the placeholder run is under
+  the heuristic's threshold (~16 tokens), behavior could differ from
+  vision-stability. Flagged, not yet verified either way.
+- Everything else checked (candle.rs core forward pass, vision.rs,
+  gguf.rs, sampler.rs, profile/mod.rs, graph/builder.rs, graph/ops.rs,
+  tokenizer.rs, model/config.rs, backends/mod.rs, cli bins,
+  llm-cluster/profiler.rs) came back as genuine supersets — relocated
+  intact into attention.rs/weights.rs/multimodal.rs, or strictly more
+  defensive (removed unwraps, added Result-returning error paths, added
+  RAM-OOM guards). No further deletions found.
+
 ## Backend dispatch audit
 - `cpu` branch: `candle.rs`'s `Backend::new()` (approx) picks device via a
   hardcoded chain: `candle_core::utils::cuda_is_available()` → else try
