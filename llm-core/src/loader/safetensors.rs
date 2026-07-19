@@ -76,7 +76,12 @@ pub fn load_safetensors(path: &Path) -> Result<SafeTensorsFile> {
             safetensors::Dtype::F32 => WeightDtype::F32,
             safetensors::Dtype::F16 => WeightDtype::F16,
             safetensors::Dtype::BF16 => WeightDtype::BF16,
-            safetensors::Dtype::I8 => WeightDtype::Q8_0, // Map to Q8_0 or similar if needed
+            // Raw SafeTensors I8 is a plain signed-byte tensor with NO embedded
+            // per-block scale — it must NOT be mapped to Q8_0, which implies
+            // GGML's 34-byte block layout (f16 scale + 32 i8 values). Doing so
+            // would silently corrupt weights if ever consumed by a
+            // GGML-block-aware dequantizer. Use the distinct `I8` variant instead.
+            safetensors::Dtype::I8 => WeightDtype::I8,
             d => return Err(anyhow!("Unsupported SafeTensors dtype: {:?}", d)),
         };
 

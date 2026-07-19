@@ -242,7 +242,11 @@ impl Scheduler {
             seq.token_history.push(next_token);
             seq.tokens_generated += 1;
 
-            let is_eos = next_token == self.backend.eos_token_id();
+            // `eos_token_id()` is `None` when the backend couldn't determine an
+            // EOS id (see `LlmBackend::eos_token_id`'s doc comment) — in that case
+            // no token can match "the" EOS id, and generation is bounded solely by
+            // `max_new_tokens` below rather than silently assuming Llama's `2`.
+            let is_eos = self.backend.eos_token_id() == Some(next_token);
             let reached_max = seq.tokens_generated >= seq.max_new_tokens;
 
             if is_eos || reached_max {

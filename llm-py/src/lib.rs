@@ -136,7 +136,7 @@ pub struct LLM {
     tokenizer: Arc<LlmTokenizer>,
     runtime: tokio::runtime::Runtime,
     next_seq_id: AtomicU64,
-    eos_token_id: u32,
+    eos_token_id: Option<u32>,
     backend_name: String,
     model_name: String,
     vocab_size: usize,
@@ -397,7 +397,7 @@ impl LLM {
 /// of bug.
 async fn run_batch(
     engine: &ServingEngine,
-    eos_token_id: u32,
+    eos_token_id: Option<u32>,
     requests: Vec<InferRequest>,
     prompt_lens: HashMap<SeqId, usize>,
 ) -> anyhow::Result<Vec<(SeqId, Vec<TokenId>, String, f64, f64)>> {
@@ -428,7 +428,7 @@ async fn run_batch(
                 first_token_at.entry(seq_id).or_insert(now);
                 last_token_at.insert(seq_id, now);
                 tokens.entry(seq_id).or_default().push(token_id);
-                if is_eos || token_id == eos_token_id {
+                if is_eos || Some(token_id) == eos_token_id {
                     finish_reason.insert(seq_id, "stop".to_string());
                     pending.remove(&seq_id);
                 }

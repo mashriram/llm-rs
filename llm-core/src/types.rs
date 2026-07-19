@@ -21,6 +21,28 @@ pub enum HiddenAct {
     GeLU,
 }
 
+/// Single source of truth for detecting whether a model belongs to the Gemma family.
+///
+/// This drives numerically-significant, model-agnostic-in-name-only behavior
+/// (RMSNorm formula, `embed_scale`, GeLU activation fallback, default EOS string)
+/// wherever no more-specific metadata/tensor-presence signal is available.
+/// Both the GGUF loading path (`backends/candle.rs`, which only has a single
+/// `general.architecture` string) and the HF config.json path
+/// (`model/config.rs`, which has both `model_type` and an `architectures` list)
+/// call this SAME function so the heuristic can't drift between the two independently.
+///
+/// NOTE: any Gemma fork/variant whose architecture string isn't in this exact list
+/// will NOT get Gemma-specific handling. Prefer deriving behavior from generic,
+/// metadata/tensor-presence-driven flags (e.g. `ModelMeta::tie_word_embeddings`,
+/// which is computed from actual tensor presence and is correct for non-Gemma
+/// tied-embedding models too) instead of extending this list, wherever feasible.
+pub fn is_gemma_arch(arch_or_model_type: &str, architectures: &[String]) -> bool {
+    arch_or_model_type == "gemma"
+        || arch_or_model_type == "gemma2"
+        || arch_or_model_type == "gemma4"
+        || architectures.iter().any(|a| a.contains("Gemma"))
+}
+
 /// Static metadata extracted from a model's config file.
 /// Populated once at load time; never mutated during inference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,9 +162,14 @@ pub enum WeightDtype {
     F32,
     F16,
     BF16,
-    Q8_0,    // 8-bit symmetric, scale per 32-weight block
+    Q8_0,    // 8-bit symmetric, scale per 32-weight block (GGML block-quantized layout)
     Q4_0,    // 4-bit symmetric, scale per 32-weight block
     Q4_K,    // 4-bit with k-means quantization (GGUF)
+    /// Plain signed-byte tensor with NO embedded per-block scale — e.g. raw
+    /// SafeTensors `I8` tensors. Distinct from `Q8_0`: a `Q8_0`-aware
+    /// dequantizer expects 34-byte blocks (f16 scale + 32 i8 values) and would
+    /// silently misinterpret a raw `I8` tensor's bytes if the two were conflated.
+    I8,
 }
 
 /// Configuration for the KV cache, derived from ModelMeta at load time.

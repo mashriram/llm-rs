@@ -498,10 +498,20 @@ pub fn load_candle_backend(
 }
 
 /// Resolve the set of token ids that should terminate generation: the
-/// backend's own EOS id, plus any of the common chat-turn end markers that
-/// exist in this tokenizer's vocabulary.
+/// backend's own EOS id (if it could determine one — see
+/// `LlmBackend::eos_token_id`'s doc comment; a model whose metadata omits
+/// this is not assumed to use Llama's `2`), plus any of the common
+/// chat-turn end markers that exist in this tokenizer's vocabulary.
 pub fn resolve_eos_token_ids(backend: &dyn LlmBackend, tokenizer: &LlmTokenizer) -> Vec<u32> {
-    let mut ids = vec![backend.eos_token_id()];
+    let mut ids = Vec::new();
+    if let Some(id) = backend.eos_token_id() {
+        ids.push(id);
+    } else {
+        tracing::warn!(
+            "no EOS token id could be determined for this model; relying on \
+             --max-new-tokens and known chat-template stop strings only"
+        );
+    }
     for tok in &["<|im_end|>", "<end_of_turn>", "<turn|>"] {
         if let Some(id) = tokenizer.token_to_id(tok) {
             ids.push(id);

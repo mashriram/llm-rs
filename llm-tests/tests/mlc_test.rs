@@ -619,7 +619,7 @@ fn test_q8_block_parse_scale_is_f16() {
     block[1] = bytes[1];
     for i in 0..32usize { block[2 + i] = i as u8; }
 
-    let (parsed_scale, _) = llm_core::quantization::parse_q8_0_block(&block);
+    let (parsed_scale, _) = llm_core::quantization::parse_q8_0_block(&block).unwrap();
     assert_close(parsed_scale, 0.5f32, 1e-3, "q8 block scale (f16 precision)");
 }
 

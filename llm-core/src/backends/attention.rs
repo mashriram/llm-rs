@@ -188,6 +188,16 @@ fn build_inv_freq(
 }
 
 /// Build per-position cos/sin matrices incorporating KV-cache offset.
+///
+/// `q`/`k` are packed as `(1, total_tokens, n_heads, head_dim)` — a single
+/// "batch of 1" row holding every sequence's tokens back-to-back (see
+/// `CandleBackend::forward_pass`'s `input_ids` construction). Each token's
+/// RoPE position must therefore be derived from ITS OWN sequence's KV-cache
+/// offset plus its offset WITHIN that sequence — not from a single shared
+/// `kv_cache.get_seq_len` call for a `b`-th "batch row", which silently
+/// assumed every sequence in the batch had the same length and were arranged
+/// one-per-batch-row. `batch.cu_seqlens` gives the exact token-axis boundary
+/// of each sequence in the packed buffer, so we walk those boundaries instead.
 fn build_cos_sin(
     b_sz: usize,
     seq_len: usize,
@@ -197,15 +207,29 @@ fn build_cos_sin(
     dtype: DType,
     dev: &candle_core::Device,
 ) -> Result<(Tensor, Tensor)> {
-    let mut pos_vec = Vec::with_capacity(b_sz * seq_len);
-    for b in 0..b_sz {
-        let seq_id = batch.seq_ids[b];
+    let total_tokens = b_sz * seq_len;
+    if batch.cu_seqlens.last().copied() != Some(total_tokens as u32) {
+        return Err(anyhow!(
+            "build_cos_sin: cu_seqlens last entry ({:?}) does not match q/k total token count ({})",
+            batch.cu_seqlens.last(), total_tokens
+        ));
+    }
+    let mut pos_vec = Vec::with_capacity(total_tokens);
+    for (i, &seq_id) in batch.seq_ids.iter().enumerate() {
         let offset = kv_cache.get_seq_len(seq_id);
-        for t in 0..seq_len {
+        let start = batch.cu_seqlens[i] as usize;
+        let end = batch.cu_seqlens[i + 1] as usize;
+        for t in 0..(end - start) {
             pos_vec.push((offset + t) as f32);
         }
     }
-    let pos = Tensor::from_vec(pos_vec, (b_sz * seq_len, 1), dev)?;
+    if pos_vec.len() != total_tokens {
+        return Err(anyhow!(
+            "build_cos_sin: cu_seqlens-derived token count ({}) does not match q/k total token count ({})",
+            pos_vec.len(), total_tokens
+        ));
+    }
+    let pos = Tensor::from_vec(pos_vec, (total_tokens, 1), dev)?;
     let freqs = pos.matmul(inv_freq)?;
     let cos = freqs.cos()?.to_dtype(dtype)?.reshape((b_sz, seq_len, freqs.dim(1)?))?;
     let sin = freqs.sin()?.to_dtype(dtype)?.reshape((b_sz, seq_len, freqs.dim(1)?))?;
@@ -245,4 +269,96 @@ pub(crate) fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
     let xs = xs.unsqueeze(1)?;
     let xs = xs.expand((n_kv_heads, n_rep, seq_len, head_dim))?;
     Ok(xs.reshape((n_kv_heads * n_rep, seq_len, head_dim))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::BatchInput;
+    use candle_core::Device;
+
+    /// Regression test for the mixed-length-batch bug: a batch containing two
+    /// PREFILL sequences of DIFFERENT prompt lengths, packed back-to-back per
+    /// `cu_seqlens` (exactly what `Scheduler::step` produces — see
+    /// `llm-scheduler/src/scheduler.rs`'s `BatchInput` construction). Before the
+    /// fix, `CandleBackend::forward_pass` reshaped `token_ids` to a uniform
+    /// `(num_seqs, token_ids.len() / num_seqs)` grid, which panics outright when
+    /// lengths differ, and `build_cos_sin` assigned RoPE positions assuming one
+    /// batch "row" per sequence of equal length. This test drives `build_cos_sin`
+    /// directly (the position-id half of the fix) with a 3-token and a 5-token
+    /// sequence packed into one `total_tokens = 8` batch and asserts:
+    /// 1. it does not error / panic on the length mismatch, and
+    /// 2. each token gets the RoPE position belonging to ITS OWN sequence
+    ///    (continuing from that sequence's individual KV-cache offset), with no
+    ///    cross-contamination between the two sequences' position ranges.
+    #[test]
+    fn build_cos_sin_handles_mixed_length_batch_without_cross_contamination() {
+        let dev = Device::Cpu;
+
+        // Sequence A: seq_id=1, already has 10 cached tokens, contributes 3 new
+        // tokens this step (e.g. a partial-prefill continuation).
+        // Sequence B: seq_id=2, fresh (0 cached tokens), contributes 5 new
+        // tokens this step (an initial prompt prefill).
+        // Packed token_ids buffer would be [A0,A1,A2, B0,B1,B2,B3,B4] (8 total);
+        // cu_seqlens = [0, 3, 8] marks that boundary.
+        let batch = BatchInput {
+            seq_ids: vec![1, 2],
+            token_ids: vec![0u32; 8], // token values are irrelevant to build_cos_sin
+            cu_seqlens: vec![0, 3, 8],
+            block_tables: vec![vec![0], vec![1]],
+            is_prefill: vec![true, true],
+        };
+
+        let mut kv_cache = RawKvCache::new();
+        kv_cache.set_seq_len(1, 10);
+        kv_cache.set_seq_len(2, 0);
+
+        let head_dim = 4;
+        let half_dim = head_dim / 2;
+        let inv_freq = build_inv_freq(half_dim, head_dim, 10000.0, &dev).unwrap();
+
+        let total_tokens = batch.token_ids.len();
+        let (cos, _sin) = build_cos_sin(1, total_tokens, &batch, &kv_cache, &inv_freq, DType::F32, &dev)
+            .expect("build_cos_sin must not error on a mixed-length packed batch");
+
+        assert_eq!(cos.dims(), &[1, total_tokens, half_dim]);
+
+        // Recover the per-token cos(pos * inv_freq[0]) implied value and back out
+        // the effective position for the first frequency component, then check
+        // sequence A's 3 tokens continue from offset 10 (positions 10,11,12) and
+        // sequence B's 5 tokens start fresh from offset 0 (positions 0,1,2,3,4) —
+        // i.e. no cross-contamination of KV-cache offsets between sequences, and
+        // no assumption that both sequences share the same length.
+        let cos_vals = cos.reshape((total_tokens, half_dim)).unwrap()
+            .narrow(1, 0, 1).unwrap()
+            .squeeze(1).unwrap()
+            .to_vec1::<f32>().unwrap();
+
+        let expected_positions: [f32; 8] = [10.0, 11.0, 12.0, 0.0, 1.0, 2.0, 3.0, 4.0];
+        for (i, &expected_pos) in expected_positions.iter().enumerate() {
+            let expected_cos = expected_pos.cos(); // inv_freq[0] == 1.0
+            assert!(
+                (cos_vals[i] - expected_cos).abs() < 1e-4,
+                "token {i}: expected cos(pos={expected_pos}) = {expected_cos}, got {}",
+                cos_vals[i]
+            );
+        }
+    }
+
+    #[test]
+    fn build_cos_sin_rejects_cu_seqlens_token_count_mismatch() {
+        let dev = Device::Cpu;
+        let batch = BatchInput {
+            seq_ids: vec![1],
+            token_ids: vec![0u32; 4],
+            cu_seqlens: vec![0, 3], // wrong: should be 4 to match token_ids.len()
+            block_tables: vec![vec![0]],
+            is_prefill: vec![true],
+        };
+        let kv_cache = RawKvCache::new();
+        let head_dim = 4;
+        let inv_freq = build_inv_freq(head_dim / 2, head_dim, 10000.0, &dev).unwrap();
+        let result = build_cos_sin(1, 4, &batch, &kv_cache, &inv_freq, DType::F32, &dev);
+        assert!(result.is_err(), "cu_seqlens/token-count mismatch must be a hard error, not silently truncated/padded");
+    }
 }
