@@ -2,13 +2,13 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::path::PathBuf;
 use std::io::{self, Write, BufRead};
-use llm_core::backend::LlmBackend;
-use llm_core::backends::candle::CandleBackend;
-use llm_core::types::{InferRequest, SampleParams, ModelMeta};
+use llm_core::types::{InferRequest, SampleParams};
 use llm_scheduler::engine::ServingEngine;
 use clap::Parser;
-use minijinja::{Environment, Value, context};
-use minijinja_contrib::add_to_environment;
+use llm_cli::{
+    load_candle_backend, log_compiled_backend_support, maybe_prepend_bos, render_prompt,
+    resolve_eos_token_ids, ChatMessage,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Interactive multi-turn chat CLI with multimodal support")]
@@ -50,126 +50,10 @@ struct Args {
     system_prompt: Option<String>,
 }
 
-/// A single turn in the conversation
-#[derive(Debug, Clone)]
-struct Message {
-    role: String,
-    content: String,
-}
-
-/// Detect the chat format from ModelMeta and try to render via Jinja, with a robust fallback
-fn render_prompt(messages: &[Message], meta: &ModelMeta) -> String {
-    // Try Jinja rendering from embedded chat_template first
-    if let Some(template_str) = &meta.chat_template {
-        match try_jinja_render(template_str, messages, meta) {
-            Ok(rendered) => return rendered,
-            Err(e) => {
-                eprintln!("[chat] Jinja render failed ({}), falling back to manual format", e);
-            }
-        }
-    }
-    // Manual fallback based on architecture
-    manual_format(messages, meta)
-}
-
-fn try_jinja_render(template_str: &str, messages: &[Message], _meta: &ModelMeta) -> anyhow::Result<String> {
-    let mut env = Environment::new();
-    // Add Python-compat builtins (tojson, etc.)
-    add_to_environment(&mut env);
-    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-    // Register strftime_now: returns today's date string (HF templates use this)
-    env.add_function("strftime_now", |fmt: &str| -> String {
-        // Return a plausible static date; no std::time formatting in minijinja natively
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let secs = now.as_secs();
-        // Basic date from seconds (approx)
-        let days = secs / 86400;
-        let year = 1970 + (days / 365) as u32;
-        let day_of_year = days % 365;
-        let month = (day_of_year / 30 + 1).min(12) as u32;
-        let day = (day_of_year % 30 + 1) as u32;
-        if fmt.contains("%Y") || fmt.contains("%d") {
-            format!("{:02} {:?} {}", day, month, year)
-        } else {
-            format!("{}-{:02}-{:02}", year, month, day)
-        }
-    });
-
-    // Strip HuggingFace-specific non-standard Jinja2 tags that minijinja doesn't support
-    let cleaned = template_str
-        .replace("{% generation %}", "")
-        .replace("{% endgeneration %}", "");
-
-    // Convert messages to minijinja-compatible values
-    let msgs: Vec<Value> = messages.iter().map(|m| {
-        context! {
-            role => m.role.as_str(),
-            content => m.content.as_str(),
-        }
-    }).collect();
-
-    env.add_template("chat", &cleaned)?;
-    let tmpl = env.get_template("chat")?;
-
-    let ctx = context! {
-        messages => msgs,
-        add_generation_prompt => true,
-        enable_thinking => false,
-    };
-
-    let rendered = tmpl.render(ctx)?;
-    Ok(rendered)
-}
-
-fn manual_format(messages: &[Message], meta: &ModelMeta) -> String {
-    let mut result = String::new();
-
-    if meta.arch == "gemma4" {
-        // Gemma 4 format: <|turn>role\ncontent<turn|>\n
-        for msg in messages {
-            let role = if msg.role == "assistant" { "model" } else { &msg.role };
-            result.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, msg.content));
-        }
-        result.push_str("<|turn>model\n");
-    } else if meta.is_gemma {
-        // Gemma 1/2 format: <start_of_turn>role\ncontent<end_of_turn>\n
-        for msg in messages {
-            let role = if msg.role == "assistant" { "model" } else { &msg.role };
-            result.push_str(&format!("<start_of_turn>{}\n{}<end_of_turn>\n", role, msg.content));
-        }
-        result.push_str("<start_of_turn>model\n");
-    } else if meta.chat_template.as_deref().map(|t| t.contains("<|im_start|>")).unwrap_or(false)
-        || matches!(meta.arch.as_str(), "qwen2" | "qwen3" | "qwen3vl" | "qwen2vl" | "smollm3" | "llama" | "mistral") {
-        // ChatML format: <|im_start|>role\ncontent<|im_end|>\n
-        for msg in messages {
-            result.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content));
-        }
-        result.push_str("<|im_start|>assistant\n");
-    } else {
-        // Generic: role: content\n\n
-        for msg in messages {
-            if msg.role == "system" {
-                result.push_str(&format!("System: {}\n\n", msg.content));
-            } else if msg.role == "user" {
-                result.push_str(&format!("User: {}\n", msg.content));
-            } else {
-                result.push_str(&format!("Assistant: {}\n", msg.content));
-            }
-        }
-        result.push_str("Assistant: ");
-    }
-
-    result
-}
-
-/// Insert BOS token for Gemma if needed
-fn maybe_prepend_bos(tokens: &mut Vec<u32>, meta: &ModelMeta) {
-    if meta.is_gemma && (tokens.is_empty() || tokens[0] != 2) {
-        tokens.insert(0, 2);
-    }
-}
+// Chat-template rendering (render_prompt/try_jinja_render/manual_format) and
+// Gemma BOS handling (maybe_prepend_bos) now live in llm_cli (lib.rs) as the
+// single shared implementation also used by the HTTP server's
+// chat_completions handler — see audit findings #7/#9/#10.
 
 /// Parse a line into a content string, possibly with an image or audio command.
 /// Returns (text_content, image_path, audio_path)
@@ -295,6 +179,21 @@ fn print_help() {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+    log_compiled_backend_support();
+
+    // Validate arguments up front with actionable errors rather than
+    // failing deep inside model/tokenizer loading with a raw io::Error.
+    let model_path = std::path::Path::new(&args.model_path);
+    if !model_path.exists() {
+        anyhow::bail!("model file not found at {}: pass a valid --model-path", args.model_path);
+    }
+    let tokenizer_path = std::path::Path::new(&args.tokenizer_path);
+    if !tokenizer_path.exists() {
+        anyhow::bail!(
+            "tokenizer.json not found at {}: pass --tokenizer-path explicitly with a valid path",
+            args.tokenizer_path
+        );
+    }
 
     println!("══════════════════════════════════════════════");
     println!("  llm-rs Interactive Chat");
@@ -307,19 +206,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Load tokenizer
     println!("Loading tokenizer...");
-    let tokenizer = Arc::new(llm_core::tokenizer::LlmTokenizer::from_file(&args.tokenizer_path)?);
+    let tokenizer = Arc::new(
+        llm_core::tokenizer::LlmTokenizer::from_file(&args.tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("failed to load tokenizer from {}: {}", args.tokenizer_path, e))?,
+    );
 
     // Load model
     println!("Loading model (this may take a moment)...");
     let load_start = Instant::now();
-    let mut backend = Box::new(CandleBackend::new());
-    if args.explicit_dequantize {
-        backend.set_explicit_dequantize(true);
-    }
-    if args.use_vram_embeddings {
-        backend.set_use_vram_embeddings(true);
-    }
-    let meta = backend.load_weights(std::path::Path::new(&args.model_path))?;
+    let (backend, meta) = load_candle_backend(model_path, args.explicit_dequantize, args.use_vram_embeddings)?;
     println!(
         "Model loaded in {:.2?} | arch: {} | hidden: {} | layers: {} | heads: {} | vocab: {}",
         load_start.elapsed(),
@@ -339,21 +234,16 @@ async fn main() -> anyhow::Result<()> {
     }
     println!();
 
-    let mut eos_token_ids = vec![backend.eos_token_id()];
-    for tok in &["<|im_end|>", "<end_of_turn>", "<turn|>"] {
-        if let Some(id) = tokenizer.token_to_id(tok) {
-            eos_token_ids.push(id);
-        }
-    }
+    let eos_token_ids = resolve_eos_token_ids(backend.as_ref(), &tokenizer);
     let engine = Arc::new(ServingEngine::new(backend, 2048));
     let meta = Arc::new(meta);
 
-    let mut conversation: Vec<Message> = Vec::new();
+    let mut conversation: Vec<ChatMessage> = Vec::new();
     let mut seq_id: u64 = 1;
 
     // Add system prompt if provided
     if let Some(sys) = &args.system_prompt {
-        conversation.push(Message { role: "system".to_string(), content: sys.clone() });
+        conversation.push(ChatMessage { role: "system".to_string(), content: sys.clone() });
     }
 
     let stdin = io::stdin();
@@ -382,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
             "/clear" => {
                 conversation.clear();
                 if let Some(sys) = &args.system_prompt {
-                    conversation.push(Message { role: "system".to_string(), content: sys.clone() });
+                    conversation.push(ChatMessage { role: "system".to_string(), content: sys.clone() });
                 }
                 *llm_core::backends::ACTIVE_IMAGE_PATH.lock() = None;
                 *llm_core::backends::ACTIVE_AUDIO_PATH.lock() = None;
@@ -412,7 +302,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Add user message to history
-        conversation.push(Message { role: "user".to_string(), content: text_content.clone() });
+        conversation.push(ChatMessage { role: "user".to_string(), content: text_content.clone() });
 
         // Render the full conversation to tokens
         let mut prompt_str = render_prompt(&conversation, &meta);
@@ -498,59 +388,44 @@ async fn main() -> anyhow::Result<()> {
 
         engine.add_request(req)?;
 
-        let gen_start = Instant::now();
-        let mut generated_tokens: Vec<u32> = Vec::new();
         let mut assistant_response = String::new();
-        let mut ttft: Option<std::time::Duration> = None;
-
-        loop {
-            match rx.recv().await {
-                Ok(event) if event.seq_id == this_seq_id => {
-                    if ttft.is_none() {
-                        ttft = Some(gen_start.elapsed());
-                    }
-
-                    // Decode and print token
-                    let token_str = tokenizer.decode(&[event.token_id], true).unwrap_or_default();
-                    if !token_str.is_empty() {
-                        print!("{}", token_str);
-                        io::stdout().flush()?;
-                        assistant_response.push_str(&token_str);
-                    }
-                    generated_tokens.push(event.token_id);
-
-                    if event.is_eos || eos_token_ids.contains(&event.token_id) {
-                        break;
-                    }
-                    if generated_tokens.len() >= args.max_new_tokens {
-                        break;
-                    }
+        let gen_result = llm_cli::consume_generation(
+            &mut rx,
+            this_seq_id,
+            &tokenizer,
+            &eos_token_ids,
+            args.max_new_tokens,
+            |_token_id, text| {
+                if !text.is_empty() {
+                    print!("{}", text);
+                    let _ = io::stdout().flush();
+                    assistant_response.push_str(text);
                 }
-                Ok(_) => continue, // Different seq_id
-                Err(_) => break,
-            }
-        }
+            },
+        ).await;
 
         println!(); // newline after assistant response
 
         // Print timing stats
-        let total_dur = gen_start.elapsed();
-        let n_gen = generated_tokens.len();
-        if let Some(ttft_dur) = ttft {
-            let prefill_tps = prompt_len as f64 / ttft_dur.as_secs_f64();
-            let decode_dur = total_dur.saturating_sub(ttft_dur);
-            let decode_tps = if n_gen > 1 { (n_gen - 1) as f64 / decode_dur.as_secs_f64() } else { 0.0 };
+        let n_gen = gen_result.tokens.len();
+        if let Some(ttft_dur) = gen_result.ttft {
+            let prefill_tps = if ttft_dur.as_secs_f64() > 0.0 { prompt_len as f64 / ttft_dur.as_secs_f64() } else { 0.0 };
+            let decode_dur = gen_result.total_dur.saturating_sub(ttft_dur);
+            let decode_tps = if n_gen > 1 && decode_dur.as_secs_f64() > 0.0 { (n_gen - 1) as f64 / decode_dur.as_secs_f64() } else { 0.0 };
             println!(
                 "  [stats] TTFT: {:.0}ms | Prefill: {:.1} t/s | Decode: {:.1} t/s | Tokens: {}",
                 ttft_dur.as_millis(), prefill_tps, decode_tps, n_gen
             );
+        }
+        if gen_result.lagged {
+            println!("  [warn] event stream lagged; response above may be truncated.");
         }
         println!();
 
         // Add assistant turn to conversation history (strip EOS tokens if present)
         let _clean_response = assistant_response.trim_end_matches(|c: char| c == '<' || c == '>' || c.is_alphanumeric()).trim().to_string();
         if !assistant_response.is_empty() {
-            conversation.push(Message { role: "assistant".to_string(), content: assistant_response.clone() });
+            conversation.push(ChatMessage { role: "assistant".to_string(), content: assistant_response.clone() });
         }
 
         // Trim conversation to avoid exceeding context length

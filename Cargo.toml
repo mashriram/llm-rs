@@ -43,4 +43,14 @@ minijinja = { version = "2", features = ["loader"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "wav", "isomp4"] }
 parking_lot = "0.12"
+tower-http = { version = "0.6", features = ["limit"] }
+
+[profile.release]
+# Inference-engine-appropriate release settings. Deliberately keep
+# panic = "unwind" (the default): llm-ffi's extern "C" boundary relies on
+# std::panic::catch_unwind to avoid UB from unwinding across the FFI
+# boundary, which requires unwind panics to be available.
+lto = "thin"
+codegen-units = 1
+opt-level = 3
 
