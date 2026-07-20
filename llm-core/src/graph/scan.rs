@@ -51,6 +51,15 @@ pub fn map_gguf_name(name: &str) -> String {
     if name == "output.weight" {
         return "lm_head.weight".to_string();
     }
+    if name == "per_layer_inp.weight" || name == "per_layer_token_embd.weight" || name == "per_layer_embed.weight" {
+        return "per_layer_token_embd.weight".to_string();
+    }
+    if name == "per_layer_proj.weight" || name == "per_layer_model_proj.weight" {
+        return "per_layer_model_proj.weight".to_string();
+    }
+    if name == "per_layer_norm.weight" || name == "per_layer_proj_norm.weight" {
+        return "per_layer_proj_norm.weight".to_string();
+    }
     
     if name.starts_with("blk.") {
         let parts: Vec<&str> = name.split('.').collect();
@@ -178,6 +187,10 @@ pub fn scan_tensors(names: &[String]) -> TensorGroupMap {
                 }
             }
         }
+    }
+
+    if per_layer_token_embd.is_none() && per_layer_model_proj.is_some() {
+        per_layer_token_embd = embed_tokens.clone();
     }
     
     let mut layers: Vec<LayerTensors> = layer_map.into_values().collect();

@@ -25,6 +25,10 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     explicit_dequantize: bool,
+
+    /// Explicit path to multimodal projector (mmproj) GGUF file
+    #[arg(long)]
+    mmproj_path: Option<String>,
 }
 
 #[tokio::main]
@@ -55,7 +59,12 @@ async fn main() -> anyhow::Result<()> {
     let start_load = Instant::now();
     // benchmark_speed previously never called set_use_vram_embeddings; kept
     // as `false` here to preserve prior behavior (no CLI flag existed for it).
-    let (backend, meta) = load_candle_backend(model_path, args.explicit_dequantize, false)?;
+    let (backend, meta) = load_candle_backend(
+        model_path,
+        args.explicit_dequantize,
+        false,
+        args.mmproj_path.map(std::path::PathBuf::from),
+    )?;
     println!(
         "Model loaded in {:.2?} (vocab_size: {}, hidden_dim: {})",
         start_load.elapsed(),

@@ -178,6 +178,11 @@ impl HardwareProfile {
     /// long sequences. On CUDA, checks free VRAM. On CPU, checks free RAM and
     /// refuses to load if the model would OOM (clean error > OS kill).
     pub fn choose_device(&self, estimated_bytes: u64) -> Result<BackendChoice, String> {
+        if std::env::var("LLM_FORCE_CPU").is_ok() {
+            info!("LLM_FORCE_CPU is set → forcing CPU execution.");
+            return Ok(BackendChoice::Cpu);
+        }
+
         // 15% headroom for KV cache growth and fragmentation.
         let required = (estimated_bytes as f64 * 1.15) as u64;
 
@@ -221,14 +226,18 @@ fn query_nvidia_smi() -> Option<(u64, u64)> {
         .output()
         .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.lines().next()?;
-    let parts: Vec<&str> = line.split(',').map(str::trim).collect();
-    if parts.len() != 2 {
-        return None;
+    let mut best: Option<(u64, u64)> = None;
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+        if parts.len() == 2 {
+            if let (Ok(total), Ok(free)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                if best.map(|(_, best_free)| free > best_free).unwrap_or(true) {
+                    best = Some((total, free));
+                }
+            }
+        }
     }
-    let total = parts[0].parse::<u64>().ok()?;
-    let free = parts[1].parse::<u64>().ok()?;
-    Some((total, free))
+    best
 }
 
 fn mb(bytes: u64) -> f64 {

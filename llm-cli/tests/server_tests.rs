@@ -97,10 +97,21 @@ impl LlmBackend for MockBackend {
 }
 
 fn tokenizer_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let parent = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
-        .join("qwen2.5-0.5b/tokenizer.json")
+        .to_path_buf();
+    let candidates = [
+        parent.join("qwen2.5-0.5b/tokenizer.json"),
+        parent.join("qwen2.5-1.5b/tokenizer.json"),
+        parent.join("models/qwen2.5-0.5b/tokenizer.json"),
+    ];
+    for p in &candidates {
+        if p.exists() {
+            return p.clone();
+        }
+    }
+    parent.join("qwen2.5-0.5b/tokenizer.json")
 }
 
 fn build_state(arch: &str, max_tokens_limit: usize) -> Arc<AppState> {

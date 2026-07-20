@@ -35,6 +35,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     use_vram_embeddings: bool,
 
+    /// Explicit path to multimodal projector (mmproj) GGUF file
+    #[arg(long)]
+    mmproj_path: Option<String>,
+
     #[arg(long, default_value_t = 50)]
     max_new_tokens: usize,
 }
@@ -65,7 +69,12 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Loading model from {}...", args.model_path);
     let start_load = Instant::now();
-    let (backend, meta) = load_candle_backend(model_path, args.explicit_dequantize, args.use_vram_embeddings)?;
+    let (backend, meta) = load_candle_backend(
+        model_path,
+        args.explicit_dequantize,
+        args.use_vram_embeddings,
+        args.mmproj_path.map(std::path::PathBuf::from),
+    )?;
     println!(
         "Model loaded in {:.2?} (vocab_size: {}, hidden_dim: {})",
         start_load.elapsed(),

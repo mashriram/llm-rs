@@ -190,14 +190,19 @@ fn find_mmproj_path(base_path: &Path) -> Option<std::path::PathBuf> {
             return Some(std::path::PathBuf::from(candidate));
         }
     }
-    // Fall back to a same-directory scan for any file matching `*mmproj*.gguf`.
+    // Fall back to a same-directory scan for any file matching `*<stem_prefix>*mmproj*.gguf`.
+    let model_file_stem = base_path.file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let model_prefix = model_file_stem.split('-').next().unwrap_or(&model_file_stem);
+
     if let Some(parent) = base_path.parent() {
         if let Ok(entries) = std::fs::read_dir(parent) {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_file() {
                     let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-                    if name.contains("mmproj") && name.ends_with(".gguf") {
+                    if name.contains("mmproj") && name.ends_with(".gguf") && (name.contains(model_prefix) || model_file_stem.contains(name.split('-').next().unwrap_or(""))) {
                         return Some(p);
                     }
                 }
@@ -280,6 +285,7 @@ pub struct CandleBackend {
     seq_blocks: Mutex<HashMap<SeqId, Vec<BlockId>>>,
     explicit_dequantize: bool,
     use_vram_embeddings: bool,
+    custom_mmproj_path: Option<std::path::PathBuf>,
     qmatmul_cache: Mutex<HashMap<String, QMatMul>>,
 }
 
@@ -325,8 +331,14 @@ impl CandleBackend {
             seq_blocks: Mutex::new(HashMap::new()),
             explicit_dequantize,
             use_vram_embeddings,
+            custom_mmproj_path: None,
             qmatmul_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Set an explicit custom mmproj path for vision/audio encoders.
+    pub fn set_mmproj_path(&mut self, path: std::path::PathBuf) {
+        self.custom_mmproj_path = Some(path);
     }
 
     /// Thin wrapper: resolve a weight tensor by delegating to `WeightStore`.
@@ -649,6 +661,7 @@ impl LlmBackend for CandleBackend {
             for name in model.tensor_infos.keys() {
                 let name_lower = name.to_lowercase();
                 let is_token_embd = name == "token_embd.weight";
+                let is_per_layer_embd = name_lower.contains("per_layer_token_embd");
                 let is_non_matmul = name_lower.contains("embed") 
                     || name_lower.contains("embd")
                     || name_lower.contains("norm") 
@@ -658,9 +671,10 @@ impl LlmBackend for CandleBackend {
                     || name_lower.contains("rotors")
                     || name_lower.contains("rot");
                 let mut fit_in_vram = false;
-                if is_non_matmul && !name_lower.contains("freq") && !name_lower.contains("rot") && self.device.is_cuda() {
+                if is_non_matmul && !name_lower.contains("freq") && !name_lower.contains("rot") && !is_per_layer_embd && self.device.is_cuda() {
                     if let Some(info) = model.tensor_infos.get(name) {
-                        let size_bytes = (info.shape.dims().iter().product::<usize>() as u64) * 2;
+                        // dequantize() produces F32 tensors (4 bytes per element)
+                        let size_bytes = (info.shape.dims().iter().product::<usize>() as u64) * 4;
                         if remaining_vram_budget >= size_bytes {
                             remaining_vram_budget -= size_bytes;
                             fit_in_vram = true;
@@ -678,8 +692,15 @@ impl LlmBackend for CandleBackend {
                 } else {
                     self.device.clone()
                 };
-                let qt = model.tensor(&mut file, name, &load_device)
-                    .with_context(|| format!("Failed to read tensor {}", name))?;
+                let qt = match model.tensor(&mut file, name, &load_device) {
+                    Ok(qt) => qt,
+                    Err(e) if !load_device.is_cpu() => {
+                        tracing::warn!("Failed to load tensor {} on {:?} ({e}); falling back to CPU", name, load_device);
+                        model.tensor(&mut file, name, &Device::Cpu)
+                            .with_context(|| format!("Failed to read tensor {}", name))?
+                    }
+                    Err(e) => return Err(anyhow::Error::new(e).context(format!("Failed to read tensor {}", name))),
+                };
                 let hf_name = map_gguf_name(name);
                 quantized_weights.insert(hf_name, qt);
 
@@ -872,7 +893,12 @@ impl LlmBackend for CandleBackend {
                 eos_token_str,
             }
         } else {
-            let config_path = path.join("config.json");
+            let model_dir = if path.is_file() {
+                path.parent().unwrap_or(Path::new("."))
+            } else {
+                path
+            };
+            let config_path = model_dir.join("config.json");
             let mut meta = parse_config(&config_path)
                 .context("Failed to parse config.json in CandleBackend")?;
 
@@ -889,7 +915,7 @@ impl LlmBackend for CandleBackend {
                     // lacks an explicit one — try the tokenizer files' own special
                     // tokens for common EOS strings as a best-effort fallback.
                     .or_else(|| find_eos_in_hf_tokenizer_files(
-                        path,
+                        model_dir,
                         &["<|im_end|>", "<end_of_turn>", "<|endoftext|>", "</s>"],
                     ))
             };
@@ -905,7 +931,9 @@ impl LlmBackend for CandleBackend {
             self.eos_token_id = eos_token_id;
 
             let mut sf_files = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(path) {
+            if path.is_file() {
+                sf_files.push(path.to_path_buf());
+            } else if let Ok(entries) = std::fs::read_dir(path) {
                 for entry in entries.flatten() {
                     let p = entry.path();
                     if p.extension().and_then(|ext| ext.to_str()) == Some("safetensors") {
@@ -979,7 +1007,7 @@ impl LlmBackend for CandleBackend {
             }
             if meta.chat_template.is_none() {
                 // Try to load chat_template from tokenizer_config.json alongside model
-                let tc_path = path.join("tokenizer_config.json");
+                let tc_path = model_dir.join("tokenizer_config.json");
                 if let Ok(tc_content) = std::fs::read_to_string(&tc_path) {
                     if let Ok(tc_json) = serde_json::from_str::<serde_json::Value>(&tc_content) {
                         if let Some(tmpl) = tc_json.get("chat_template").and_then(|v| v.as_str()) {
@@ -1125,25 +1153,35 @@ impl LlmBackend for CandleBackend {
 
                         if is_non_matmul {
                             let target_dev = qt.device().clone();
-                            match qt.dequantize(&target_dev) {
+                            let deq_res = qt.dequantize(&target_dev).or_else(|_| {
+                                if !target_dev.is_cpu() {
+                                    qt.dequantize(&Device::Cpu)
+                                } else {
+                                    Err(candle_core::Error::Msg("CPU dequantize failed".to_string()))
+                                }
+                            });
+                            match deq_res {
                                 Ok(t) => {
-                                    // Keep as f32 — f16 can overflow (~65504) for large
-                                    // residual activations (e.g. Qwen 2.5 reaches ~43k by layer 0).
                                     local_deq.insert(name.clone(), t);
                                 }
                                 Err(e) => {
-                                    println!("Error: Failed to dequantize tensor {} on CPU: {:?}", name, e);
+                                    println!("Error: Failed to dequantize tensor {}: {:?}", name, e);
+                                    self.quantized_weights.insert(name, qt);
                                 }
                             }
                         } else {
-                            // qt is already loaded on self.device, directly initialize QMatMul
-                            match QMatMul::from_qtensor(qt) {
-                                Ok(qmatmul) => {
-                                    local_qmatmul.insert(name.clone(), qmatmul);
+                            // QMatMul requires a 2D matrix weight. If 1D or 3D+, keep in quantized_weights.
+                            if qt.shape().dims().len() == 2 {
+                                match QMatMul::from_qtensor(qt) {
+                                    Ok(qmatmul) => {
+                                        local_qmatmul.insert(name.clone(), qmatmul);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("QMatMul::from_qtensor failed for {}: {:?}", name, e);
+                                    }
                                 }
-                                Err(e) => {
-                                    println!("Warning: QMatMul::from_qtensor failed for {}: {:?}", name, e);
-                                }
+                            } else {
+                                self.quantized_weights.insert(name, qt);
                             }
                         }
                     }
@@ -1163,31 +1201,47 @@ impl LlmBackend for CandleBackend {
             }
         }
 
+        let custom_mmproj = self.custom_mmproj_path.clone();
+
         if meta.has_vision_encoder {
-            // Model-agnostic mmproj discovery, falling back to the base model
-            // path itself (the vision tower may be embedded in the same GGUF file).
-            let vision_path = if is_gguf {
-                find_mmproj_path(path).unwrap_or_else(|| path.to_path_buf())
-            } else {
-                path.to_path_buf()
-            };
-            tracing::info!("Attempting to load VisionEncoder from {:?}", vision_path);
+            // Explicit mmproj path from CLI/caller, or model-agnostic mmproj discovery,
+            // falling back to the base model path itself.
+            let vision_path = custom_mmproj.clone().unwrap_or_else(|| {
+                if is_gguf {
+                    find_mmproj_path(path).unwrap_or_else(|| path.to_path_buf())
+                } else {
+                    path.to_path_buf()
+                }
+            });
+            println!("  [mmproj] Loading VisionEncoder weights from: {}", vision_path.display());
             match VisionEncoder::load(&vision_path, &dev) {
-                Ok(enc) => { self.vision_encoder = Some(enc); }
-                Err(e) => { tracing::warn!("VisionEncoder load skipped: {e}"); }
+                Ok(enc) => {
+                    println!("  [mmproj] VisionEncoder loaded successfully ✓");
+                    self.vision_encoder = Some(enc);
+                }
+                Err(e) => {
+                    println!("  [mmproj] VisionEncoder load skipped: {e}");
+                }
             }
         }
 
         if meta.has_audio_encoder {
-            let audio_path = if is_gguf {
-                find_mmproj_path(path).unwrap_or_else(|| path.to_path_buf())
-            } else {
-                path.to_path_buf()
-            };
-            tracing::info!("Attempting to load AudioEncoder from {:?}", audio_path);
+            let audio_path = custom_mmproj.clone().unwrap_or_else(|| {
+                if is_gguf {
+                    find_mmproj_path(path).unwrap_or_else(|| path.to_path_buf())
+                } else {
+                    path.to_path_buf()
+                }
+            });
+            println!("  [mmproj] Loading AudioEncoder weights from: {}", audio_path.display());
             match AudioEncoder::load(&audio_path, &dev) {
-                Ok(enc) => { self.audio_encoder = Some(enc); }
-                Err(e) => { tracing::warn!("AudioEncoder load skipped: {e}"); }
+                Ok(enc) => {
+                    println!("  [mmproj] AudioEncoder loaded successfully ✓");
+                    self.audio_encoder = Some(enc);
+                }
+                Err(e) => {
+                    println!("  [mmproj] AudioEncoder load skipped: {e}");
+                }
             }
         }
 

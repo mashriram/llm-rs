@@ -473,6 +473,7 @@ pub fn load_candle_backend(
     model_path: &Path,
     explicit_dequantize: bool,
     use_vram_embeddings: bool,
+    mmproj_path: Option<PathBuf>,
 ) -> anyhow::Result<(Box<dyn LlmBackend>, ModelMeta)> {
     if !model_path.exists() {
         anyhow::bail!(
@@ -486,6 +487,9 @@ pub fn load_candle_backend(
     }
     if use_vram_embeddings {
         backend.set_use_vram_embeddings(true);
+    }
+    if let Some(p) = mmproj_path {
+        backend.set_mmproj_path(p);
     }
     let meta = backend.load_weights(model_path).map_err(|e| {
         anyhow::anyhow!(

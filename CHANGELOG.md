@@ -1,5 +1,18 @@
 # Changelog
 
+## v2026.7.20 — Multimodal Stabilization, Explicit Projectors & Multi-GPU VRAM Auto-Selection
+
+This release completes the hardware-agnostic and model-agnostic multimodal stabilization for Gemma 4 E2B, Qwen3-VL, and SmolLM3 across both CUDA GPU and CPU execution backends, resolving tensor shape mismatches and multi-GPU VRAM discovery issues.
+
+### Added
+- **Explicit `--mmproj-path <PATH>` CLI argument**: Supported across `chat`, `server`, `run_model`, and `benchmark_speed`. Allows passing custom or non-standard multimodal projector weight files (e.g. `gemma-4-E2B-mmproj-BF16.gguf`) directly, overriding directory-wide stem scanning.
+- **Automatic Multimodal Tag Prepending**: In interactive `chat`, using `/image <path>` or `/audio <path>` commands automatically prepends `<image>` / `<audio>` tags to the prompt content when missing, ensuring visual and audio token placeholders are correctly formatted into the token stream.
+
+### Fixed
+- **Vision Attention QKV Bias Shape Mismatch (`vision.rs`)**: Fixed dimension derivation in fallback zero-bias generation (`attn_qkv.bias`) from `dim(0)` (input size) to `dim(1)` (output projection size). This resolved a `broadcast_add` shape mismatch crash when executing Gemma 4 E2B vision encoder projections.
+- **Multi-GPU / Hybrid Graphics VRAM Selection (`profile/mod.rs`)**: Updated `query_nvidia_smi()` to iterate across all lines returned by `nvidia-smi` and select the GPU with the highest free VRAM instead of blindly taking line 1. On dual-GPU laptops (e.g. AMD iGPU + NVIDIA dGPU), line 1 previously reported 0 VRAM, causing silent fallback from CUDA to CPU.
+- **Explicit Projector Weight Priority (`candle.rs`)**: Prioritized user-specified `custom_mmproj_path` during weight loading in `CandleBackend` for both `VisionEncoder` and `AudioEncoder`, guaranteeing deterministic weight loading across diverse multi-modal models.
+
 ## v2026.7.19 (branch, unreleased) — phase 2: model-agnostic + hardware-agnostic push
 
 Follow-up pass on the same branch: a real HF downloader, real TCP

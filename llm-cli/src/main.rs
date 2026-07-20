@@ -48,6 +48,10 @@ struct Args {
     /// Force embedding tables to VRAM (GPU) instead of CPU system RAM.
     #[arg(long, default_value_t = false)]
     use_vram_embeddings: bool,
+
+    /// Explicit path to multimodal projector (mmproj) GGUF file
+    #[arg(long)]
+    mmproj_path: Option<String>,
 }
 
 #[tokio::main]
@@ -79,8 +83,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("Loading weights from {}...", args.model_path);
-    let (backend, meta) =
-        load_candle_backend(path, args.explicit_dequantize, args.use_vram_embeddings)?;
+    let (backend, meta) = load_candle_backend(
+        path,
+        args.explicit_dequantize,
+        args.use_vram_embeddings,
+        args.mmproj_path.map(std::path::PathBuf::from),
+    )?;
     info!(
         "Weights loaded successfully. arch: {} | hidden: {} | layers: {}",
         meta.arch, meta.hidden_dim, meta.n_layers

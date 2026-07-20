@@ -45,6 +45,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     use_vram_embeddings: bool,
 
+    /// Explicit path to multimodal projector (mmproj) GGUF file
+    #[arg(long)]
+    mmproj_path: Option<PathBuf>,
+
     /// System prompt (optional)
     #[arg(long)]
     system_prompt: Option<String>,
@@ -214,7 +218,12 @@ async fn main() -> anyhow::Result<()> {
     // Load model
     println!("Loading model (this may take a moment)...");
     let load_start = Instant::now();
-    let (backend, meta) = load_candle_backend(model_path, args.explicit_dequantize, args.use_vram_embeddings)?;
+    let (backend, meta) = load_candle_backend(
+        model_path,
+        args.explicit_dequantize,
+        args.use_vram_embeddings,
+        args.mmproj_path,
+    )?;
     println!(
         "Model loaded in {:.2?} | arch: {} | hidden: {} | layers: {} | heads: {} | vocab: {}",
         load_start.elapsed(),
@@ -302,7 +311,14 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // Add user message to history
-        conversation.push(ChatMessage { role: "user".to_string(), content: text_content.clone() });
+        let mut msg_content = text_content.clone();
+        if image_path.is_some() && !msg_content.contains("<image>") && !msg_content.contains("<|image|>") {
+            msg_content = format!("<image>\n{}", msg_content);
+        }
+        if audio_path.is_some() && !msg_content.contains("<audio>") && !msg_content.contains("<|audio|>") {
+            msg_content = format!("<audio>\n{}", msg_content);
+        }
+        conversation.push(ChatMessage { role: "user".to_string(), content: msg_content });
 
         // Render the full conversation to tokens
         let mut prompt_str = render_prompt(&conversation, &meta);

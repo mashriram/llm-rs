@@ -202,8 +202,13 @@ impl VisionEncoder {
         let mut x = pixel_values.conv2d(patch_emb_w, 0, self.patch_size, 1, 1)?;
 
         if let Some(bias) = patch_emb_b {
-            let bias_reshaped = bias.reshape((1, self.hidden_dim, 1, 1))?;
-            x = x.broadcast_add(&bias_reshaped)?;
+            let out_c = x.dim(1)?;
+            if bias.elem_count() == out_c {
+                let bias_reshaped = bias.reshape((1, out_c, 1, 1))?;
+                x = x.broadcast_add(&bias_reshaped)?;
+            } else {
+                tracing::warn!("Skipping non-matching patch_embed bias: out_c={out_c}, bias elem_count={}", bias.elem_count());
+            }
         }
 
         // Reshape [1, hidden_dim, H_out, W_out] -> [1, hidden_dim, patches] -> [1, patches, hidden_dim]
@@ -231,20 +236,17 @@ impl VisionEncoder {
                 let grid_pos = y_reshaped.broadcast_add(&x_reshaped)?; // Shape [h, w, c]
                 let pos_to_add = grid_pos.reshape((1, num_patches, c))?;
                 x = x.broadcast_add(&pos_to_add)?;
-            } else {
-                // 1D learned absolute position embedding
+            } else if pos_shape.dims().len() >= 2 && pos_shape.dim(pos_shape.rank() - 1).unwrap_or(0) == c {
+                // 1D learned absolute position embedding table [N, hidden_dim]
                 let pos_len = pos_emb.dim(0)?;
-                // Take the FIRST `num_patches` rows of the position embedding table
-                // (position 0 must align with patch 0). Slicing from the end
-                // (`pos_len - num_patches`) was an off-by-one/wrong-end bug: it
-                // would apply the tail of a longer table's positions to the
-                // beginning of the patch sequence, misaligning every position.
                 let pos_to_add = if pos_len > num_patches {
                     pos_emb.narrow(0, 0, num_patches)?
                 } else {
                     pos_emb.clone()
                 };
-                x = x.broadcast_add(&pos_to_add.reshape((1, num_patches, c))?)?;
+                if pos_to_add.dim(0)? == num_patches {
+                    x = x.broadcast_add(&pos_to_add.reshape((1, num_patches, c))?)?;
+                }
             }
         }
 
@@ -711,7 +713,7 @@ fn normalize_vision_tensors(
             };
             let qkv_b = Tensor::cat(&[&q_b, &k_b, &v_b], 0)?;
             normalized.insert(format!("vision.layers.{}.attn_qkv.bias", layer_idx), qkv_b);
-        } else {
+        } else if !normalized.contains_key(&format!("vision.layers.{}.attn_qkv.bias", layer_idx)) {
             // Generate zero bias if the weight was successfully created/found
             if let Some(qkv_w) = normalized.get(&format!("vision.layers.{}.attn_qkv.weight", layer_idx)) {
                 let out_dim = qkv_w.dim(1)?;
