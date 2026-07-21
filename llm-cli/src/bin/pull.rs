@@ -401,15 +401,26 @@ async fn check_quantization_method(client: &reqwest::Client, repo: &str) -> Resu
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
         match method.to_lowercase().as_str() {
-            "bitsandbytes" | "bnb" | "awq" | "gptq" => {
+            "awq" | "gptq" => {
+                println!(
+                    "\nNOTE: this repo is pre-quantized with '{method}'. llm-rs dequantizes \
+                     {method} weights to dense F16/F32 at load time (see llm-core/src/loader/{method}.rs) \
+                     - this is a correctness-first path, not yet the fast tensor-core kernel path \
+                     (Marlin-class), so expect similar throughput to loading the unquantized model, \
+                     not {method}'s usual speed advantage. This dequant path has been reviewed against \
+                     real safetensors headers but not yet numerically verified against Python \
+                     (transformers/autoawq/auto-gptq) output on real hardware - if generation looks \
+                     wrong, that verification step is the first thing to check."
+                );
+            }
+            "bitsandbytes" | "bnb" => {
                 println!(
                     "\nNOTE: this repo is pre-quantized with '{method}'. llm-rs does not yet \
-                     implement dequantization for {method}-format safetensors (bitsandbytes NF4/FP4, \
-                     AWQ, and GPTQ each use their own packed-weight/group-scale layout that needs \
-                     dedicated kernel support this engine doesn't have). Loading this repo as-is \
-                     will fail with a clear error at load time rather than silently misreading the \
-                     packed weights as plain F16/BF16. Use a GGUF-quantized version of this model \
-                     instead (search huggingface.co), or the unquantized/F16 version of this repo."
+                     implement dequantization for bitsandbytes NF4/FP4's packed-weight layout. \
+                     Loading this repo as-is will fail with a clear error at load time rather than \
+                     silently misreading the packed weights as plain F16/BF16. Use a GGUF-quantized \
+                     version of this model instead (search huggingface.co), or the unquantized/F16 \
+                     version of this repo."
                 );
             }
             other => {

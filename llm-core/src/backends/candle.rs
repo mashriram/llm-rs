@@ -250,6 +250,64 @@ fn update_block_tensor(
     Ok(res)
 }
 
+/// Full block-gather-and-reconstruct fallback: dequantizes and concatenates
+/// every stored block for this sequence/layer, from scratch. This is what
+/// every decode step did unconditionally before the `kv_history_cache` fast
+/// path was added below - O(total context length) of tensor work per layer,
+/// per single new token, which is the dominant real cost of long-context
+/// decode (confirmed by direct benchmarking: decode throughput dropped from
+/// ~31 t/s at a 28-token context to ~16 t/s at a 278-token context on the
+/// same 3B model/hardware, far more than a model this size should degrade
+/// over such a small range). Kept as the correctness-guaranteed fallback for
+/// cache misses (new sequence, evicted/reused seq_id, quantized KV dtype).
+#[allow(clippy::too_many_arguments)]
+fn rebuild_kv_history_from_blocks(
+    gpu_cache: &HashMap<(usize, BlockId), BlockData>,
+    src_layer: usize,
+    block_table: &[BlockId],
+    offset: usize,
+    this_seq_len: usize,
+    block_size: usize,
+    dtype: KvDtype,
+    compute_dtype: DType,
+    n_rep: usize,
+) -> Result<(Tensor, Tensor)> {
+    let total_len = offset + this_seq_len;
+    let num_active_blocks = std::cmp::min(
+        (total_len + block_size - 1) / block_size,
+        block_table.len(),
+    );
+    let mut k_blocks = Vec::with_capacity(num_active_blocks);
+    let mut v_blocks = Vec::with_capacity(num_active_blocks);
+
+    for &block_id in &block_table[0..num_active_blocks] {
+        let block_data = gpu_cache.get(&(src_layer, block_id))
+            .ok_or_else(|| anyhow!("Block ID {} not found for layer {}", block_id, src_layer))?;
+
+        let k_deq = if dtype == KvDtype::Q8 || dtype == KvDtype::Q4 {
+            dequantize(&block_data.k, block_data.k_scale.as_ref().unwrap(), dtype, compute_dtype)?
+        } else {
+            block_data.k.clone()
+        };
+        let v_deq = if dtype == KvDtype::Q8 || dtype == KvDtype::Q4 {
+            dequantize(&block_data.v, block_data.v_scale.as_ref().unwrap(), dtype, compute_dtype)?
+        } else {
+            block_data.v.clone()
+        };
+
+        k_blocks.push(k_deq.squeeze(0)?);
+        v_blocks.push(v_deq.squeeze(0)?);
+    }
+
+    let k_hist_squeezed = Tensor::cat(&k_blocks, 0)?.narrow(0, 0, total_len)?;
+    let v_hist_squeezed = Tensor::cat(&v_blocks, 0)?.narrow(0, 0, total_len)?;
+
+    let k_hist_rep = repeat_kv(k_hist_squeezed.transpose(0, 1)?, n_rep)?.contiguous()?;
+    let v_hist_rep = repeat_kv(v_hist_squeezed.transpose(0, 1)?, n_rep)?.contiguous()?;
+
+    Ok((k_hist_rep, v_hist_rep))
+}
+
 pub struct CandleBackend {
     /// Full-precision weights (safetensors path; loaded directly onto device)
     weights: HashMap<String, Tensor>,
@@ -283,6 +341,19 @@ pub struct CandleBackend {
     last_audio_values: Mutex<Option<Tensor>>,
     gpu_kv_cache: Mutex<HashMap<(usize, BlockId), BlockData>>,
     seq_blocks: Mutex<HashMap<SeqId, Vec<BlockId>>>,
+    /// Per-(sequence, source-layer) cache of the already-repeated/transposed/
+    /// contiguous full K/V history, so a decode step only needs to append its
+    /// one new token instead of rebuilding the entire past from block storage
+    /// every time (see `rebuild_kv_history_from_blocks`'s doc comment for
+    /// why this matters). Keyed by `src_layer` (not `layer_idx`) so KV-shared
+    /// layers (e.g. Gemma's local/global sharing) reuse the same entry the
+    /// owning layer already populated in the same forward_pass call, instead
+    /// of redundantly caching identical data per sharing layer. Always holds
+    /// the un-windowed length - sliding-window trimming happens on a local
+    /// view at use time, never persisted here. Only populated for
+    /// non-quantized (F16/F32) KV; the Q8/Q4 path always uses the full
+    /// rebuild fallback (see `is_quantized` checks at the call site).
+    kv_history_cache: Mutex<HashMap<(SeqId, usize), (usize, Tensor, Tensor)>>,
     explicit_dequantize: bool,
     use_vram_embeddings: bool,
     custom_mmproj_path: Option<std::path::PathBuf>,
@@ -329,6 +400,7 @@ impl CandleBackend {
             last_audio_values: Mutex::new(None),
             gpu_kv_cache: Mutex::new(HashMap::new()),
             seq_blocks: Mutex::new(HashMap::new()),
+            kv_history_cache: Mutex::new(HashMap::new()),
             explicit_dequantize,
             use_vram_embeddings,
             custom_mmproj_path: None,
@@ -392,6 +464,11 @@ impl LlmBackend for CandleBackend {
                 }
             }
         }
+        // Must be cleared alongside gpu_kv_cache: if `seq_id` gets reused for
+        // a different sequence later, a stale entry here would make the next
+        // forward_pass call wrongly believe it can append onto someone else's
+        // history instead of rebuilding from scratch.
+        self.kv_history_cache.lock().retain(|(sid, _), _| *sid != seq_id);
     }
 
     fn set_explicit_dequantize(&mut self, val: bool) {
@@ -945,13 +1022,93 @@ impl LlmBackend for CandleBackend {
                 return Err(anyhow!("No safetensors files found in {:?}", path));
             }
 
-            // Load all SafeTensors tensors to CPU memory in compute_dtype first
-            let mut cpu_tensors = HashMap::new();
+            // Detect AWQ/GPTQ pre-quantization from config.json (bitsandbytes
+            // is rejected earlier in `parse_config`; awq/gptq are allowed
+            // through to be dequantized here). Read directly rather than
+            // threading a new field through `ModelMeta` (which has ~9
+            // construction sites across the codebase) to keep this change's
+            // blast radius small.
+            let packed_quant: Option<(String, usize)> = std::fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| {
+                    let qc = v.get("quantization_config")?;
+                    let method = qc.get("quant_method")?.as_str()?.to_lowercase();
+                    if method == "awq" || method == "gptq" {
+                        let group_size = qc.get("group_size").and_then(|g| g.as_u64()).unwrap_or(128) as usize;
+                        Some((method, group_size))
+                    } else {
+                        None
+                    }
+                });
+
+            // Load all SafeTensors tensors to CPU memory first, at their
+            // native dtype (NOT cast to compute_dtype yet: AWQ/GPTQ pack
+            // weights as I32, and a raw numeric cast of packed integer bit
+            // patterns to F16/F32 would silently produce meaningless values
+            // instead of a dequantization - exactly the kind of silent
+            // wrong-output failure this project's rules forbid).
+            let mut raw_tensors: HashMap<String, Tensor> = HashMap::new();
             for sf_file in sf_files {
                 let loaded = candle_core::safetensors::load(&sf_file, &Device::Cpu)?;
                 for (name, tensor) in loaded {
-                    let casted = tensor.to_dtype(self.compute_dtype)?;
-                    cpu_tensors.insert(name, casted);
+                    raw_tensors.insert(name, tensor);
+                }
+            }
+
+            let mut cpu_tensors = HashMap::new();
+            if let Some((method, group_size)) = packed_quant {
+                // Group the three (AWQ) or four (GPTQ) packed components per
+                // logical linear layer, dequantize each into one dense
+                // `{base}.weight` tensor; copy anything else (embeddings,
+                // norms, lm_head, GPTQ's per-layer biases) through unchanged.
+                let mut bases: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for name in raw_tensors.keys() {
+                    let comp = if method == "awq" {
+                        crate::loader::awq::awq_component(name)
+                    } else {
+                        crate::loader::gptq::gptq_component(name)
+                    };
+                    if let Some((base, _)) = comp {
+                        bases.insert(base.to_string());
+                    }
+                }
+                for base in &bases {
+                    let qweight = raw_tensors.get(&format!("{base}.qweight"))
+                        .ok_or_else(|| anyhow!("{method}: missing {base}.qweight"))?;
+                    let qzeros = raw_tensors.get(&format!("{base}.qzeros"))
+                        .ok_or_else(|| anyhow!("{method}: missing {base}.qzeros"))?;
+                    let scales = raw_tensors.get(&format!("{base}.scales"))
+                        .ok_or_else(|| anyhow!("{method}: missing {base}.scales"))?;
+                    let dequantized = if method == "awq" {
+                        crate::loader::awq::dequantize_awq_linear(qweight, qzeros, scales, group_size, &Device::Cpu)?
+                    } else {
+                        let g_idx = raw_tensors.get(&format!("{base}.g_idx"));
+                        crate::loader::gptq::dequantize_gptq_linear(qweight, qzeros, scales, g_idx, group_size, &Device::Cpu)?
+                    };
+                    cpu_tensors.insert(format!("{base}.weight"), dequantized.to_dtype(self.compute_dtype)?);
+                }
+                for (name, tensor) in raw_tensors {
+                    let comp = if method == "awq" {
+                        crate::loader::awq::awq_component(&name)
+                    } else {
+                        crate::loader::gptq::gptq_component(&name)
+                    };
+                    if comp.is_none() {
+                        cpu_tensors.insert(name, tensor.to_dtype(self.compute_dtype)?);
+                    }
+                }
+                tracing::warn!(
+                    "Dequantized {} {method} linear layer(s) to dense {:?} weights at load time \
+                     (correctness-first path, not yet a fast tensor-core kernel - see \
+                     quant-performance-plan.md phase 4.3). This dequant path has been checked \
+                     against real safetensors headers but not yet numerically verified against \
+                     Python (transformers/autoawq/auto-gptq) output on real hardware.",
+                    bases.len(), self.compute_dtype
+                );
+            } else {
+                for (name, tensor) in raw_tensors {
+                    cpu_tensors.insert(name, tensor.to_dtype(self.compute_dtype)?);
                 }
             }
 
@@ -1752,59 +1909,92 @@ impl LlmBackend for CandleBackend {
                             *layer_idx
                         };
 
-                        let num_active_blocks = std::cmp::min(
-                            (offset + this_seq_len + block_size - 1) / block_size,
-                            block_table.len()
-                        );
-                        let mut k_blocks = Vec::with_capacity(num_active_blocks);
-                        let mut v_blocks = Vec::with_capacity(num_active_blocks);
-
-                        for &block_id in &block_table[0..num_active_blocks] {
-                            let block_data = gpu_cache.get(&(src_layer, block_id))
-                                .ok_or_else(|| anyhow!("Block ID {} not found for layer {}", block_id, src_layer))?;
-                            
-                            // Same invariant as above: `k_scale`/`v_scale` are always `Some`
-                            // whenever `kv_config.dtype` is Q8/Q4.
-                            let k_deq = if self.kv_config.dtype == KvDtype::Q8 || self.kv_config.dtype == KvDtype::Q4 {
-                                dequantize(&block_data.k, block_data.k_scale.as_ref().unwrap(), self.kv_config.dtype, self.compute_dtype)?
-                            } else {
-                                block_data.k.clone()
-                            };
-
-                            let v_deq = if self.kv_config.dtype == KvDtype::Q8 || self.kv_config.dtype == KvDtype::Q4 {
-                                dequantize(&block_data.v, block_data.v_scale.as_ref().unwrap(), self.kv_config.dtype, self.compute_dtype)?
-                            } else {
-                                block_data.v.clone()
-                            };
-
-                            k_blocks.push(k_deq.squeeze(0)?);
-                            v_blocks.push(v_deq.squeeze(0)?);
-                        }
-
-                        let mut k_hist_squeezed = Tensor::cat(&k_blocks, 0)?;
-                        let mut v_hist_squeezed = Tensor::cat(&v_blocks, 0)?;
-
                         let total_len = offset + this_seq_len;
-                        k_hist_squeezed = k_hist_squeezed.narrow(0, 0, total_len)?;
-                        v_hist_squeezed = v_hist_squeezed.narrow(0, 0, total_len)?;
+                        let n_rep = layer_n_heads / n_kv_heads;
 
-                        if let Some(window_len) = meta.get_sliding_window_len(*layer_idx) {
-                            if total_len > window_len {
-                                let start_idx = total_len - window_len;
-                                k_hist_squeezed = k_hist_squeezed.narrow(0, start_idx, window_len)?;
-                                v_hist_squeezed = v_hist_squeezed.narrow(0, start_idx, window_len)?;
+                        // Fast path: extend the cached, already-repeated/transposed/contiguous
+                        // K/V history instead of rebuilding it from block storage every step
+                        // (see `rebuild_kv_history_from_blocks`'s doc comment for why this is
+                        // the dominant real cost of long-context decode). Restricted to
+                        // non-quantized KV: the Q8/Q4 path applies a Hadamard rotation +
+                        // lossy quantization round-trip this shortcut does not replicate.
+                        let cached_entry = if is_quantized {
+                            None
+                        } else {
+                            self.kv_history_cache.lock().get(&(seq_id, src_layer)).cloned()
+                        };
+
+                        let (k_hist_rep, v_hist_rep, total_seq_len) = match cached_entry {
+                            Some((cached_len, cached_k, cached_v)) if cached_len == total_len => {
+                                // A KV-shared layer whose owning layer already extended the
+                                // cache to this exact length earlier in this same
+                                // forward_pass call - nothing left to do.
+                                (cached_k, cached_v, cached_len)
                             }
+                            Some((cached_len, cached_k, cached_v)) if cached_len == offset && !is_shared => {
+                                // Common decode-step case: append just the newly computed
+                                // tokens onto the cached history instead of re-reading,
+                                // re-dequantizing, and re-repeating the entire past.
+                                let k_4d_val = k_4d.as_ref().unwrap();
+                                let v_4d_val = v_4d.as_ref().unwrap();
+                                let k_new = k_4d_val.narrow(1, tok_start, this_seq_len)?.squeeze(0)?.transpose(0, 1)?;
+                                let v_new = v_4d_val.narrow(1, tok_start, this_seq_len)?.squeeze(0)?.transpose(0, 1)?;
+                                let k_new_rep = repeat_kv(k_new, n_rep)?.contiguous()?;
+                                let v_new_rep = repeat_kv(v_new, n_rep)?.contiguous()?;
+                                let k_new_rep = if k_new_rep.dtype() != cached_k.dtype() {
+                                    k_new_rep.to_dtype(cached_k.dtype())?
+                                } else {
+                                    k_new_rep
+                                };
+                                let v_new_rep = if v_new_rep.dtype() != cached_v.dtype() {
+                                    v_new_rep.to_dtype(cached_v.dtype())?
+                                } else {
+                                    v_new_rep
+                                };
+                                let k_full = Tensor::cat(&[&cached_k, &k_new_rep], 1)?.contiguous()?;
+                                let v_full = Tensor::cat(&[&cached_v, &v_new_rep], 1)?.contiguous()?;
+                                (k_full, v_full, total_len)
+                            }
+                            _ => {
+                                // Cache miss, or stale/mismatched length (new sequence,
+                                // evicted/reused seq_id, prefix-cache reuse, etc.) - safe
+                                // fallback to full reconstruction rather than risk building
+                                // on top of the wrong history.
+                                let (k, v) = rebuild_kv_history_from_blocks(
+                                    &gpu_cache, src_layer, block_table, offset, this_seq_len,
+                                    block_size, self.kv_config.dtype, self.compute_dtype, n_rep,
+                                )?;
+                                (k, v, total_len)
+                            }
+                        };
+
+                        if !is_quantized {
+                            self.kv_history_cache.lock().insert(
+                                (seq_id, src_layer),
+                                (total_seq_len, k_hist_rep.clone(), v_hist_rep.clone()),
+                            );
                         }
 
-                        let total_seq_len = k_hist_squeezed.dim(0)?;
-                        let layer_n_kv_heads = k_hist_squeezed.dim(1)?;
+                        // Sliding window is applied to a local view only - the cache above
+                        // always holds the full un-windowed history so later steps can keep
+                        // extending it correctly.
+                        let (k_hist_rep, v_hist_rep, total_seq_len) = if let Some(window_len) = meta.get_sliding_window_len(*layer_idx) {
+                            if total_seq_len > window_len {
+                                let start_idx = total_seq_len - window_len;
+                                (
+                                    k_hist_rep.narrow(1, start_idx, window_len)?,
+                                    v_hist_rep.narrow(1, start_idx, window_len)?,
+                                    window_len,
+                                )
+                            } else {
+                                (k_hist_rep, v_hist_rep, total_seq_len)
+                            }
+                        } else {
+                            (k_hist_rep, v_hist_rep, total_seq_len)
+                        };
 
                         let q_i = q_4d_rotated.narrow(1, tok_start, this_seq_len)?.squeeze(0)?;
                         let q_i = q_i.transpose(0, 1)?.contiguous()?; // (n_heads, this_seq_len, head_dim)
-                        
-                        let n_rep = layer_n_heads / layer_n_kv_heads;
-                        let k_hist_rep = repeat_kv(k_hist_squeezed.transpose(0, 1)?, n_rep)?.contiguous()?;
-                        let v_hist_rep = repeat_kv(v_hist_squeezed.transpose(0, 1)?, n_rep)?.contiguous()?;
 
                         // Align K dtype to Q for scores matmul
                         let k_hist_rep = if k_hist_rep.dtype() != q_i.dtype() {

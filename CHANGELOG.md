@@ -1,5 +1,45 @@
 # Changelog
 
+## v2026.7.20 (part 2) — decode-speed fix + first-pass AWQ/GPTQ loaders
+
+Prompted by a real, measured comparison against llama.cpp (installed on
+this dev machine) showing llm-rs decoding ~3x slower on Metal for the
+same GGUF file/hardware.
+
+### Fixed
+- **O(n)-per-decode-step KV-cache reconstruction** in `CandleBackend`'s
+  `PagedAttention` operator (`llm-core/src/backends/candle.rs`): every
+  decode step, for every layer, fully rebuilt the entire K/V history from
+  block storage (dequantize + clone every stored block + concat +
+  repeat_kv + transpose + contiguous) just to append one new token -
+  confirmed via a context-length sweep showing decode throughput
+  dropping from ~31 t/s to ~16 t/s between a 28-token and a 278-token
+  context on the same 3B model. Added a `kv_history_cache` that extends
+  the previous step's already-processed history instead of rebuilding it,
+  falling back to the original full-rebuild path (unchanged) for
+  quantized (Q8/Q4) KV, new sequences, and any cache-miss/mismatch.
+  Verified bit-identical generated token IDs before/after; full test
+  suite and `scripts/hardware_check.sh` still pass. Real measured result
+  on this machine: Metal decode throughput 14.7 -> 24.9 t/s (+69%) on the
+  same benchmark. This is backend-agnostic Rust logic, not a Metal-only
+  patch.
+
+### Added
+- **First-pass AWQ + GPTQ safetensors loaders** (`llm-core/src/loader/
+  awq.rs`, `gptq.rs`): dequantize AWQ/GPTQ 4-bit packed weights to dense
+  F16/F32 at load time, wired into the existing safetensors-loading path.
+  `parse_config` no longer hard-rejects these formats (bitsandbytes still
+  is). Tensor layout (AWQ packs along the output axis, GPTQ along the
+  input axis - opposite of each other) confirmed by inspecting two real
+  HF repos' safetensors headers via HTTP range requests, not assumed.
+  **Numerically unverified** - this has not been checked against a real
+  Python (`transformers`/`autoawq`/`auto-gptq`) reference on real
+  tensors, and cannot be built/run at all in this environment (no CUDA
+  hardware, no local AWQ/GPTQ model). Correctness-first only: full
+  dequant at load time trades away AWQ/GPTQ's memory savings and speed
+  advantage for simplicity; real throughput needs a tensor-core kernel
+  (Marlin-class), not attempted here. See `quant-performance-plan.md`.
+
 ## v2026.7.20 — Multimodal Stabilization, Explicit Projectors & Multi-GPU VRAM Auto-Selection
 
 This release completes the hardware-agnostic and model-agnostic multimodal stabilization for Gemma 4 E2B, Qwen3-VL, and SmolLM3 across both CUDA GPU and CPU execution backends, resolving tensor shape mismatches and multi-GPU VRAM discovery issues.

@@ -12,17 +12,19 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
     let val: serde_json::Value = serde_json::from_str(&contents)
         .map_err(|e| anyhow!("Failed to parse config.json: {}", e))?;
 
-    // Reject pre-quantized safetensors formats we don't implement dequant
-    // kernels for (bitsandbytes NF4/FP4, AWQ, GPTQ each pack weights with
-    // their own group-scale/zero-point layout) with a clear error, rather
-    // than silently loading the packed bytes as if they were plain
-    // F16/BF16 weights - which would load "successfully" and produce
-    // meaningless output with no indication anything is wrong. This is a
-    // defense-in-depth check for models loaded directly from disk (not
-    // via `llm pull`, which already warns about this before download).
+    // AWQ and GPTQ are dequantized at load time in CandleBackend::load_weights
+    // (see `llm-core/src/loader/awq.rs`/`gptq.rs`) - detected here only to
+    // reject formats with genuinely no dequant path. bitsandbytes (NF4/FP4)
+    // packs weights in a layout this codebase does not implement at all;
+    // rather than silently loading its packed bytes as if they were plain
+    // F16/BF16 weights (which would load "successfully" and produce
+    // meaningless output with no indication anything is wrong), fail with a
+    // clear error. This is a defense-in-depth check for models loaded
+    // directly from disk (not via `llm pull`, which already warns about this
+    // before download).
     if let Some(qc) = val.get("quantization_config") {
         let method = qc.get("quant_method").and_then(|v| v.as_str()).unwrap_or("unknown");
-        if matches!(method.to_lowercase().as_str(), "bitsandbytes" | "bnb" | "bnb_4bit" | "awq" | "gptq") {
+        if matches!(method.to_lowercase().as_str(), "bitsandbytes" | "bnb" | "bnb_4bit") {
             return Err(anyhow!(
                 "this model is pre-quantized with '{method}', which llm-rs does not yet support \
                  (no dequantization kernel for this packed-weight format) - use a GGUF-quantized \

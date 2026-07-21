@@ -15,8 +15,122 @@ need). A separate CUDA/CPU machine then applied more real-hardware fixes
 (explicit `--mmproj-path`, multi-GPU VRAM selection, vision bias-shape
 guards — see CHANGELOG's v2026.7.20 entry, commit `c7ece93`); those
 changes were re-verified end-to-end on this Mac (Metal + CPU) via
-`scripts/hardware_check.sh` with no regressions — see "v4" below. Not yet
-merged to master.
+`scripts/hardware_check.sh` with no regressions — see "v4" below. Since
+then: a real, measured GPU-throughput investigation (llama.cpp is
+installed on this machine, used as a direct comparison baseline), which
+found and fixed a genuine O(n)-per-decode-step KV-cache reconstruction
+bug (real, hardware-agnostic decode throughput improvement, verified
+bit-identical output before/after), plus first-pass AWQ/GPTQ safetensors
+loaders (dequantize-at-load-time, correctness-first, numerically
+**unverified** — needs the GPU machine and a Python reference to confirm).
+See "v5" below and `quant-performance-plan.md` for the full plan and
+honest status. Not yet merged to master.
+
+## v5 — Real GPU-throughput investigation + AWQ/GPTQ loaders, 2026-07-20
+
+### Measured, not assumed: llm-rs vs llama.cpp head-to-head
+llama.cpp is installed on this machine (Homebrew, build bcfd1989e) - used
+it as a real comparison baseline rather than guessing. Same GGUF file
+(`SmolLM3-3B-Q4_K_M`), same M4 Pro, `llama-bench` vs `llm-cli`'s
+`benchmark_speed`:
+
+| | Prefill | Decode |
+|---|---|---|
+| llama.cpp, Metal | 530 t/s | 43 t/s |
+| llama.cpp, CPU-only | 55 t/s | 22 t/s |
+| llm-rs, Metal (before fix) | 222 t/s | 14.7 t/s |
+| llm-rs, Metal (after fix, see below) | 427 t/s | **24.9 t/s** |
+| llm-rs, CPU-forced | 20-25 t/s | ~9.3-9.8 t/s (fix gave no measurable change here - see why below) |
+
+### Root cause found and fixed: O(n) full KV-history rebuild every decode step
+`llm-core/src/backends/candle.rs`'s `PagedAttention` operator rebuilt the
+**entire** K/V history from block storage on **every single decode
+step, for every layer**: dequantize each stored block, clone it, concat
+all of them into one tensor, then re-run `repeat_kv`+transpose+
+`contiguous` over the whole thing - all just to append ONE new token.
+Confirmed empirically before fixing anything: a context-length sweep
+(28->278 tokens) showed decode throughput dropping from ~31 t/s to ~16
+t/s on the same 3B model, far more than a model this size should
+degrade over such a small range - the signature of accidentally-
+quadratic total decode cost, not normal attention scaling.
+
+Fixed with a new `kv_history_cache: Mutex<HashMap<(SeqId, usize), (usize, Tensor, Tensor)>>`
+field on `CandleBackend`: caches the already-repeated/transposed/
+contiguous full K/V history per (sequence, source-layer - keyed by
+source layer so KV-shared layers like Gemma's local/global sharing reuse
+one entry instead of duplicating it), and each step either (a) reuses it
+directly if a sharing layer already extended it this same call, (b)
+appends just the new token(s) onto it if it's this layer's own turn, or
+(c) falls back to the original full-rebuild path unchanged whenever
+neither holds (new sequence, evicted/reused seq_id, or quantized Q8/Q4
+KV dtype - the Hadamard-rotation + lossy quantization round trip that
+path applies isn't replicated by the fast path, so it's excluded
+entirely for safety). Cache entries are cleared in `clear_sequence` so a
+reused `seq_id` can never read stale history.
+
+**Correctness verified, not assumed**: same prompt, same greedy
+sampling, same model - generated token IDs are **bit-identical** before
+and after this change (`[128002, 271, 128003, 198, 791, 6864, 315, 9822,
+374, 12366, 13, 128012]` both times). Full existing test suite (101
+llm-core + 94 llm-cli tests) still passes, and the full
+`scripts/hardware_check.sh` run (build/detect/text/vision/audio/cluster)
+is still all-green after the change - including the Gemma-4 vision/audio
+smoke test, which exercises this same sliding-window/KV-shared code path.
+
+**Why CPU didn't measurably benefit**: this fix removes redundant CPU-
+side tensor-copy overhead per decode step. On Metal, the GPU compute
+itself is fast, so that CPU-side overhead was a large fraction of total
+decode time - removing it is a big win. On CPU, compute is already the
+bottleneck (the CPU is doing both the "extra" copy work AND the real
+matmul work), so removing the copy overhead barely moves total time.
+This is consistent with the same fix very likely mattering even more on
+CUDA (also GPU-compute-fast, CPU-copy-bound), though that's not
+verified here (no CUDA hardware in this environment).
+
+This is real, hardware-agnostic engine improvement - not a Metal-only
+patch - and is exactly the kind of fix `quant-performance-plan.md`'s
+"Phase 1: profile before optimizing" step was meant to surface.
+
+### First-pass AWQ + GPTQ safetensors loaders (correctness-first, UNVERIFIED numerically)
+New `llm-core/src/loader/awq.rs` and `gptq.rs`: dequantize AWQ/GPTQ
+packed 4-bit safetensors weights to dense F16/F32 at load time, wired
+into `CandleBackend::load_weights`'s existing safetensors-loading path
+(detects `quantization_config.quant_method` in `config.json`, groups the
+per-linear `qweight`/`qzeros`/`scales`(+`g_idx` for GPTQ) tensors, and
+dequantizes each into a plain `{base}.weight` tensor - everything else
+loads through the existing dense-weight path unchanged). `parse_config`
+no longer hard-rejects `awq`/`gptq` (bitsandbytes remains rejected - its
+packed layout isn't implemented at all). `llm pull`'s pre-download
+warning updated to match.
+
+**Tensor layout confirmed by direct inspection** of two real HF repos'
+safetensors headers (`TheBloke/Llama-2-7B-AWQ` and `TheBloke/Llama-2-7B-
+Chat-GPTQ`, via HTTP range requests - no full download needed), not
+assumed from memory: AWQ packs 8 int4 values per int32 along the
+**output** axis; GPTQ packs along the **input** axis (opposite of each
+other) - a real, easy-to-get-backwards detail now backed by real header
+data. Round-trip unit tests (`awq_nibble_order_round_trips`,
+`gptq_sequential_order_round_trips`) verify the bit-unpacking logic is
+internally self-consistent.
+
+**Explicitly NOT verified**: the actual numerical dequantization has
+**not** been checked against a real Python (`transformers`/`autoawq`/
+`auto-gptq`) reference computing the same real tensor - AWQ's
+documented GEMM-kernel nibble interleave order (`[0,2,4,6,1,3,5,7]`)
+and GPTQ's documented zero-point `+1` offset are implemented per public
+documentation of those formats, but neither has been confirmed against
+ground truth. This is real code, not a stub, but it must not be trusted
+for production inference until that check happens - see
+`quant-performance-plan.md` phase 4.1's acceptance criteria for exactly
+what that check involves. This also intentionally trades away AWQ/GPTQ's
+memory savings (full dequant to F16 at load time) for correctness/
+simplicity; real throughput AND memory benefits need phase 4.3's
+tensor-core kernel work, not attempted here.
+
+Cannot be built or tested end-to-end in this environment at all (no
+`nvcc`, no NVIDIA GPU, and no local AWQ/GPTQ model on disk to load) -
+this is scaffolding for the GPU machine to build on, exactly like the
+CUDA-path work documented in "v4".
 
 ## v4 — Re-verification of GPU/CPU-machine fixes on this Mac, 2026-07-20
 Commit `c7ece93` (authored on a separate CUDA/CPU machine) added an
