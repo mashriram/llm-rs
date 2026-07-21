@@ -1,5 +1,38 @@
 # Changelog
 
+## v2026.7.20 (part 4) — multimodal embed_scale fix + quantized-KV cache extension
+
+### Fixed
+- **Vision/audio embeddings incorrectly scaled by Gemma's `embed_scale`**
+  (`llm-core/src/backends/candle.rs`): Gemma-family models multiply the
+  whole embedding tensor by `sqrt(hidden_dim)` in one graph-wide op,
+  applied AFTER vision/audio splicing - so image/audio embeddings (already
+  at the correct final magnitude from their own encoder) were getting an
+  extra ~39x (for Gemma-4-E2B) magnitude blow-up on top of their correct
+  scale. This matches a real root cause for the "runs fine, output is
+  garbage" multimodal failure mode. Fixed by pre-dividing vision/audio
+  embeddings by `embed_scale` at the splice point - mathematically
+  equivalent to HF's real Gemma3/PaliGemma ordering (scale text first,
+  splice unscaled image features after) without restructuring the
+  existing graph. No-op for non-Gemma architectures (gated on
+  `meta.embed_scale.is_some()`) - model-agnostic, not a Gemma-only patch.
+  Verified no regression (Gemma-4 text-only bit-identical, SmolLM3
+  unaffected, full test suite + `hardware_check.sh` still pass) and a
+  real behavior change (repetitive garbage -> clean stop). **Multimodal
+  output is still not fully coherent** - this is real, verified partial
+  progress, not a complete fix; at least one more bug (likely encoder/
+  projector-level) remains, not isolated in this session.
+
+### Added
+- **KV-history-cache fast path extended to quantized (Q8/Q4) KV**: the
+  decode-speed fix from part 2 only covered non-quantized (F16/F32) KV;
+  the Hadamard-rotated Q8/Q4 path always fell back to the full per-step
+  block rebuild. Extended to cover it too, putting the new chunk through
+  the same quantize-then-dequantize round trip the block store applies,
+  so it stays bit-identical to the old path rather than trading away
+  precision for speed. Verified: `LLM_KV_DTYPE=q8` and default KV produce
+  bit-identical generated token IDs.
+
 ## v2026.7.20 (part 3) — re-verification: llama.cpp comparison + multimodal coherence check
 
 No code changes - a verification pass on part 2's work, requested

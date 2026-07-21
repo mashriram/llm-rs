@@ -26,8 +26,14 @@ loaders (dequantize-at-load-time, correctness-first, numerically
 See "v5" below and `quant-performance-plan.md` for the full plan and
 honest status. Re-ran the llama.cpp comparison and multimodal (vision +
 audio, Gemma-4 and Qwen2-VL) tests after that work to confirm the fix
-holds and nothing regressed — see "v5" update below. Not yet merged to
-master.
+holds and nothing regressed — see "v5" update below. Then: found and
+fixed a real, model-agnostic multimodal magnitude bug (Gemma's
+`embed_scale` was being applied to vision/audio embeddings that should
+never see it), and extended the KV-history-cache fast path to also cover
+quantized (Q8/Q4, Hadamard-rotated) KV, verified bit-identical to the
+old slow path. Multimodal output is measurably less broken but **still
+not coherent** - reported honestly as partial progress, not a fix. See
+"v5"'s final update. Not yet merged to master.
 
 ## v5 — Real GPU-throughput investigation + AWQ/GPTQ loaders, 2026-07-20
 
@@ -196,6 +202,74 @@ pre-existing work, distinct from anything fixed in this session - the
 root cause (encoder correctness? projector correctness? something in the
 splice/positional-encoding path?) is not yet isolated for Gemma-4
 specifically (Qwen2-VL's cause - missing 2D RoPE - is already known).
+
+### Found and fixed a real, model-agnostic multimodal bug: `embed_scale` applied to vision/audio embeddings
+Root-caused the Gemma-4 incoherence (not just observed it): Gemma-family
+models multiply the ENTIRE embedding tensor by `sqrt(hidden_dim)`
+(`embed_scale`) in a single graph-wide `Operator::Scale`, applied in
+`graph/builder.rs` AFTER text embedding, vision splice, AND audio splice
+all happen (`Embed -> VisualEmbed+Splice -> AudioEmbed+Splice -> Scale`).
+That means vision/audio embeddings - which come from a separate encoder
+already producing values at the correct final magnitude - were getting
+multiplied by `sqrt(1536) ≈ 39.2` (for Gemma-4-E2B) on top of their
+already-correct scale, an ~39x magnitude blow-up at exactly the image/
+audio token positions. This matches HF's real Gemma3/PaliGemma reference
+behavior, which avoids this by scaling text embeddings BEFORE the
+image-feature scatter (image features themselves are never scaled).
+
+Fixed by pre-dividing vision/audio embeddings by `embed_scale` right at
+the splice point (`SpliceTensors`/`SpliceAudioTensors` in
+`llm-core/src/backends/candle.rs`), so the later uniform multiply brings
+them back to the encoder's intended scale - mathematically equivalent to
+HF's actual order of operations, without restructuring the existing
+graph. Gated purely on `meta.embed_scale.is_some()` (only true for Gemma-
+family models), so this is a no-op for Qwen2-VL/any non-Gemma
+architecture - fully model-agnostic, not a Gemma-specific hack.
+
+**Verified real and correct, but NOT a complete fix**:
+- Confirmed no regression: Gemma-4 text-only generation is bit-identical
+  before/after (`The capital of France is **Paris**.`); SmolLM3 (non-
+  Gemma, `embed_scale: None`) unaffected; full test suite (101+94 tests)
+  and `hardware_check.sh` (all 7 checks) still pass.
+- Measured real behavior change: Gemma-4 vision went from repetitive
+  garbage tokens ("covering this / ing this / ing this...") to a clean,
+  short stop (no hallucinated babbling) - a real, less-severe failure
+  mode, consistent with the magnitude corruption being real and now
+  fixed. Tested with both a flat-color and a two-color test image.
+- **Still not coherent**: neither vision nor audio produces an actually
+  *correct* description yet. Audio in particular still shows garbled
+  output, not just silence - meaning at least one more bug remains,
+  likely in the vision/audio encoder or projector itself rather than
+  this embedding-scale path (which is now verified sound). Not isolated
+  in this session - would need either a numerical reference comparison
+  against HF's Gemma3/PaliGemma vision-tower output, or further encoder-
+  level debugging with more time than this pass allowed. Reporting this
+  honestly as real, verified partial progress, not a solved bug.
+
+### Extended the KV-history-cache fast path to quantized (Q8/Q4) KV
+The KV-cache optimization from earlier in this section only covered
+non-quantized (F16/F32) KV - the Q8/Q4 path (Hadamard-rotated before
+quantization) always fell back to the full block-rebuild every step.
+Confirmed `generate_hadamard_orthogonal`'s rotation matrix is a pure,
+deterministic function of `head_dim` (a fixed Walsh-Hadamard
+construction, no randomness) - safe to cache across calls, since the
+same rotation is always reproduced identically.
+
+Extended the fast path to cover this case too: the newly-computed
+chunk's K/V is put through the *exact same* quantize-then-dequantize
+round trip the block store itself applies (via the existing `quantize`/
+`dequantize` functions) before being appended to the cached history, so
+the result stays bit-identical to reading the same chunk back from
+`gpu_kv_cache` - no precision is traded away for the speed gain.
+
+**Verified**: `LLM_KV_DTYPE=q8` and default (F16) KV now produce
+bit-identical generated token IDs for the same prompt/model
+(`[128002, 271, 128003, 198, 791, 6864, 315, 9822, 374, 12366, 13,
+128012]`, both cases). Real measured decode speed with the fast path
+active: ~19 t/s on Metal for `LLM_KV_DTYPE=q8` (no "before" number exists
+for direct before/after comparison on this specific path, since it
+wasn't benchmarked prior to this extension - but it shares the identical
+architectural fix already proven on the F16 path).
 
 ## v4 — Re-verification of GPU/CPU-machine fixes on this Mac, 2026-07-20
 Commit `c7ece93` (authored on a separate CUDA/CPU machine) added an

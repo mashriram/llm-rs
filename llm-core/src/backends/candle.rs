@@ -350,9 +350,11 @@ pub struct CandleBackend {
     /// owning layer already populated in the same forward_pass call, instead
     /// of redundantly caching identical data per sharing layer. Always holds
     /// the un-windowed length - sliding-window trimming happens on a local
-    /// view at use time, never persisted here. Only populated for
-    /// non-quantized (F16/F32) KV; the Q8/Q4 path always uses the full
-    /// rebuild fallback (see `is_quantized` checks at the call site).
+    /// view at use time, never persisted here. Covers quantized (Q8/Q4,
+    /// Hadamard-rotated) KV too - the new chunk goes through the same
+    /// quantize-then-dequantize round trip the block store applies, so the
+    /// cache stays bit-identical to reading the same chunk back from
+    /// `gpu_kv_cache` (see the call site's `is_quantized` branch).
     kv_history_cache: Mutex<HashMap<(SeqId, usize), (usize, Tensor, Tensor)>>,
     explicit_dequantize: bool,
     use_vram_embeddings: bool,
@@ -1915,14 +1917,14 @@ impl LlmBackend for CandleBackend {
                         // Fast path: extend the cached, already-repeated/transposed/contiguous
                         // K/V history instead of rebuilding it from block storage every step
                         // (see `rebuild_kv_history_from_blocks`'s doc comment for why this is
-                        // the dominant real cost of long-context decode). Restricted to
-                        // non-quantized KV: the Q8/Q4 path applies a Hadamard rotation +
-                        // lossy quantization round-trip this shortcut does not replicate.
-                        let cached_entry = if is_quantized {
-                            None
-                        } else {
-                            self.kv_history_cache.lock().get(&(seq_id, src_layer)).cloned()
-                        };
+                        // the dominant real cost of long-context decode). Covers the quantized
+                        // (Q8/Q4, Hadamard-rotated) KV path too: `k_4d`/`v_4d` here already ARE
+                        // the rotated tensors (the rotation is applied once, upstream, before
+                        // this match arm - see `k_4d_rotated` above), and the new chunk is put
+                        // through the exact same quantize-then-dequantize round trip the block
+                        // store itself applies, so this stays bit-identical to reading the same
+                        // chunk back from `gpu_cache` rather than trading precision for speed.
+                        let cached_entry = self.kv_history_cache.lock().get(&(seq_id, src_layer)).cloned();
 
                         let (k_hist_rep, v_hist_rep, total_seq_len) = match cached_entry {
                             Some((cached_len, cached_k, cached_v)) if cached_len == total_len => {
@@ -1937,8 +1939,22 @@ impl LlmBackend for CandleBackend {
                                 // re-dequantizing, and re-repeating the entire past.
                                 let k_4d_val = k_4d.as_ref().unwrap();
                                 let v_4d_val = v_4d.as_ref().unwrap();
-                                let k_new = k_4d_val.narrow(1, tok_start, this_seq_len)?.squeeze(0)?.transpose(0, 1)?;
-                                let v_new = v_4d_val.narrow(1, tok_start, this_seq_len)?.squeeze(0)?.transpose(0, 1)?;
+                                let k_i = k_4d_val.narrow(1, tok_start, this_seq_len)?;
+                                let v_i = v_4d_val.narrow(1, tok_start, this_seq_len)?;
+                                let (k_i, v_i) = if is_quantized {
+                                    let k_cast = k_i.to_dtype(self.compute_dtype)?;
+                                    let v_cast = v_i.to_dtype(self.compute_dtype)?;
+                                    let (q_k, q_k_scale) = quantize(&k_cast, self.kv_config.dtype, self.compute_dtype)?;
+                                    let (q_v, q_v_scale) = quantize(&v_cast, self.kv_config.dtype, self.compute_dtype)?;
+                                    (
+                                        dequantize(&q_k, &q_k_scale, self.kv_config.dtype, self.compute_dtype)?,
+                                        dequantize(&q_v, &q_v_scale, self.kv_config.dtype, self.compute_dtype)?,
+                                    )
+                                } else {
+                                    (k_i, v_i)
+                                };
+                                let k_new = k_i.squeeze(0)?.transpose(0, 1)?;
+                                let v_new = v_i.squeeze(0)?.transpose(0, 1)?;
                                 let k_new_rep = repeat_kv(k_new, n_rep)?.contiguous()?;
                                 let v_new_rep = repeat_kv(v_new, n_rep)?.contiguous()?;
                                 let k_new_rep = if k_new_rep.dtype() != cached_k.dtype() {
@@ -1968,12 +1984,10 @@ impl LlmBackend for CandleBackend {
                             }
                         };
 
-                        if !is_quantized {
-                            self.kv_history_cache.lock().insert(
-                                (seq_id, src_layer),
-                                (total_seq_len, k_hist_rep.clone(), v_hist_rep.clone()),
-                            );
-                        }
+                        self.kv_history_cache.lock().insert(
+                            (seq_id, src_layer),
+                            (total_seq_len, k_hist_rep.clone(), v_hist_rep.clone()),
+                        );
 
                         // Sliding window is applied to a local view only - the cache above
                         // always holds the full un-windowed history so later steps can keep
@@ -2149,6 +2163,26 @@ impl LlmBackend for CandleBackend {
                         let v_emb = ctx.get(visual_embeds)?;
                         // Unify dtypes: visual embeddings (may be F32 on CPU) must match text embedding dtype
                         let v_emb = v_emb.to_dtype(t_emb.dtype())?;
+                        // Model-agnostic pre-compensation for `embed_scale` (Gemma-family
+                        // models multiply ALL embeddings by sqrt(hidden_dim) in a single
+                        // graph-wide Scale op applied AFTER this splice - see
+                        // `graph/builder.rs`). The vision encoder's own output is already at
+                        // the correct final magnitude on its own, so without this it would be
+                        // scaled up an extra sqrt(hidden_dim)x (e.g. ~39x for a 1536-dim
+                        // model) relative to what the transformer layers expect, corrupting
+                        // every position from the image tokens onward even though nothing
+                        // crashes - exactly the "runs fine, output is garbage" failure mode
+                        // confirmed via real Gemma-4 vision testing. Dividing here so the
+                        // later uniform multiply brings it back to the encoder's intended
+                        // scale - the same pre-compensation HF's Gemma3/PaliGemma reference
+                        // implementation applies to image features before its own equivalent
+                        // scatter+scale sequence. A no-op (scale absent) for any non-Gemma
+                        // architecture, so this does not affect Qwen2-VL or other models.
+                        let v_emb = if let Some(scale) = meta.embed_scale {
+                            (v_emb / scale as f64)?
+                        } else {
+                            v_emb
+                        };
                         let v_emb_narrowed = if v_emb.dim(2)? > t_emb.dim(2)? {
                             v_emb.narrow(2, 0, t_emb.dim(2)?)?
                         } else {
@@ -2206,6 +2240,13 @@ impl LlmBackend for CandleBackend {
                     } else {
                         let a_emb = ctx.get(audio_embeds)?;
                         let a_emb = a_emb.to_dtype(t_emb.dtype())?;
+                        // Same `embed_scale` pre-compensation as `SpliceTensors` above - see
+                        // that comment for the full explanation. No-op for non-Gemma models.
+                        let a_emb = if let Some(scale) = meta.embed_scale {
+                            (a_emb / scale as f64)?
+                        } else {
+                            a_emb
+                        };
                         let a_emb_narrowed = if a_emb.dim(2)? > t_emb.dim(2)? {
                             a_emb.narrow(2, 0, t_emb.dim(2)?)?
                         } else {
