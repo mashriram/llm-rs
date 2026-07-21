@@ -55,7 +55,32 @@ speech sample. **Audio is still not fully coherent** even after all of
 this - reported honestly; the most likely remaining cause (missing
 validity/causal attention masking for zero-padded buffer positions) is
 identified and scoped but not implemented this pass. See CHANGELOG's
-"part 6" entry for the complete writeup. Not yet merged to master.
+"part 6" entry for the complete writeup. **Then implemented that
+masking** (real reference-ported causal+validity mask for the chunked
+attention, plus lconv1d masking), verified no regression - but the
+resulting output got noticeably SHORTER (near-immediate stop), not more
+coherent, which turned out to be a critical clue: **"part 6" had used
+the wrong reference model entirely**. This project's actual target,
+"Gemma-4," is a different, newer model from "Gemma 3n" (the HF
+`transformers` model part 6 read). Caught this by finally getting a
+REAL, RUNNING reference on this machine
+(`mlx-community/gemma-4-e2b-it-4bit` via `mlx-vlm`, both work natively on
+Apple Silicon) - it transcribed a real JFK speech sample perfectly,
+proving the weights/architecture work and giving actual ground truth to
+compare against, not just source code. Reverted three real regressions
+(k_scale removal, CumulativeGroupNorm, asymmetric conv padding - all
+individually well-reasoned against the WRONG reference), rewrote the
+mel-spectrogram front-end to match Gemma-4's real (and much simpler,
+no-preemphasis) config, and found+fixed a real mel-filterbank bin-index
+bug along the way (numerically confirmed by comparing frame-by-frame
+against the real reference's own mel output - one frame matched
+bit-for-bit). **Audio is still not coherent** - but for the first time,
+precisely why is known rather than guessed: the SSCP-stage and full
+encoder outputs were directly compared against the real reference's own
+intermediate tensors and do not match, narrowing the remaining bug to a
+specific, verifiable location instead of an open-ended search. See
+CHANGELOG's "part 7" entry for the complete writeup and what tooling now
+exists for the next pass. Not yet merged to master.
 
 ## v5 — Real GPU-throughput investigation + AWQ/GPTQ loaders, 2026-07-20
 

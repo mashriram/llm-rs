@@ -1,5 +1,121 @@
 # Changelog
 
+## v2026.7.20 (part 7) — found and fixed the wrong-reference-model mistake; real numeric verification
+
+**Critical correction to part 6**: this project's actual target is
+**"Gemma-4"** (`google/gemma-4-E2B-it`, matching this repo's own GGUF
+filenames) - a different, newer model from **"Gemma 3n"**, the model in
+HF `transformers` that part 6 used as its reference. They share a similar
+Conformer architecture family but have real, materially different
+configs. Part 6's fixes (removing k_scale, replacing LayerNorm with
+CumulativeGroupNorm, switching to asymmetric conv padding) were each
+individually well-reasoned against Gemma 3n's real source - but Gemma 3n
+was the wrong model. All three have been reverted.
+
+This was caught by finally obtaining what earlier passes lacked: a real,
+*running* reference on this exact machine. `mlx-community/gemma-4-e2b-
+it-4bit` (a public, non-gated 4-bit MLX port of the actual target model)
+was downloaded and run via `mlx-vlm` (`pip install mlx mlx-vlm`, both
+work natively on Apple Silicon). Given the real JFK audio sample used
+throughout this session's audio testing, it produced the **exact correct
+transcription**: `"And so my fellow Americans, ask not what your country
+can do for you, ask what you can do for your country."` This is real,
+runnable ground truth, not source-code reasoning - `mlx_vlm/models/
+gemma4/audio.py` and `audio_feature_extractor.py` are the actual
+target architecture's implementation, confirmed against the real
+model's own `processor_config.json`.
+
+### Reverted (real regressions from the wrong reference)
+- **K-scale removal**: restored. The real Gemma-4 attention DOES apply a
+  fixed key-side scale `ln(1+e)/ln(2)` (`self.k_scale = math.log(1 +
+  math.e) / math.log(2)`, applied as `k = k * self.k_scale`) - Gemma 3n
+  genuinely lacks this, but that's irrelevant; Gemma-4 has it.
+- **CumulativeGroupNorm**: reverted to plain `LayerNorm` (channel-dim, no
+  bias) - the real `SSCPConvBlock` uses `nn.LayerNorm(out_channels, eps,
+  bias=False)`, not a cumulative/masked group norm. Masking is instead
+  applied by zeroing invalid time steps *before* the conv
+  (`x = mx.where(mask, 0.0, x)`), which is what `zero_invalid_time_steps`
+  (replacing `cumulative_group_norm`) now does.
+- **Asymmetric SSCP conv padding**: reverted to symmetric `(1,1,1,1)`
+  padding on both time and frequency axes (`self.padding = (1,1,1,1)`,
+  ordinary `conv2d(padding=1)`) - the real model has no "reverse-causal"
+  time-axis asymmetry at all.
+
+### Fixed for real (Gemma-4's actual mel-spectrogram front-end)
+The mel-spectrogram implementation from part 6 (itself built against
+Gemma 3n) has been replaced with `gemma4_mel_spectrogram`, matching the
+real `Gemma4AudioFeatureExtractor` exactly:
+- 20ms/320-sample frames (not 32ms/512), FFT length 512 (not 1024 - no
+  "FFT overdrive" for this model).
+- Mel filterbank spans 0-8000 Hz (not 125-7600 Hz).
+- **No preemphasis** (coefficient 0.0) - part 6 had *added* HTK
+  preemphasis based on Gemma 3n; the real model has none.
+- Semicausal left-padding (`frame_length/2` = 160 zero samples prepended
+  so the first frame is centered at t=0) - entirely missing before.
+- `ln(mel + 1e-3)` (additive floor), not `ln(max(mel, 1e-5))`.
+
+**Independently verified numerically, not just by reading source**:
+extracted the real reference's actual mel-spectrogram values for this
+session's real JFK audio sample (`Gemma4AudioFeatureExtractor` run
+directly in Python) and compared frame-by-frame against this codebase's
+own `load_audio` output for the identical file. A pure-silence frame
+(frame 0) matched **bit-for-bit** (`-6.9077554` in every bin, `=
+ln(1e-3)`, non-trivial to match by coincidence). A real-signal frame
+(frame 50) was close but showed a small, consistent per-bin discrepancy.
+
+### Also fixed: a real, now-measurable mel-filterbank bin-index bug
+Investigating that remaining frame-50 discrepancy found a genuine bug in
+`build_mel_filterbank` (shared by both the Whisper and Gemma paths):
+converting a mel-scale frequency to an FFT bin index used `(n_fft + 1) *
+Hz / sample_rate`; the mathematically correct conversion (each FFT bin
+`k` represents frequency `k * sample_rate / n_fft`, so the inverse is
+`Hz * n_fft / sample_rate`) has no `+1`. Part 5 had flagged this as a
+"minor, ~0.1%, deliberately unfixed" nit specifically because it
+couldn't be verified against a reference at the time. Now it's
+measured, not estimated: removing the erroneous `+1` reduced the
+frame-50 per-bin discrepancy against the real reference by roughly an
+order of magnitude (differences dropped from the ~0.01-0.02 range to
+~0.001-0.01). Fixed - this formula has one objectively correct form, so
+unlike the Gemma-vs-Whisper-specific fixes above, this was safe to
+correct for both architectures at once.
+
+### Honest status: still not coherent, and now precisely why
+With the mel front-end verified close (not exact) and three real
+regressions reverted, end-to-end output is still not coherent (tested
+with the same real JFK sample). Went one level deeper for a definitive
+answer: extracted the *encoder's* actual output tensor from the real
+reference (`audio_tower(mel, mask)`, shape `(1, 275, 1536)` - 275 matches
+this codebase's own valid-length arithmetic exactly, a good sign) and
+compared against this codebase's own full encoder output for the
+identical input. **They do not match** - not just numerically off, but
+a different overall scale (reference std ≈ 5.7, this codebase's std ≈
+1.5) and non-matching sign patterns per dimension. Narrowed further: the
+SSCP-stage output (before the 12 Conformer blocks) is in the right
+ballpark (same order of magnitude, similar largest-dimension pattern)
+but also does not match closely. This means real, additional bugs remain
+somewhere in the SSCP conv/norm stage and/or the Conformer blocks
+themselves (attention, relative position embedding, or light-conv) -
+now a well-scoped, verifiable-not-guessable problem: the tooling to
+compare any intermediate tensor against real ground truth now exists and
+works (see below), the remaining work is methodically walking it
+layer-by-layer rather than reasoning from source code alone.
+
+**What's now available for the next pass** (not yet exhausted this
+session, given how much ground was already covered): the real reference
+model runs locally (`/tmp/hf-ref-env` venv, `mlx`/`mlx-vlm` installed,
+`mlx-community/gemma-4-e2b-it-4bit` cached in `~/.cache/huggingface`) -
+any intermediate tensor (per-conv-layer, per-attention-layer, position
+embeddings, etc.) can be dumped from the real model and compared
+directly against this codebase's own (a temporary `LLM_DEBUG_*`-gated
+early-return in `encode_conformer`, exactly like the one used to extract
+the SSCP-only comparison above, is the fastest way to tap any
+intermediate point). This is a materially better position than "read
+source code and hope" - the verification loop is now real.
+
+Full test suite (101+94 tests) and `scripts/hardware_check.sh` (all 7
+checks) still pass; Gemma-4 text-only output remains bit-identical
+throughout every change in this entry.
+
 ## v2026.7.20 (part 6) — audio fixes verified against the real Gemma3n reference source
 
 Part 5's audit flagged several audio issues as "could not verify without a

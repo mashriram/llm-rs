@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
     // Create a dummy audio input: (1, 128, 3000)
     let dummy_input = Tensor::zeros((1, 128, 3000), DType::F32, &device)?;
     println!("Encoding dummy audio...");
-    let out = encoder.encode(&dummy_input)?;
+    let out = encoder.encode(&dummy_input, 3000)?;
     println!("Successfully encoded audio! Output shape: {:?}", out.shape());
     Ok(())
 }

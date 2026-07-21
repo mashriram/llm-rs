@@ -339,6 +339,13 @@ pub struct CandleBackend {
     audio_embeddings: Mutex<Option<Tensor>>,
     last_audio_path: Mutex<Option<String>>,
     last_audio_values: Mutex<Option<Tensor>>,
+    /// How many of `last_audio_values`' mel frames are real audio vs.
+    /// zero-padding from the fixed-size buffer (see `load_audio`) - cached
+    /// alongside the tensor itself so `Operator::AudioEmbed` (which reads
+    /// the cached tensor from the compute graph, not directly from
+    /// `load_audio`'s return value) can pass it into `AudioEncoder::encode`
+    /// for masking.
+    last_audio_valid_frames: Mutex<Option<usize>>,
     gpu_kv_cache: Mutex<HashMap<(usize, BlockId), BlockData>>,
     seq_blocks: Mutex<HashMap<SeqId, Vec<BlockId>>>,
     /// Per-(sequence, source-layer) cache of the already-repeated/transposed/
@@ -400,6 +407,7 @@ impl CandleBackend {
             audio_embeddings: Mutex::new(None),
             last_audio_path: Mutex::new(None),
             last_audio_values: Mutex::new(None),
+            last_audio_valid_frames: Mutex::new(None),
             gpu_kv_cache: Mutex::new(HashMap::new()),
             seq_blocks: Mutex::new(HashMap::new()),
             kv_history_cache: Mutex::new(HashMap::new()),
@@ -1523,6 +1531,7 @@ impl LlmBackend for CandleBackend {
             let active_path = crate::backends::ACTIVE_AUDIO_PATH.lock().clone();
             let mut cache = self.last_audio_values.lock();
             let mut last_path = self.last_audio_path.lock();
+            let mut cached_valid_frames = self.last_audio_valid_frames.lock();
             let needs_load = match (&active_path, &*last_path, &*cache) {
                 (Some(curr), Some(prev), Some(_)) if curr == prev => false,
                 _ => true,
@@ -1533,19 +1542,20 @@ impl LlmBackend for CandleBackend {
                     .map(|e| e.architecture)
                     .unwrap_or(crate::backends::audio::AudioArchitecture::GemmaConformer);
                 let num_mel_bins = architecture.num_mel_bins();
-                let loaded = if let Some(ref path_str) = active_path {
+                let (loaded, valid_frames) = if let Some(ref path_str) = active_path {
                     match crate::backends::audio::load_audio(Path::new(path_str), &dev, architecture) {
-                        Ok(t) => t.to_dtype(audio_dtype)?,
+                        Ok((t, valid_frames)) => (t.to_dtype(audio_dtype)?, valid_frames),
                         Err(e) => {
                             tracing::warn!("Failed to load audio from {path_str}: {e}, using zeros");
-                            Tensor::zeros((1, num_mel_bins, 3000), audio_dtype, &dev)?
+                            (Tensor::zeros((1, num_mel_bins, 3000), audio_dtype, &dev)?, 0)
                         }
                     }
                 } else {
-                    Tensor::zeros((1, num_mel_bins, 3000), audio_dtype, &dev)?
+                    (Tensor::zeros((1, num_mel_bins, 3000), audio_dtype, &dev)?, 0)
                 };
                 *cache = Some(loaded.clone());
                 *last_path = active_path.clone();
+                *cached_valid_frames = Some(valid_frames);
                 loaded
             } else {
                 // `needs_load` is only `false` when the match above matched the
@@ -2212,7 +2222,9 @@ impl LlmBackend for CandleBackend {
                         };
                         if needs_encode {
                             let a_val = ctx.get(audio_values)?;
-                            let encoded = enc.encode(&a_val)?;
+                            let valid_frames = self.last_audio_valid_frames.lock()
+                                .unwrap_or_else(|| a_val.dim(2).unwrap_or(0));
+                            let encoded = enc.encode(&a_val, valid_frames)?;
                             *cache = Some(encoded.clone());
                             *last_path = active_path.clone();
                             encoded

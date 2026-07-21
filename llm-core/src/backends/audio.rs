@@ -157,9 +157,14 @@ impl AudioEncoder {
         })
     }
 
-    pub fn encode(&self, audio_values: &Tensor) -> Result<Tensor> {
+    /// `valid_frames`: how many of `audio_values`' time-axis positions are
+    /// real audio vs. zero-padding (see `load_audio`). Only used by the
+    /// Gemma-Conformer path to mask padded positions out of attention/
+    /// normalization; ignored by Whisper (see `load_audio`'s doc comment
+    /// for why that path isn't masked).
+    pub fn encode(&self, audio_values: &Tensor, valid_frames: usize) -> Result<Tensor> {
         match self.architecture {
-            AudioArchitecture::GemmaConformer => self.encode_conformer(audio_values),
+            AudioArchitecture::GemmaConformer => self.encode_conformer(audio_values, valid_frames),
             AudioArchitecture::Whisper => self.encode_whisper(audio_values),
         }
     }
@@ -302,8 +307,11 @@ impl AudioEncoder {
         Ok(x)
     }
 
-    /// Gemma-4 style Conformer encoder.
-    fn encode_conformer(&self, audio_values: &Tensor) -> Result<Tensor> {
+    /// Gemma-4 style Conformer encoder. `valid_mel_frames`: how many of
+    /// `audio_values`' input mel frames are real audio vs. zero-padding
+    /// (see `load_audio`) - propagated through both SSCP conv-subsampling
+    /// stages and into the Conformer blocks' attention/lconv masking.
+    fn encode_conformer(&self, audio_values: &Tensor, valid_mel_frames: usize) -> Result<Tensor> {
         let device = audio_values.device();
         // Dynamically resolve the working dtype from the weights
         let first_w = self.weights.values().next()
@@ -316,46 +324,56 @@ impl AudioEncoder {
         // Unsqueeze to (batch, 1, 128, 3000)
         let x = audio_values.unsqueeze(1)?.contiguous()?;
 
-        // layer 0: Conv2d(stride=2, padding=1), LayerNorm, ReLU
+        // Zero out invalid (padded) time steps BEFORE the conv, matching the
+        // real Gemma-4 `SSCPConvBlock.__call__` (`x = mx.where(mask, 0.0,
+        // x)`) - ported from mlx-vlm's actual `mlx_vlm/models/gemma4/
+        // audio.py` (the real target architecture for this project's
+        // "gemma-4" GGUF checkpoints - confirmed by running the real
+        // `mlx-community/gemma-4-e2b-it-4bit` model on this machine and
+        // reading its source directly, NOT the unrelated "Gemma 3n" model
+        // in HF `transformers` an earlier pass in this session mistakenly
+        // used as the reference).
+        let x = zero_invalid_time_steps(&x, 2, valid_mel_frames)?;
+
+        // layer 0: Conv2d(stride=2, SYMMETRIC padding=1 on both time and
+        // freq), LayerNorm (plain, channel-dim, no bias), ReLU - matching
+        // `SSCPConvBlock`'s real `self.padding = (1,1,1,1)` and
+        // `nn.LayerNorm(out_channels, ..., bias=False)`. An earlier pass
+        // this session replaced this with an asymmetric "reverse-causal"
+        // pad and a from-scratch `CumulativeGroupNorm`, both based on the
+        // wrong ("Gemma 3n") reference - reverted now that the real
+        // architecture is confirmed to use neither.
         let conv0_w = self.weights.get("a.conv1d.0.weight")
             .ok_or_else(|| anyhow!("a.conv1d.0.weight not found"))?;
         let norm0_w = self.weights.get("a.conv1d.0.norm.weight")
             .ok_or_else(|| anyhow!("a.conv1d.0.norm.weight not found"))?;
 
-        // Reference (`Gemma3nAudioSSCPConvBlock`) pads TIME (0 before,
-        // kernel_h-1=2 after - "reverse causal": every output step only ever
-        // looks at past+current input, never future) and FREQ (1 before, 1
-        // after - ordinary symmetric "same"-ish padding) asymmetrically per
-        // axis, then convolves with padding=0. candle's `conv2d` only takes
-        // one symmetric padding value applied to both axes, so the padding
-        // is done manually here instead of via conv2d's own padding param
-        // (which previously applied the WRONG symmetric 1-before/1-after
-        // shape to the time axis too, letting each output step see one
-        // step into the future it shouldn't - a real, confirmed-against-
-        // reference bug, distinct from the normalization/scale ones above).
-        let x = x.pad_with_zeros(2, 0, 2)?.pad_with_zeros(3, 1, 1)?;
-        let x = x.conv2d(conv0_w, 0, 2, 1, 1)?; // padding already applied manually above
+        let x = x.conv2d(conv0_w, 1, 2, 1, 1)?; // padding 1, stride 2
 
-        // Permute to (batch, time, freq, channels) for CumulativeGroupNorm
+        // Permute to (batch, time, freq, channels) for LayerNorm
         let x = x.permute((0, 2, 3, 1))?.contiguous()?;
 
-        const SSCP_GROUP_NORM_EPS: f64 = 1e-3; // config.sscp_conv_group_norm_eps
-        let x = cumulative_group_norm(&x, norm0_w, SSCP_GROUP_NORM_EPS)?;
+        let valid_len0 = conv_stride2_out_len(valid_mel_frames);
+        let norm0_b = Tensor::zeros(norm0_w.dim(0)?, dtype, device)?;
+        let x = candle_nn::ops::layer_norm(&x, norm0_w, &norm0_b, 1e-6)?;
         let x = x.relu()?;
         let x = x.permute((0, 3, 1, 2))?; // Back to (batch, channels, h, w)
+        let x = zero_invalid_time_steps(&x, 2, valid_len0)?;
 
-        // layer 1: same reverse-causal-time/symmetric-freq padding, CumulativeGroupNorm, ReLU
+        // layer 1: same symmetric padding, plain LayerNorm, ReLU
         let conv1_w = self.weights.get("a.conv1d.1.weight")
             .ok_or_else(|| anyhow!("a.conv1d.1.weight not found"))?;
         let norm1_w = self.weights.get("a.conv1d.1.norm.weight")
             .ok_or_else(|| anyhow!("a.conv1d.1.norm.weight not found"))?;
 
-        let x = x.contiguous()?.pad_with_zeros(2, 0, 2)?.pad_with_zeros(3, 1, 1)?;
-        let x = x.conv2d(conv1_w, 0, 2, 1, 1)?;
+        let x = x.contiguous()?.conv2d(conv1_w, 1, 2, 1, 1)?;
         let x = x.permute((0, 2, 3, 1))?.contiguous()?;
-        let x = cumulative_group_norm(&x, norm1_w, SSCP_GROUP_NORM_EPS)?;
+        let valid_len1 = conv_stride2_out_len(valid_len0);
+        let norm1_b = Tensor::zeros(norm1_w.dim(0)?, dtype, device)?;
+        let x = candle_nn::ops::layer_norm(&x, norm1_w, &norm1_b, 1e-6)?;
         let x = x.relu()?;
         let x = x.permute((0, 3, 1, 2))?; // (batch, 32, 32, 750)
+        let x = zero_invalid_time_steps(&x, 2, valid_len1)?;
 
         // Reshape to sequence: (batch, seq_len, hidden_dim)
         let x = x.permute((0, 2, 3, 1))?.contiguous()?;
@@ -393,7 +411,7 @@ impl AudioEncoder {
 
         // 3. Conformer Blocks (12 layers)
         for i in 0..self.num_layers {
-            x = self.forward_conformer_block(i, &x, &pos_embed, rel_len)?;
+            x = self.forward_conformer_block(i, &x, &pos_embed, rel_len, valid_len1)?;
         }
 
         // 4. Output Projector (output_proj)
@@ -408,7 +426,7 @@ impl AudioEncoder {
         Ok(x)
     }
 
-    fn forward_conformer_block(&self, i: usize, x: &Tensor, pos_embed: &Tensor, rel_len: usize) -> Result<Tensor> {
+    fn forward_conformer_block(&self, i: usize, x: &Tensor, pos_embed: &Tensor, rel_len: usize, valid_seq_len: usize) -> Result<Tensor> {
         let _device = x.device();
         let dtype = x.dtype();
         let grad_clip = if dtype == DType::F16 { 65504.0f32 } else { 1e10f32 };
@@ -500,21 +518,17 @@ impl AudioEncoder {
         let q_reshaped = q.reshape((batch_size, seq_len, num_heads, head_dim))?;
         let q_scaled = q_reshaped.broadcast_mul(&q_scale_factor)?;
 
-        // NOTE: a fixed K-side multiplier `ln(1+e)/ln(2) ~= 1.894` (softplus(1.0)
-        // over ln(2)) previously lived here, applied uniformly to every key
-        // vector. Unlike `q_scale` above (`1/softplus(0) = head_dim^-0.5/ln(2)`,
-        // a documented Google Conformer/USM "PerDimScale" trick chosen so a
-        // *learned*, zero-initialized `per_dim_scale` reduces to plain
-        // scaled-dot-product attention at init), no reference for this
-        // architecture defines an analogous fixed or learned K-side scale, and
-        // no `k_per_dim_scale` weight is loaded anywhere in this file. Audited
-        // and could not find a principled derivation for "softplus evaluated at
-        // 1.0" in this family of attention formulas - removed rather than kept
-        // un-justified or replaced with another guess. If a future reference
-        // implementation confirms a real K-side scale value, restore it here
-        // with a citation.
+        // Fixed K-side multiplier `ln(1+e)/ln(2) ~= 1.894` (`softplus(1.0)/ln(2)`).
+        // An earlier pass this session removed this, reasoning (from the
+        // unrelated "Gemma 3n" HF `transformers` reference) that no such
+        // K-scale exists in this architecture family - that reference was
+        // simply the wrong model. Confirmed by reading the REAL Gemma-4
+        // reference directly (`mlx_vlm/models/gemma4/audio.py`,
+        // `self.k_scale = math.log(1 + math.e) / math.log(2)`, applied as
+        // `k = k * self.k_scale` - i.e. exactly this constant): restored.
+        let k_scale = (1.0f64 + std::f64::consts::E).ln() / 2.0f64.ln();
         let k_reshaped = k.reshape((batch_size, seq_len, num_heads, head_dim))?;
-        let k_scaled = k_reshaped;
+        let k_scaled = (k_reshaped * k_scale)?;
         let v_reshaped = v.reshape((batch_size, seq_len, num_heads, head_dim))?;
 
         // convert to block/context
@@ -554,6 +568,26 @@ impl AudioEncoder {
         let attn_weights = attn_weights.tanh()?;
         let attn_weights = (attn_weights * softcap)?;
 
+        // Combined local-causal + validity mask, ported from the reference's
+        // `create_local_causal_valid_mask` (tril-based construction, worked
+        // out algebraically and cross-checked term-by-term against the
+        // actual tril/diagonal semantics) plus its per-block validity check
+        // against `audio_mel_mask`. This is exactly the masking real
+        // inference engines apply for variable-length audio (llama.cpp's
+        // Gemma-4 Conformer support processes the same fixed 30s-buffer
+        // convention; vLLM's variable-length audio attention excludes
+        // padded positions from attention the same way) - without it, every
+        // block attends across its full context window as if the entire
+        // fixed-size buffer were real audio, including any trailing
+        // zero-padding from clips shorter than the buffer.
+        let mask_bias = conformer_attention_mask_bias(
+            num_blocks, chunk_size, context_size,
+            max_past_horizon, max_future_horizon, valid_seq_len,
+            attn_weights.device(),
+        )?;
+        let mask_bias = mask_bias.to_dtype(attn_weights.dtype())?;
+        let attn_weights = attn_weights.broadcast_add(&mask_bias)?;
+
         let attn_probs = candle_nn::ops::softmax(&attn_weights, 4)?;
 
         let value_states_perm = value_states.permute((0, 3, 1, 2, 4))?.contiguous()?;
@@ -579,6 +613,19 @@ impl AudioEncoder {
         let attn_norm2_out = rms_norm(&attn_output, Some(attn_norm2), 1e-6)?;
 
         let x = residual.add(&attn_norm2_out)?;
+
+        // Zero out padded positions before the light-conv, matching the
+        // reference's `validity_mask_for_lconv` - otherwise the depthwise
+        // conv's receptive field would blend real content with whatever
+        // (already other-wise-masked-to-near-zero, but not exactly zero
+        // once past a RMSNorm's rescaling) values sit in the padded tail.
+        let x = if valid_seq_len < seq_len {
+            let validity: Vec<f32> = (0..seq_len).map(|t| if t < valid_seq_len { 1.0 } else { 0.0 }).collect();
+            let validity = Tensor::from_vec(validity, (1, seq_len, 1), x.device())?.to_dtype(x.dtype())?;
+            x.broadcast_mul(&validity)?
+        } else {
+            x
+        };
 
         // 3. lconv1d
         let residual = x.clone();
@@ -665,49 +712,88 @@ impl AudioEncoder {
     }
 }
 
-/// Gemma 3n's `Gemma3nAudioCumulativeGroupNorm`, ported exactly from the real
-/// `transformers` reference source (`modeling_gemma3n.py`, read directly
-/// rather than assumed): normalizes over a SINGLE group spanning all
-/// non-batch/non-time feature dims (here: frequency and channel jointly,
-/// matching `num_groups=1`), with statistics accumulated CUMULATIVELY over
-/// the time axis (dim 1) rather than independently per time step - i.e. the
-/// stats at time `t` include every time step from `0..=t`, not just `t`
-/// itself. This replaces a plain per-frame `LayerNorm`, which computes
-/// completely different (non-cumulative, per-step-only) statistics and was
-/// a real, confirmed-against-reference correctness bug for both of the SSCP
-/// conv-subsampling stages that use it.
+/// Additive attention-logit bias (`0.0` where a query/key pair is allowed to
+/// attend, large-negative where it isn't), combining two conditions exactly
+/// as the reference's `Gemma3nAudioAttention.create_local_causal_valid_mask`
+/// + its per-block validity check against `audio_mel_mask` do:
 ///
-/// `x`: `[B, T, F, C]` (batch, time, freq, channel). `weight`: `[C]`, applied
-/// per-channel after normalization. No masking is applied (this codebase
-/// does not yet track which time steps are real audio vs. zero-padding —
-/// see CHANGELOG for that separately-tracked gap), matching the reference's
-/// own behavior when no mask is supplied (all time steps treated as valid).
-fn cumulative_group_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
-    let original_dtype = x.dtype();
-    let x_f32 = x.to_dtype(DType::F32)?;
-    let (_b, t, f, c) = x_f32.dims4()?;
-    let elements_per_step = (f * c) as f64;
+///   - **Local causal window**: query row `w` (0..chunk_size) may attend to
+///     context column `c` (0..context_size) iff `c >= w` (causal: never
+///     attend to a strictly-future position within the block) AND
+///     `c <= w + max_past_horizon + max_future_horizon` (bounded window).
+///     Derived algebraically from the reference's `tril`/`diagonal`
+///     construction and cross-checked term-by-term against `tril`'s actual
+///     semantics (not assumed) - see the module's audit notes.
+///   - **Validity**: context column `c` in block `b` corresponds to
+///     absolute key position `b*chunk_size - max_past_horizon + c` (the
+///     same left-padding convention `extract_block_context` itself uses);
+///     that position is valid iff it falls within `[0, valid_seq_len)`.
+///
+/// Returns a `[1, 1, num_blocks, chunk_size, context_size]` tensor,
+/// broadcastable against attention logits shaped
+/// `[batch, num_heads, num_blocks, chunk_size, context_size]`.
+#[allow(clippy::too_many_arguments)]
+fn conformer_attention_mask_bias(
+    num_blocks: usize,
+    chunk_size: usize,
+    context_size: usize,
+    max_past_horizon: usize,
+    max_future_horizon: usize,
+    valid_seq_len: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    // Large enough to zero out a masked position's softmax probability, but
+    // safely representable in F16 (max ~65504) without relying on
+    // overflow-to-infinity rounding during the dtype cast below.
+    const MASKED_BIAS: f32 = -1.0e4;
+    let mut data = vec![0.0f32; num_blocks * chunk_size * context_size];
+    for b in 0..num_blocks {
+        for w in 0..chunk_size {
+            for c in 0..context_size {
+                let causal_ok = c >= w && c <= w + max_past_horizon + max_future_horizon;
+                let abs_key_pos = b as i64 * chunk_size as i64 - max_past_horizon as i64 + c as i64;
+                let valid_ok = abs_key_pos >= 0 && (abs_key_pos as usize) < valid_seq_len;
+                if !(causal_ok && valid_ok) {
+                    let idx = (b * chunk_size + w) * context_size + c;
+                    data[idx] = MASKED_BIAS;
+                }
+            }
+        }
+    }
+    let t = Tensor::from_vec(data, (1, 1, num_blocks, chunk_size, context_size), device)?;
+    Ok(t)
+}
 
-    // Cumulative mean: cumsum of the per-step sum, divided by cumsum of the
-    // (constant, since unmasked) per-step element count.
-    let sum_at_t = x_f32.sum_keepdim((2, 3))?; // [B, T, 1, 1]
-    let cum_sum = sum_at_t.cumsum(1)?;
-    let step_indices: Vec<f32> = (1..=t as u32).map(|i| i as f32 * elements_per_step as f32).collect();
-    let cum_count = Tensor::from_vec(step_indices, (1, t, 1, 1), x.device())?;
-    let cum_mean = cum_sum.broadcast_div(&cum_count)?; // [B, T, 1, 1]
+/// Output time-axis length of one of the SSCP stage's stride-2 conv2d
+/// calls, given `input_len` real (valid) time steps. Matches the actual
+/// conv arithmetic `(input_len + total_pad - kernel) / stride + 1` with
+/// `total_pad=2, kernel=3, stride=2`, which simplifies to `(input_len-1)/2+1`
+/// - and is exactly equivalent to how the real Gemma-4 implementation
+/// downsamples its own boolean validity mask by simple striding
+/// (`mask[:, ::2]`; `ceil(V/2) == (V-1)//2+1` for any `V >= 1`). Used to
+/// track how many of the SSCP output's time positions are still "real"
+/// after each downsampling stage.
+fn conv_stride2_out_len(input_len: usize) -> usize {
+    if input_len == 0 { 0 } else { (input_len - 1) / 2 + 1 }
+}
 
-    // Cumulative variance: each time step's squared-diff-from-ITS-OWN cum_mean
-    // is computed first, summed over (F,C), THEN cumsum'd over time - matching
-    // the reference exactly (not a Welford-style incremental update).
-    let sq_diff_at_t = x_f32.broadcast_sub(&cum_mean)?.sqr()?.sum_keepdim((2, 3))?;
-    let cum_sum_sq_diff = sq_diff_at_t.cumsum(1)?;
-    let cum_variance = cum_sum_sq_diff.broadcast_div(&cum_count)?;
-
-    let normalized = x_f32.broadcast_sub(&cum_mean)?
-        .broadcast_div(&(cum_variance + eps)?.sqrt()?)?;
-    let weight_f32 = weight.to_dtype(DType::F32)?.reshape((1, 1, 1, c))?;
-    let scaled = normalized.broadcast_mul(&weight_f32)?;
-    Ok(scaled.to_dtype(original_dtype)?)
+/// Zeroes out time steps at or past `valid_len` along dimension `time_dim`,
+/// leaving earlier steps untouched. Ported from the real Gemma-4
+/// `SSCPConvBlock`'s masking (`x = mx.where(mask, 0.0, x)`, confirmed by
+/// running `mlx-community/gemma-4-e2b-it-4bit` on this machine and reading
+/// `mlx_vlm/models/gemma4/audio.py` directly) - excludes zero-padded
+/// buffer positions from the conv/norm computation rather than processing
+/// them as if they were real audio.
+fn zero_invalid_time_steps(x: &Tensor, time_dim: usize, valid_len: usize) -> Result<Tensor> {
+    let t = x.dim(time_dim)?;
+    if valid_len >= t {
+        return Ok(x.clone());
+    }
+    let mut shape = vec![1usize; x.rank()];
+    shape[time_dim] = t;
+    let vals: Vec<f32> = (0..t).map(|i| if i < valid_len { 1.0 } else { 0.0 }).collect();
+    let mask = Tensor::from_vec(vals, shape, x.device())?.to_dtype(x.dtype())?;
+    Ok(x.broadcast_mul(&mask)?)
 }
 
 fn rms_norm(x: &Tensor, weight: Option<&Tensor>, eps: f64) -> Result<Tensor> {
@@ -926,7 +1012,10 @@ fn normalize_audio_tensors(
     Ok(normalized)
 }
 
-pub fn load_audio(path: &Path, device: &Device, architecture: AudioArchitecture) -> Result<Tensor> {
+/// Returns `(mel_spectrogram, valid_frames)` - `valid_frames` is how many of
+/// the tensor's time-axis positions are real audio vs. zero-padding (see
+/// `gemma3n_num_frames`).
+pub fn load_audio(path: &Path, device: &Device, architecture: AudioArchitecture) -> Result<(Tensor, usize)> {
     tracing::info!("Loading audio from {:?}", path);
 
     let src = std::fs::File::open(path)
@@ -1032,6 +1121,7 @@ pub fn load_audio(path: &Path, device: &Device, architecture: AudioArchitecture)
     }
 
     let target_samples = 480000;
+    let real_sample_count = pcm_data.len().min(target_samples);
     if pcm_data.len() < target_samples {
         pcm_data.resize(target_samples, 0.0);
     } else {
@@ -1039,8 +1129,38 @@ pub fn load_audio(path: &Path, device: &Device, architecture: AudioArchitecture)
     }
 
     match architecture {
-        AudioArchitecture::Whisper => whisper_mel_spectrogram(&pcm_data, device),
-        AudioArchitecture::GemmaConformer => gemma3n_mel_spectrogram(&pcm_data, device),
+        // Whisper was trained expecting a fixed, always-fully-padded 30s
+        // buffer processed uniformly (no reference-confirmed masking
+        // behavior for this path, unlike Gemma-4 below) - `3000` here
+        // means "every frame is valid," a no-op for the caller's masking.
+        AudioArchitecture::Whisper => Ok((whisper_mel_spectrogram(&pcm_data, device)?, 3000)),
+        AudioArchitecture::GemmaConformer => {
+            // real_sample_count is left-padded by FRAME_LENGTH/2 the same
+            // way the mel computation itself is - see `gemma4_num_frames`.
+            let padded_real_samples = real_sample_count + 320 / 2;
+            let mel = gemma4_mel_spectrogram(&pcm_data, device)?;
+            let valid_frames = gemma4_num_frames(padded_real_samples);
+            Ok((mel, valid_frames))
+        }
+    }
+}
+
+/// Number of real (non-padded) mel frames Gemma-4's feature extractor
+/// produces for `num_samples` of (semicausally left-padded) real audio -
+/// same `_unfold` arithmetic as `gemma4_mel_spectrogram` itself
+/// (`(len - (frame_length+1)) / hop + 1`). Used to build a validity mask
+/// for the encoder (see `encode_conformer`) - real inference engines
+/// (mlx-vlm's real Gemma-4 Conformer support, vLLM's variable-length
+/// audio attention) all exclude padded positions from attention/
+/// normalization rather than process them as if they were real audio.
+fn gemma4_num_frames(num_samples: usize) -> usize {
+    const FRAME_LENGTH: usize = 320;
+    const HOP_LENGTH: usize = 160;
+    let frame_size_for_unfold = FRAME_LENGTH + 1;
+    if num_samples >= frame_size_for_unfold {
+        (num_samples - frame_size_for_unfold) / HOP_LENGTH + 1
+    } else {
+        0
     }
 }
 
@@ -1088,66 +1208,69 @@ fn whisper_mel_spectrogram(pcm_data: &[f32], device: &Device) -> Result<Tensor> 
     Ok(t)
 }
 
-/// Gemma 3n's real audio feature extractor (`Gemma3nAudioFeatureExtractor`),
-/// ported exactly from HuggingFace `transformers`' reference source
-/// (`transformers/models/gemma3n/feature_extraction_gemma3n.py`, read
-/// directly rather than assumed) — confirmed to differ from Whisper's
-/// convention in every parameter that matters:
-///   - 32ms/512-sample frames (not 25ms/400), 10ms/160-sample hop (same).
-///   - FFT length 1024 (`2^ceil(log2(512))`, doubled for "FFT overdrive"),
-///     not a same-length-as-frame DFT.
-///   - Mel filterbank spans 125-7600 Hz (not 0-8000 Hz).
-///   - HTK-flavor preemphasis (coefficient 0.97) applied to every frame -
-///     entirely absent from the previous implementation.
-///   - Magnitude spectrum (`|STFT|`), not power spectrum (`|STFT|^2`).
-///   - `ln(max(mel, 1e-5))` with NO final clip/rescale - the "clip to top 8
-///     log units, rescale to roughly [-1,1]" step is a Whisper-specific
-///     convention that was previously (incorrectly) applied to Gemma too.
-fn gemma3n_mel_spectrogram(pcm_data: &[f32], device: &Device) -> Result<Tensor> {
+/// Gemma-4's real audio feature extractor (`Gemma4AudioFeatureExtractor`),
+/// ported exactly from `mlx-vlm`'s reference source
+/// (`mlx_vlm/models/gemma4/audio_feature_extractor.py`, read directly
+/// after confirming it against the actual `mlx-community/gemma-4-e2b-
+/// it-4bit` checkpoint's `processor_config.json`, and validated by running
+/// that real model on this machine with a real speech sample) — an
+/// EARLIER pass this session had implemented "Gemma 3n"'s (HF
+/// `transformers`) feature extractor instead, a different, unrelated
+/// model with a materially different front-end; every constant below is
+/// now confirmed against the real target architecture:
+///   - 20ms/320-sample frames (not 32ms/512), 10ms/160-sample hop (same).
+///   - FFT length 512 (not 1024 - no "FFT overdrive" doubling for this model).
+///   - Mel filterbank spans 0-8000 Hz (not 125-7600 Hz).
+///   - NO preemphasis (coefficient 0.0 - the opposite correction from the
+///     "Gemma 3n" pass, which had added HTK preemphasis that doesn't
+///     belong here at all).
+///   - Semicausal left-padding: `frame_length/2` (160) zero samples
+///     prepended before framing, so the first frame is centered at t=0 -
+///     entirely missing from the previous implementation.
+///   - `ln(mel + 1e-3)` (additive floor, not `ln(max(mel, floor))`).
+///   - Magnitude spectrum (`|STFT|`), not power spectrum (`|STFT|^2`) -
+///     this part was already correct from the "Gemma 3n" pass.
+fn gemma4_mel_spectrogram(pcm_data: &[f32], device: &Device) -> Result<Tensor> {
     const SAMPLE_RATE: f32 = 16000.0;
-    const FRAME_LENGTH: usize = 512; // round(16000 * 32ms / 1000)
+    const FRAME_LENGTH: usize = 320; // round(16000 * 20ms / 1000)
     const HOP_LENGTH: usize = 160; // round(16000 * 10ms / 1000)
-    const FFT_LENGTH: usize = 1024; // 2^ceil(log2(512)), doubled for fft_overdrive
+    const FFT_LENGTH: usize = 512; // 2^ceil(log2(320)), no fft_overdrive for this model
     const NUM_MEL_BINS: usize = 128;
-    const MEL_MIN_FREQ: f32 = 125.0;
-    const MEL_MAX_FREQ: f32 = 7600.0;
-    const PREEMPHASIS: f32 = 0.97;
-    const MEL_FLOOR: f32 = 1e-5;
+    const MEL_MIN_FREQ: f32 = 0.0;
+    const MEL_MAX_FREQ: f32 = 8000.0;
+    const MEL_FLOOR: f32 = 1e-3;
+
+    // Semicausal left-padding: the real extractor prepends frame_length/2
+    // zero samples so the first frame is centered at t=0, matching the
+    // real model's own `_extract_spectrogram`.
+    let pad_left = FRAME_LENGTH / 2;
+    let mut padded = vec![0.0f32; pad_left + pcm_data.len()];
+    padded[pad_left..].copy_from_slice(pcm_data);
 
     let window = hann_window(FRAME_LENGTH);
     let mel_filters = build_mel_filterbank(NUM_MEL_BINS, FFT_LENGTH, SAMPLE_RATE, MEL_MIN_FREQ, MEL_MAX_FREQ);
 
-    // `_unfold(waveform, size=frame_length+1, step=hop_length)`: each frame
-    // needs one extra leading sample so the HTK preemphasis below has a
-    // "previous sample" for every position in the output frame.
+    // `_unfold(waveform, size=frame_length+1, step=hop_length)`: the extra
+    // leading sample is a leftover of the (disabled, for this model)
+    // preemphasis codepath, but the frame count arithmetic still uses it.
     let frame_size_for_unfold = FRAME_LENGTH + 1;
-    let num_frames = if pcm_data.len() >= frame_size_for_unfold {
-        (pcm_data.len() - frame_size_for_unfold) / HOP_LENGTH + 1
+    let num_frames = if padded.len() >= frame_size_for_unfold {
+        (padded.len() - frame_size_for_unfold) / HOP_LENGTH + 1
     } else {
         0
     };
 
     let mut mel_data = vec![0.0f32; NUM_MEL_BINS * num_frames];
-    let mut raw_frame = vec![0.0f32; frame_size_for_unfold];
-    let mut preemph_frame = vec![0.0f32; FRAME_LENGTH];
     let mut fft_input = vec![0.0f32; FFT_LENGTH];
 
     for frame in 0..num_frames {
         let start_idx = frame * HOP_LENGTH;
-        for (i, slot) in raw_frame.iter_mut().enumerate() {
-            *slot = pcm_data.get(start_idx + i).copied().unwrap_or(0.0);
-        }
-
-        // HTK-flavor preemphasis: first output sample is the first raw
-        // sample scaled by (1-coeff) (no earlier sample to reference);
-        // every subsequent sample is `x[i] - coeff * x[i-1]`.
-        preemph_frame[0] = raw_frame[0] * (1.0 - PREEMPHASIS);
-        for i in 1..FRAME_LENGTH {
-            preemph_frame[i] = raw_frame[i] - PREEMPHASIS * raw_frame[i - 1];
-        }
-
+        // No preemphasis for this model (coefficient 0.0): frame is simply
+        // `frames_to_process[..., :-1]` - the first FRAME_LENGTH samples of
+        // the unfolded (frame_length+1)-sample window.
         for (i, w) in window.iter().enumerate() {
-            fft_input[i] = preemph_frame[i] * w;
+            let sample = padded.get(start_idx + i).copied().unwrap_or(0.0);
+            fft_input[i] = sample * w;
         }
         for slot in fft_input.iter_mut().skip(FRAME_LENGTH) {
             *slot = 0.0;
@@ -1158,7 +1281,7 @@ fn gemma3n_mel_spectrogram(pcm_data: &[f32], device: &Device) -> Result<Tensor> 
             let magnitude_energy: f32 = filter.iter().zip(power_spectrum.iter())
                 .map(|(f, p)| f * p.sqrt())
                 .sum();
-            mel_data[bin * num_frames + frame] = magnitude_energy.max(MEL_FLOOR).ln();
+            mel_data[bin * num_frames + frame] = (magnitude_energy + MEL_FLOOR).ln();
         }
     }
 
@@ -1199,9 +1322,18 @@ fn build_mel_filterbank(num_mel_bins: usize, n_fft: usize, sample_rate: f32, f_m
     let mel_points: Vec<f32> = (0..num_mel_bins + 2)
         .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (num_mel_bins + 1) as f32)
         .collect();
+    // Hz -> FFT-bin-index: each bin k represents frequency k*sample_rate/n_fft,
+    // so the inverse is `Hz * n_fft / sample_rate` - confirmed against real
+    // reference mel-spectrogram values (`mlx_vlm`'s `_mel_filter_bank`,
+    // `all_freqs = arange(n_freq_bins) * (sample_rate / (2*(n_freq_bins-1)))`,
+    // which is algebraically the same `n_fft` scaling since
+    // `2*(n_fft/2+1-1) = n_fft`). A stray `+1` here previously introduced a
+    // small but real, numerically-confirmed discrepancy against the real
+    // Gemma-4 model's own mel output (bit-exact on a pure-silence frame,
+    // consistently off by ~1-2% per bin on a frame with real signal).
     let bin_points: Vec<f32> = mel_points
         .iter()
-        .map(|&m| (n_fft as f32 + 1.0) * mel_to_hz(m) / sample_rate)
+        .map(|&m| n_fft as f32 * mel_to_hz(m) / sample_rate)
         .collect();
 
     let mut filters = vec![vec![0.0f32; num_fft_bins]; num_mel_bins];
