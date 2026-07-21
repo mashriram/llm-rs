@@ -368,6 +368,23 @@ pub struct CandleBackend {
     use_vram_embeddings: bool,
     custom_mmproj_path: Option<std::path::PathBuf>,
     qmatmul_cache: Mutex<HashMap<String, QMatMul>>,
+    /// quant-performance-plan.md Phase 1.3: `apply_rope`/`apply_rope_q`
+    /// rebuilt the `inv_freq` table (`1/theta^(2i/head_dim)`) from a fresh
+    /// host `Vec<f32>` + device upload on EVERY call - i.e. every layer,
+    /// every prefill/decode step - even though it depends only on
+    /// `(head_dim, rope_theta)`, both fixed per-layer architecture
+    /// constants that never change across a generation. Measured via
+    /// `LLM_PROFILE_STEP=1`: `rope` was consistently one of the largest
+    /// op-loop categories despite being, mathematically, cheap elementwise
+    /// work - the repeated host-alloc + device-upload was the leading
+    /// suspect. Model-agnostic and hardware-agnostic by construction: the
+    /// cache key is purely `(head_dim, rope_theta)` (derived from the
+    /// loaded model's own architecture, the same for every model/backend),
+    /// never anything request- or hardware-specific, so this changes
+    /// nothing about which models load or which device executes - it only
+    /// avoids recomputing an architecture-constant tensor that was already
+    /// being redundantly rebuilt.
+    inv_freq_cache: Mutex<HashMap<(usize, u32), Tensor>>,
 }
 
 
@@ -416,7 +433,29 @@ impl CandleBackend {
             use_vram_embeddings,
             custom_mmproj_path: None,
             qmatmul_cache: Mutex::new(HashMap::new()),
+            inv_freq_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Cached lookup for RoPE's `inv_freq` table - see `inv_freq_cache`'s
+    /// doc comment for why this is safe to cache (pure function of
+    /// `(head_dim, rope_theta)`, both model-architecture constants).
+    fn get_inv_freq(&self, head_dim: usize, rope_theta: f32, device: &Device) -> Result<Tensor> {
+        // `rope_theta == 0.0` is this codebase's "no RoPE on this layer"
+        // convention (see `apply_rope`/`apply_rope_q`'s own early return) -
+        // `1/0^x` would produce `inf`, so skip building/caching anything
+        // real for it; the caller discards this value immediately anyway.
+        if rope_theta == 0.0 {
+            return Tensor::zeros((1, head_dim / 2), DType::F32, device).map_err(Into::into);
+        }
+        let key = (head_dim, rope_theta.to_bits());
+        if let Some(cached) = self.inv_freq_cache.lock().get(&key) {
+            return Ok(cached.clone());
+        }
+        let half_dim = head_dim / 2;
+        let inv_freq = crate::backends::attention::build_inv_freq(half_dim, head_dim, rope_theta, device)?;
+        self.inv_freq_cache.lock().insert(key, inv_freq.clone());
+        Ok(inv_freq)
     }
 
     /// Set an explicit custom mmproj path for vision/audio encoders.
@@ -1762,7 +1801,8 @@ impl LlmBackend for CandleBackend {
 
                     let q_4d = q_t.reshape((b_sz, seq_len, layer_n_heads, layer_head_dim))?;
                     let k_4d = k_t.reshape((b_sz, seq_len, layer_n_kv_heads, layer_k_head_dim))?;
-                    let (q_out_4d, k_out_4d) = apply_rope(&q_4d, &k_4d, batch, &kv_cache, *rope_theta)?;
+                    let inv_freq = self.get_inv_freq(head_dim, *rope_theta, q_4d.device())?;
+                    let (q_out_4d, k_out_4d) = apply_rope(&q_4d, &k_4d, batch, &kv_cache, *rope_theta, &inv_freq)?;
                     let q_out = q_out_4d.reshape((b_sz, seq_len, layer_n_heads * layer_head_dim))?;
                     let k_out = k_out_4d.reshape((b_sz, seq_len, layer_n_kv_heads * layer_k_head_dim))?;
                     ctx.insert(output_q.clone(), q_out);
@@ -1777,7 +1817,8 @@ impl LlmBackend for CandleBackend {
                     let layer_head_dim = head_dim;
 
                     let q_4d = q_t.reshape((b_sz, seq_len, layer_n_heads, layer_head_dim))?;
-                    let q_out_4d = apply_rope_q(&q_4d, batch, &kv_cache, *rope_theta)?;
+                    let inv_freq = self.get_inv_freq(head_dim, *rope_theta, q_4d.device())?;
+                    let q_out_4d = apply_rope_q(&q_4d, batch, &kv_cache, *rope_theta, &inv_freq)?;
                     let q_out = q_out_4d.reshape((b_sz, seq_len, layer_n_heads * layer_head_dim))?;
                     ctx.insert(output_q.clone(), q_out);
                 }

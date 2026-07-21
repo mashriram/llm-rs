@@ -133,6 +133,7 @@ pub(crate) fn apply_rope(
     batch: &BatchInput,
     kv_cache: &RawKvCache,
     rope_theta: f32,
+    inv_freq: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
     if rope_theta == 0.0 {
         return Ok((q.clone(), k.clone()));
@@ -142,8 +143,7 @@ pub(crate) fn apply_rope(
     let (_, _, n_kv_heads, _) = k.dims4()?;
     let half_dim = head_dim / 2;
 
-    let inv_freq = build_inv_freq(half_dim, head_dim, rope_theta, dev)?;
-    let (cos, sin) = build_cos_sin(b_sz, seq_len, batch, kv_cache, &inv_freq, q.dtype(), dev)?;
+    let (cos, sin) = build_cos_sin(b_sz, seq_len, batch, kv_cache, inv_freq, q.dtype(), dev)?;
     let cos = cos.reshape((b_sz, seq_len, 1, half_dim, 1))?;
     let sin = sin.reshape((b_sz, seq_len, 1, half_dim, 1))?;
 
@@ -158,6 +158,7 @@ pub(crate) fn apply_rope_q(
     batch: &BatchInput,
     kv_cache: &RawKvCache,
     rope_theta: f32,
+    inv_freq: &Tensor,
 ) -> Result<Tensor> {
     if rope_theta == 0.0 {
         return Ok(q.clone());
@@ -166,16 +167,20 @@ pub(crate) fn apply_rope_q(
     let (b_sz, seq_len, n_heads, head_dim) = q.dims4()?;
     let half_dim = head_dim / 2;
 
-    let inv_freq = build_inv_freq(half_dim, head_dim, rope_theta, dev)?;
-    let (cos, sin) = build_cos_sin(b_sz, seq_len, batch, kv_cache, &inv_freq, q.dtype(), dev)?;
+    let (cos, sin) = build_cos_sin(b_sz, seq_len, batch, kv_cache, inv_freq, q.dtype(), dev)?;
     let cos = cos.reshape((b_sz, seq_len, 1, half_dim, 1))?;
     let sin = sin.reshape((b_sz, seq_len, 1, half_dim, 1))?;
 
     rotate_interleaved(q, &cos, &sin, b_sz, seq_len, n_heads, head_dim)
 }
 
-/// Build the inverse frequency vector: `1 / theta^(2i / head_dim)`.
-fn build_inv_freq(
+/// Build the inverse frequency vector: `1 / theta^(2i / head_dim)`. Pure
+/// function of `(half_dim, head_dim, rope_theta)` - callers should cache
+/// the result across calls when these don't change (see
+/// `CandleBackend::get_inv_freq`), since this used to be rebuilt (host
+/// `Vec<f32>` alloc + fresh device upload) on every single RoPE
+/// application before that caching existed.
+pub(crate) fn build_inv_freq(
     half_dim: usize,
     head_dim: usize,
     rope_theta: f32,

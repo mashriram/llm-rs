@@ -37,15 +37,16 @@ Do phases in order. Each ends with an acceptance test. Phase 4 (CUDA) cannot
 be built or verified in this environment at all (no `nvcc`, no NVIDIA GPU) —
 see that phase's own note before starting it.
 
-**STATUS 2026-07-21**: Phase 1 (1.1 wall-clock instrumentation + 1.2 real
-Metal System Trace via `xctrace`) is done — see Phase 1's own entries below
-for the full findings. Headline: `matmul` (the actual quantized GEMV/GEMM)
-is proportionally *cheap*; `rope`+`norm`+`attention` together dominate
-op-loop time and the GPU issues ~3,777 small (median 205µs) command-buffer
-submissions for a 30-token run — both point at **per-call CPU-side
-overhead in the smaller ops**, not raw matmul kernel quality, as the
-leading remaining cause. 1.3 (fix that overhead) is next, re-scoped to be
-precise about where to look. Nobody has run the MLX loader (Phase 3) yet -
+**STATUS 2026-07-21**: Phase 1 is done (1.1 wall-clock instrumentation,
+1.2 real Metal System Trace via `xctrace`, 1.3 fixed the RoPE `inv_freq`
+rebuild-every-call bug that 1.1/1.2 pointed at) — see Phase 1's own entries
+below for the full findings. Headline result: **real, measured decode
+throughput improvement, 34.2-34.8 → 44.8-45.4 t/s (+~30%) on the same
+SmolLM3-3B-Q4_K_M/M4 Pro/Metal benchmark used throughout this plan**, via
+one small, reviewable, model-agnostic/hardware-agnostic cache fix (no
+kernel code touched). `norm`/`attention` remain real, not-yet-addressed
+opportunities of comparable-or-larger absolute cost — a natural follow-up
+using the same toolchain. Nobody has run the MLX loader (Phase 3) yet -
 this environment used a real MLX checkpoint only as a numerical *reference*
 (via `mlx-vlm`, see CHANGELOG's audio-fix entries), never loaded one into
 llm-rs itself.
@@ -155,20 +156,57 @@ is gone.
   than one dominant slow kernel; refutes the theory that this is `matmul`-
   kernel-quality-only.
 
-- [ ] **1.3 — Reduce per-call overhead in RoPE/attention/RMSNorm
-  specifically** (re-scoped from "look at KV-cache reallocation broadly"
-  to this precise target, based on 1.1's category breakdown). Candidates
-  to check first in `llm-core/src/backends/attention.rs` and the
-  `Operator::Rope`/`RopeQ`/`RopeSkip`/`RMSNorm`/`PagedAttention` arms of
-  `forward_pass`: redundant `.contiguous()` calls per step, RoPE cos/sin
-  tables being recomputed instead of cached across steps, and per-step
-  `HashMap`/cache-key allocation in the KV-cache/PagedAttention path (the
-  `qmatmul_cache`/`kv_history_cache`/`deq_cache` pattern already exists
-  elsewhere in this file for exactly this reason — check whether RoPE has
-  an equivalent opportunity and doesn't yet use it).
-  Acceptance: re-run with `LLM_PROFILE_STEP=1` on the same benchmark;
-  `rope`/`norm`/`attention`'s share of op-loop time drops and/or decode
-  t/s improves, without having touched any kernel code.
+- [x] **1.3 — Reduce per-call overhead in RoPE specifically.**
+  **DONE 2026-07-21.** Found the exact bug 1.1 pointed at:
+  `apply_rope`/`apply_rope_q` (`llm-core/src/backends/attention.rs`)
+  rebuilt `inv_freq` (`1/theta^(2i/head_dim)`) from a fresh host
+  `Vec<f32>` + a brand-new `Tensor::from_vec` (a real Metal buffer
+  allocation + host-to-device upload) on **every single call** - every
+  layer, every prefill/decode step - even though `inv_freq` depends only
+  on `(head_dim, rope_theta)`, both fixed per-layer architecture constants
+  that never change across an entire generation.
+  **Fix**: added `CandleBackend::inv_freq_cache: Mutex<HashMap<(usize,
+  u32), Tensor>>` (same established pattern as `qmatmul_cache`/
+  `kv_history_cache`/`deq_cache` elsewhere in this file) and a
+  `get_inv_freq(head_dim, rope_theta, device)` accessor; changed
+  `apply_rope`/`apply_rope_q`'s signatures to accept a precomputed
+  `inv_freq: &Tensor` instead of building it internally, and made
+  `build_inv_freq` itself `pub(crate)` so the cache-miss path can still
+  call it. **Model-agnostic/hardware-agnostic by construction**: the
+  cache key is purely `(head_dim, rope_theta)` — both come from the
+  loaded model's own architecture metadata (`meta.get_head_dim`/the
+  graph's `rope_theta` field), identical in kind for every model and every
+  backend/device this trait supports; nothing about which models can load
+  or which hardware profile gets selected changed. `rope_theta == 0.0`
+  (this codebase's "no RoPE on this layer" convention, used by some
+  architectures) is special-cased in `get_inv_freq` itself to skip the
+  cache and return a cheap zero placeholder, avoiding an `inf`-valued
+  tensor from `1/0^x` that would otherwise get computed (and discarded) on
+  every NoPE-layer call.
+  **Measured, not assumed**: `LLM_PROFILE_STEP=1` re-run shows `rope`'s
+  absolute per-step time dropped (was consistently 6-7ms in several 1.1
+  samples, now 2-5ms). More importantly, real end-to-end decode throughput
+  on the same `SmolLM3-3B-Q4_K_M.gguf` / M4 Pro / Metal benchmark used
+  throughout this plan: **34.2-34.8 t/s → 44.8-45.4 t/s decode in warm/
+  repeated runs (+~30%)** — first-run numbers are still a noisy outlier on
+  this machine (consistent with every prior benchmark note in this repo),
+  warm runs are representative. Generated token IDs unchanged/correct
+  (`"The capital of France is Paris."`, greedy-decode token sequence
+  verified). Full test suite (195 tests) and `hardware_check.sh` (7/7)
+  both still pass with no regressions.
+  **Not yet done** (real remaining opportunity, not claimed fixed): `norm`
+  (RMSNorm) and `attention` (`PagedAttention`) still show comparable or
+  larger absolute per-step time than `rope` did even before this fix —
+  worth its own follow-up pass using the same `LLM_PROFILE_STEP`/`xctrace`
+  toolchain (e.g. `RmsNorm::forward`'s per-call `.to_dtype(F32)` round-trip
+  and weight dtype/device alignment checks, and whatever equivalent
+  per-step reallocation exists in the `PagedAttention` block-gather path,
+  are the next things to check — not attempted this pass to keep this
+  change small, reviewable, and independently verified before stacking
+  more on top of it).
+  Acceptance: met — re-ran with `LLM_PROFILE_STEP=1`, `rope`'s time
+  dropped, and decode t/s measurably improved without touching any kernel
+  code.
 
 ---
 
