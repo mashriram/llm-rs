@@ -960,7 +960,7 @@ impl LlmBackend for CandleBackend {
                         Some(arr.iter().map(|v| match v {
                             candle_core::quantized::gguf_file::Value::Bool(b) => *b,
                             _ => false,
-                        }).collect())
+                        }).collect::<Vec<bool>>())
                     }
                     _ => None,
                 },

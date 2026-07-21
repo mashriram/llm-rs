@@ -117,11 +117,19 @@ pub fn scan_tensors(names: &[String]) -> TensorGroupMap {
             final_norm = Some(name.clone());
         } else if name == "lm_head.weight" {
             lm_head = Some(name.clone());
-        } else if name == "per_layer_token_embd.weight" {
+        // GGUF's own flat names ("per_layer_token_embd.weight" etc) vs the
+        // real HF safetensors names for this same Gemma-4 2B/4B-specific
+        // per-layer-embedding (PLE) mechanism (confirmed against
+        // `mlx-community/gemma-4-e2b-it-4bit`: "model.embed_tokens_per_layer.
+        // weight", "model.per_layer_model_projection.weight",
+        // "model.per_layer_projection_norm.weight"). Without these aliases
+        // the entire PLE mechanism was silently absent for any safetensors-
+        // loaded Gemma-4 2B/4B model, with no error.
+        } else if name == "per_layer_token_embd.weight" || name == "model.embed_tokens_per_layer.weight" {
             per_layer_token_embd = Some(name.clone());
-        } else if name == "per_layer_model_proj.weight" {
+        } else if name == "per_layer_model_proj.weight" || name == "model.per_layer_model_projection.weight" {
             per_layer_model_proj = Some(name.clone());
-        } else if name == "per_layer_proj_norm.weight" {
+        } else if name == "per_layer_proj_norm.weight" || name == "model.per_layer_projection_norm.weight" {
             per_layer_proj_norm = Some(name.clone());
         } else if name.starts_with("model.layers.") {
             let remain = &name["model.layers.".len()..];
@@ -165,8 +173,20 @@ pub fn scan_tensors(names: &[String]) -> TensorGroupMap {
                         "self_attn.k_proj.bias" => layer.k_bias = Some(name.clone()),
                         "self_attn.v_proj.weight" => layer.v_proj = Some(name.clone()),
                         "self_attn.v_proj.bias" => layer.v_bias = Some(name.clone()),
-                        "attn_q_norm.weight" => layer.q_norm = Some(name.clone()),
-                        "attn_k_norm.weight" => layer.k_norm = Some(name.clone()),
+                        // "attn_q_norm.weight"/"attn_k_norm.weight" is GGUF's own
+                        // flat per-layer suffix convention; real HF safetensors
+                        // checkpoints (Gemma2/3/4, Qwen3, ...) name the identical
+                        // tensor "self_attn.q_norm.weight"/"self_attn.k_norm.weight"
+                        // instead - confirmed against a real checkpoint
+                        // (`mlx-community/gemma-4-e2b-it-4bit`'s
+                        // `language_model.model.layers.N.self_attn.q_norm.weight`).
+                        // Without this alias, QK-norm (RMS-normalizing queries/keys
+                        // before RoPE - architecturally significant, not a minor
+                        // detail) was silently dropped for every safetensors-loaded
+                        // model that uses it, with no error - a real, broadly-
+                        // applicable gap, not specific to Gemma or to MLX.
+                        "attn_q_norm.weight" | "self_attn.q_norm.weight" => layer.q_norm = Some(name.clone()),
+                        "attn_k_norm.weight" | "self_attn.k_norm.weight" => layer.k_norm = Some(name.clone()),
                         "self_attn.o_proj.weight" => layer.o_proj = Some(name.clone()),
                         "self_attn.o_proj.bias" => layer.o_bias = Some(name.clone()),
                         "post_attention_layernorm.weight" => layer.post_attention_layernorm = Some(name.clone()),
