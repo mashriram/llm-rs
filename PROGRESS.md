@@ -82,6 +82,37 @@ specific, verifiable location instead of an open-ended search. See
 CHANGELOG's "part 7" entry for the complete writeup and what tooling now
 exists for the next pass. Not yet merged to master.
 
+**Then did exactly that** - walked the encoder layer-by-layer against the
+same real reference tooling instead of reasoning from source alone, and
+found five more real bugs, three significant: a block-0 context-window
+misalignment in `extract_block_context` (an unused-parameter smell that
+turned out to hide a real `saturating_sub` clamping bug), a missing
+clamp before `attn_post_norm`, a missing final zero-masking pass after
+`output_proj`, a non-periodic (symmetric instead of periodic) Hann
+window, and - the dominant one - **the SSCP conv2d was convolving its
+kernel against the input with the two spatial axes (time, freq)
+transposed relative to the reference**, silently applying the kernel's
+time-offset weights to frequency offsets and vice versa. That last fix
+alone took the SSCP stage from "right ballpark, not matching" to
+**numerically bit-exact** against the real reference (verified frame-by-
+frame). The full encoder output still doesn't match exactly (std 1.75 vs
+reference's 5.73) even though SSCP and block-0-frame-0 attention output
+are now provably exact - the remaining divergence grows with distance
+from the start of each attention chunk, pointing at the relative-
+position-embedding math as the next suspect, but this wasn't root-caused
+this pass. End-to-end audio is **still not coherent**. Also re-ran the
+full test suite (195 tests, 0 failures), `hardware_check.sh` (7/7 pass),
+and the llama.cpp comparison benchmark on both Metal and CPU-forced -
+llm-rs's CPU decode throughput (16.5 t/s) is now within ~11% of
+llama.cpp's CPU decode (18.6 t/s), a genuinely competitive result; the
+Metal gap (especially prefill, ~44% of llama.cpp's) remains and is a
+good next profiling target. Confirmed these audio fixes are backend-
+agnostic (pure `candle_core::Tensor` ops, no CUDA-specific code path
+exists to separately patch) and wrote an explicit CUDA-hardware
+verification checklist for whoever has that hardware. See CHANGELOG's
+"part 8" entry for the complete writeup, numeric before/after table, and
+full benchmark data.
+
 ## v5 — Real GPU-throughput investigation + AWQ/GPTQ loaders, 2026-07-20
 
 ### Measured, not assumed: llm-rs vs llama.cpp head-to-head

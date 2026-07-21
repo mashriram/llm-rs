@@ -321,8 +321,31 @@ impl AudioEncoder {
         let batch_size = audio_values.dim(0)?;
 
         // 1. SubSampleConvProjection
-        // Unsqueeze to (batch, 1, 128, 3000)
-        let x = audio_values.unsqueeze(1)?.contiguous()?;
+        // `audio_values` is (batch, freq=128, time) - unsqueeze(1) alone
+        // would give (batch, channels=1, freq, time), i.e. H=freq, W=time.
+        // But the reference's own SSCPConvBlock operates on
+        // `x: [B, T, F, C]` (MLX channel-last, H=time, W=freq - confirmed
+        // by its docstrings and by `mlx.nn.Conv2d`'s [B,H,W,C] convention),
+        // and its conv WEIGHT is `[C_out, kH, kW, C_in]` with kH indexing a
+        // TIME offset and kW indexing a FREQ offset. This project's GGUF-
+        // loaded weight `a.conv1d.{0,1}.weight` has the SAME per-index
+        // values (confirmed by direct comparison against the real
+        // `mlx-community/gemma-4-e2b-it-4bit` weights:
+        // `mine[c_out,c_in,kh,kw] == reference[c_out,kh,kw,c_in]` exactly),
+        // meaning this kernel's kh axis is *semantically* a time offset and
+        // kw a freq offset, regardless of which tensor axis order it's
+        // stored in. A 3x3 conv kernel is not symmetric under swapping its
+        // own two spatial axes, so convolving it against an (H=freq,W=time)
+        // input - as this function did until this fix - applies the
+        // kernel's time-offset weights to freq offsets and vice versa: a
+        // real, silent, reference-confirmed bug (same weights, same input
+        // data, plausible-looking but numerically wrong output - "right
+        // ballpark, not matching per-position" was the exact symptom).
+        // Transposing here to (batch, channels=1, time, freq) makes
+        // everything downstream (masking on dim 2, the final
+        // reshape-to-sequence) align with the reference's own (B,T,F,C)
+        // convention with no further axis-juggling needed.
+        let x = audio_values.unsqueeze(1)?.transpose(2, 3)?.contiguous()?;
 
         // Zero out invalid (padded) time steps BEFORE the conv, matching the
         // real Gemma-4 `SSCPConvBlock.__call__` (`x = mx.where(mask, 0.0,
@@ -332,7 +355,8 @@ impl AudioEncoder {
         // `mlx-community/gemma-4-e2b-it-4bit` model on this machine and
         // reading its source directly, NOT the unrelated "Gemma 3n" model
         // in HF `transformers` an earlier pass in this session mistakenly
-        // used as the reference).
+        // used as the reference). `x` is (batch, channels, time, freq) -
+        // time is dim 2.
         let x = zero_invalid_time_steps(&x, 2, valid_mel_frames)?;
 
         // layer 0: Conv2d(stride=2, SYMMETRIC padding=1 on both time and
@@ -357,7 +381,7 @@ impl AudioEncoder {
         let norm0_b = Tensor::zeros(norm0_w.dim(0)?, dtype, device)?;
         let x = candle_nn::ops::layer_norm(&x, norm0_w, &norm0_b, 1e-6)?;
         let x = x.relu()?;
-        let x = x.permute((0, 3, 1, 2))?; // Back to (batch, channels, h, w)
+        let x = x.permute((0, 3, 1, 2))?; // Back to (batch, channels, h=time, w=freq)
         let x = zero_invalid_time_steps(&x, 2, valid_len0)?;
 
         // layer 1: same symmetric padding, plain LayerNorm, ReLU
@@ -372,12 +396,16 @@ impl AudioEncoder {
         let norm1_b = Tensor::zeros(norm1_w.dim(0)?, dtype, device)?;
         let x = candle_nn::ops::layer_norm(&x, norm1_w, &norm1_b, 1e-6)?;
         let x = x.relu()?;
-        let x = x.permute((0, 3, 1, 2))?; // (batch, 32, 32, 750)
+        let x = x.permute((0, 3, 1, 2))?; // (batch, channels=32, time=750, freq=32)
         let x = zero_invalid_time_steps(&x, 2, valid_len1)?;
 
-        // Reshape to sequence: (batch, seq_len, hidden_dim)
+        // Reshape to sequence: (batch, seq_len, hidden_dim). `x` is
+        // (batch, channels, time, freq) here - permuting to
+        // (batch, time, freq, channels) makes the reshape a pure "merge the
+        // last two dims" no-op, exactly matching the reference's own
+        // `B,T,F,C = x.shape; x = x.reshape(B,T,F*C)`.
         let x = x.permute((0, 2, 3, 1))?.contiguous()?;
-        let seq_len = x.dim(2)?;
+        let seq_len = x.dim(1)?;
         let x = x.reshape((batch_size, seq_len, self.hidden_dim))?;
 
         // input_proj_linear
@@ -423,7 +451,17 @@ impl AudioEncoder {
         let x = matmul_3d_2d(&x, op_w)?;
         let x = x.broadcast_add(op_b)?;
 
-        Ok(x)
+        // Reference's final step (`AudioEncoder.__call__`): force EXACTLY
+        // zero for any position at/past the valid length, regardless of
+        // any small nonzero "leakage" the lconv1d's causal receptive field
+        // may have re-introduced near the valid/invalid boundary inside the
+        // last block (each block re-masks before its own lconv1d, but
+        // nothing re-masks AFTER the last block's lconv1d until this final
+        // pass). Without this, those few leaked-nonzero frames (plus
+        // whatever splice_audio_embeddings does with the full fixed-size
+        // 750-frame output regardless of real clip length) get spliced into
+        // the LLM's input embeddings as if they were real audio content.
+        zero_invalid_time_steps(&x, 1, valid_len1)
     }
 
     fn forward_conformer_block(&self, i: usize, x: &Tensor, pos_embed: &Tensor, rel_len: usize, valid_seq_len: usize) -> Result<Tensor> {
@@ -608,6 +646,10 @@ impl AudioEncoder {
         let post_omax = self.weights.get(&format!("a.blk.{}.attn_out.output_max", i));
         let attn_output = clippable_linear_forward(&attn_output, post_w, post_imin, post_imax, post_omin, post_omax)?;
 
+        // Reference clamps the self_attn output before norm_post_attn
+        // (`x = mx.clip(x, -grad_clip, grad_clip); x = residual + norm_post_attn(x)`
+        // in `ConformerBlock.__call__`) - this clamp was missing here.
+        let attn_output = attn_output.clamp(-grad_clip, grad_clip)?;
         let attn_norm2 = self.weights.get(&format!("a.blk.{}.attn_post_norm.weight", i))
             .ok_or_else(|| anyhow!("attn_post_norm weight for layer {} not found", i))?;
         let attn_norm2_out = rms_norm(&attn_output, Some(attn_norm2), 1e-6)?;
@@ -858,25 +900,46 @@ fn glu(x: &Tensor) -> Result<Tensor> {
     Ok(a.broadcast_mul(&candle_nn::ops::sigmoid(&b)?)?)
 }
 
+/// Ported from the reference's `AudioAttention._extract_block_context`:
+/// left-pad by `max_past_horizon`, right-pad by `max_future_horizon +
+/// chunk_size - 1`, then slice a `context_size`-wide window per block
+/// starting at `b * chunk_size` in the *padded* tensor.
+///
+/// The previous version of this function padded on the right ONLY (by the
+/// query-side amount `num_blocks*chunk_size - seq_len`) and derived each
+/// block's start via `(block_start + chunk_size).saturating_sub(context_size)`
+/// - which happens to equal the correct real-position start
+/// `b*chunk_size - max_past_horizon` for every block except **block 0**,
+/// where the true start is negative (`-max_past_horizon`) and should be
+/// realized as `max_past_horizon` zero-padded positions followed by real
+/// data. `saturating_sub` instead clamped it to `0`, silently shifting
+/// block 0's entire context window `max_past_horizon` positions to the
+/// right - a real, reference-confirmed bug (caught by the leftover
+/// underscore-prefixed unused `_max_past_horizon`/`_max_future_horizon`
+/// parameters, which should have been the tell that padding wasn't actually
+/// using them). Confirmed by reading `_extract_block_context` in
+/// `mlx_vlm/models/gemma4/audio.py` directly, which explicitly
+/// left-pads before indexing.
 fn extract_block_context(
     x: &Tensor,
-    _max_past_horizon: usize,
-    _max_future_horizon: usize,
+    max_past_horizon: usize,
+    max_future_horizon: usize,
     chunk_size: usize,
     context_size: usize,
 ) -> Result<Tensor> {
-    let (batch_size, seq_len, num_heads, head_dim) = x.dims4()?;
-    let num_blocks = (seq_len + chunk_size - 1) / chunk_size;
-    let pad = num_blocks * chunk_size - seq_len;
-    let pad_tensor = Tensor::zeros((batch_size, pad, num_heads, head_dim), x.dtype(), x.device())?;
-    let x_padded = Tensor::cat(&[x.clone(), pad_tensor], 1)?.contiguous()?;
+    let (batch_size, _seq_len, num_heads, head_dim) = x.dims4()?;
+    let pad_left = max_past_horizon;
+    let pad_right = max_future_horizon + chunk_size - 1;
+    let left_pad = Tensor::zeros((batch_size, pad_left, num_heads, head_dim), x.dtype(), x.device())?;
+    let right_pad = Tensor::zeros((batch_size, pad_right, num_heads, head_dim), x.dtype(), x.device())?;
+    let x_padded = Tensor::cat(&[left_pad, x.clone(), right_pad], 1)?.contiguous()?;
+    let t_padded = x_padded.dim(1)?;
+    let num_blocks = (t_padded - context_size) / chunk_size + 1;
 
     let mut blocks = Vec::new();
     for b in 0..num_blocks {
-        let block_start = b * chunk_size;
-        let context_start = (block_start + chunk_size).saturating_sub(context_size);
-        let context_len = context_size;
-        let slice = x_padded.narrow(1, context_start, context_len)?;
+        let start = b * chunk_size;
+        let slice = x_padded.narrow(1, start, context_size)?;
         blocks.push(slice);
     }
     Ok(Tensor::stack(&blocks, 1)?)
@@ -1293,12 +1356,22 @@ fn matmul_3d_2d(lhs: &Tensor, rhs: &Tensor) -> Result<Tensor> {
     Ok(lhs.contiguous()?.matmul(&rhs.t()?.unsqueeze(0)?.contiguous()?)?)
 }
 
+/// Periodic Hann window (`w[n] = 0.5 - 0.5*cos(2*pi*n/n_len)`), matching
+/// both the real Gemma-4 feature extractor's explicit formula
+/// (`mlx_vlm/models/gemma4/audio_feature_extractor.py`: "Periodic Hann
+/// window... Matches HuggingFace Transformers (signal.hann_window with
+/// periodic=True)") and PyTorch/Whisper's own default
+/// (`torch.hann_window(n, periodic=True)`, the default). The previous
+/// version divided by `n-1` (the *symmetric* Hann window) instead of `n` -
+/// a real, reference-confirmed bug: it produced a mel-spectrogram "close
+/// but not bit-exact" to ground truth, with the discrepancy compounding
+/// through 12 Conformer blocks into a much larger encoder-output error.
 fn hann_window(n: usize) -> Vec<f32> {
-    if n <= 1 {
-        return vec![1.0; n];
+    if n == 0 {
+        return Vec::new();
     }
     (0..n)
-        .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos())
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos())
         .collect()
 }
 

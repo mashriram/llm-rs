@@ -1,5 +1,238 @@
 # Changelog
 
+## v2026.7.21 (part 8) — five more real audio bugs found and fixed via layer-by-layer numeric verification; CPU/Metal benchmarks re-run
+
+Continuation of part 7's investigation, using the exact same tooling
+(`/tmp/hf-ref-env` venv with `mlx`/`mlx-vlm`, the cached
+`mlx-community/gemma-4-e2b-it-4bit` model, the real JFK speech sample)
+to walk the encoder layer-by-layer instead of reasoning from source code
+alone - exactly what part 7 flagged as the needed next step. This found
+**five more real, independently-confirmed bugs**, three of them
+significant, by comparing intermediate tensors (SSCP output, per-block
+attention output) directly against the reference at each stage rather
+than only checking final output.
+
+### Fixed, in order of how they were found
+
+1. **`extract_block_context` block-0 misalignment** (moderate). The
+   function took `_max_past_horizon`/`_max_future_horizon` parameters
+   with a leading underscore - i.e. explicitly unused - which should
+   have been the tell. It right-padded a copy of K/V only up to the
+   query-side length and derived each attention block's context-window
+   start via `(block_start + chunk_size).saturating_sub(context_size)`.
+   For block index 0 this is negative (`-max_past_horizon`) and should
+   realize as `max_past_horizon` zero-padded positions followed by real
+   data (confirmed against the reference's `_extract_block_context`,
+   which explicitly left-pads by `max_past_horizon` and right-pads by
+   `max_future_horizon + chunk_size - 1` before indexing) -
+   `saturating_sub` instead clamped it to `0`, shifting the entire first
+   attention chunk's context window to the wrong real positions. Fixed
+   by properly left/right-padding before slicing, matching the reference
+   exactly.
+2. **Missing clamp before `attn_post_norm`** (minor on CPU/F32, real on
+   F16). The reference clips the self-attention output
+   (`mx.clip(x, -grad_clip, grad_clip)`) before `norm_post_attn`; this
+   clamp was absent. Restored.
+3. **Missing final validity masking** (moderate). The reference's
+   `AudioEncoder.__call__` forces the output to exactly zero at any
+   position past the valid length as its very last step, after
+   `output_proj` - covering the few frames near the valid/invalid
+   boundary where each block's own causal depthwise conv could otherwise
+   leak a little real signal forward into the padded tail. This project's
+   `encode_conformer` had no equivalent final pass. Fixed by calling
+   `zero_invalid_time_steps` on the projected output before returning.
+4. **Non-periodic Hann window** (real, but small per-frame effect).
+   `hann_window` divided by `n - 1` (the *symmetric* Hann window, the
+   variant used for e.g. filter design) instead of `n` (the *periodic*
+   Hann window). The reference's feature extractor is explicit about
+   this: `"Periodic Hann window: w[n] = 0.5 - 0.5*cos(2*pi*n/frame_length)
+   ... Matches HuggingFace Transformers (signal.hann_window with
+   periodic=True)"` - and it's also PyTorch/Whisper's own default
+   (`torch.hann_window(n, periodic=True)`). Fixed; this function is
+   shared by both the Gemma-4 and Whisper mel paths, so both benefit.
+   After this fix the mel-spectrogram matches the real reference to
+   float32 precision (verified frame-by-frame: mean/std/min/max and
+   individual per-bin values agree to 5-6 significant figures on real
+   speech, not just on silence as part 7 had managed).
+5. **`zero_invalid_time_steps` masking the wrong axis in all three SSCP
+   call sites** (real, but turned out to be a no-op every time - see
+   below). All three calls used `time_dim=2`, but at each of those three
+   points in `encode_conformer` (before conv0, between conv0 and conv1,
+   after conv1) the tensor's dim 2 was actually the **frequency** axis
+   (128, then 64, then 32), not time. Since the freq-axis size is always
+   smaller than any realistic valid-frame count, the function's own
+   `if valid_len >= t { return unchanged }` safety check made every one
+   of these calls silently do nothing - the very padding-zeroing step
+   part 7 credited as "confirmed working" (the bit-exact silent mel
+   frame) was never actually exercised on the SSCP side for real,
+   variable-length audio. Reclassified as belonging to bug #6 below
+   rather than an independent axis-index typo (see there for why) and
+   fixed together with it.
+6. **SSCP conv2d applied with the kernel's two spatial axes
+   transposed relative to the input's** (the dominant bug - this
+   explains nearly everything part 7 could not). The reference's
+   `SSCPConvBlock` operates on `x: [B, T, F, C]` (MLX channel-last,
+   H=time, W=freq - `mlx.nn.Conv2d` convention), with a conv weight
+   `[C_out, kH, kW, C_in]` where kH indexes a *time* offset and kW a
+   *freq* offset. This project's mel tensor is naturally `(batch,
+   freq=128, time)`; a plain `unsqueeze(1)` gives `(batch, channels=1,
+   freq, time)` - H=freq, W=time, the **opposite** axis assignment. The
+   GGUF-loaded conv weight has the identical per-index values as the
+   real reference's own weight (verified directly:
+   `mine[c_out,c_in,kh,kw] == reference[c_out,kh,kw,c_in]` for spot-
+   checked indices across both conv layers, so weight loading itself was
+   never in question) - meaning the kernel's own kh axis is *semantically*
+   a time-offset and kw a freq-offset, independent of which tensor axis
+   order it happens to be stored in. A 3x3 convolution kernel is not
+   symmetric under swapping its own two spatial axes (it's a learned,
+   generally-asymmetric filter), so convolving it against an
+   (H=freq, W=time) input applies the kernel's time-offset weights to
+   frequency offsets and vice versa - a real, silent, numerically-wrong
+   computation that nonetheless produces plausible-looking
+   (right-order-of-magnitude, structurally coherent) output. This is
+   *exactly* the "right ballpark, not matching per-position" symptom
+   part 7 reported for the SSCP stage and could not root-cause further.
+   Fixed by transposing the input to `(batch, channels, time, freq)`
+   immediately after `unsqueeze(1)`, which also made bug #5's axis
+   confusion moot (dim 2 is now genuinely time throughout) and simplified
+   the final reshape-to-sequence step back to the reference's own
+   `(batch, time, freq, channels) -> (batch, time, freq*channels)`
+   no-op-merge form.
+
+### Numeric verification (not "looks more correct" - actually compared against ground truth)
+
+Real 11-second JFK speech sample, real `mlx-community/gemma-4-e2b-it-4bit`
+model run via `mlx_vlm`, same real GGUF weights loaded on both sides
+(spot-checked identical, see bug #6). Before vs after this pass's fixes,
+against the reference's own intermediate tensors:
+
+| Stage | Metric | Before this pass | After this pass | Reference |
+|---|---|---|---|---|
+| Mel-spectrogram (valid frames) | mean / std | -2.2321 / 1.9836 | -2.2312 / 1.9833 | -2.2313 / 1.9835 |
+| SSCP output (valid frames) | mean / std | 0.5527 / 3.7906 | **0.8104 / 4.7228** | 0.8105 / 4.7233 |
+| SSCP output, frame 0, first 8 dims | - | `[2.42, -3.46, 8.58, 2.13, -2.08, -3.50, 2.07, -1.13]` | `[1.3770, -2.8423, 10.2214, 1.4191, -0.2701, -0.9403, -0.4367, 0.7014]` | `[1.3770, -2.8423, 10.2214, 1.4191, -0.2701, -0.9403, -0.4367, 0.7014]` |
+| Block 0 self-attn output, frame 0 | - | not comparable (pre-fix) | `[6.2134, -2.6749, 9.4661, 0.5409]` | `[6.2134, -2.6749, 9.4660, 0.5408]` |
+| Full encoder output (valid frames) | mean / std | 0.0220 / 1.7532 | 0.0248 / 1.7463 | 0.0526 / 5.7323 |
+
+**SSCP is now bit-exact** to float32 precision (mean/std/min/max and
+individual per-position values all agree to 5-6 significant figures).
+Block 0's attention output at frame 0 also now matches exactly. This is
+the SSCP-transpose fix (#6) working precisely as diagnosed.
+
+**The full encoder output still does not match** (std 1.75 vs 5.73) -
+spot-checking later frames within block 0's own attention output shows
+the first 2-3 dimensions of each frame tracking the reference closely
+(within a few percent) but consistently diverging more (up to ~10-20%)
+in later per-head dimensions and later sequence positions, in a pattern
+that does not correspond to a simple frame-index shift (checked: cross-
+correlating the full valid-range SSCP output against the reference
+across shifts of -5..+5 frames found the best alignment at shift 0 with
+correlation 0.80, not the near-1.0 a pure alignment bug would produce -
+so this is a real remaining numerical divergence, not another axis/
+off-by-one issue like the ones above). **Not root-caused this pass** -
+the leading candidates are the relative-position embedding/`rel_shift`
+computation or some other position-dependent term inside the chunked
+attention, since the divergence grows with distance from the start of
+each attention chunk rather than being uniform. End-to-end generation
+with the real JFK sample is still not a coherent transcription
+(`"/** **tool to_times_time_tool_tool_tool_tool_tooth_tool..."` -
+repetitive garbage tokens, though a different garbage pattern than
+before this pass, which itself is expected given the underlying
+embeddings changed substantially). This is real, measured progress - from
+"completely uncorrelated with ground truth past the mel-spectrogram
+stage" to "SSCP and block-0-frame-0 provably exact, encoder-level output
+close but not exact" - not a claim that audio is fixed.
+
+### Debug tooling used and removed afterward
+
+A temporary `llm-cli/src/bin/audio_debug_dump.rs` binary (loads the real
+GGUF audio encoder + `/tmp/jfk.wav`, prints mel/SSCP/encoder-output
+stats and can dump the valid-range output to a flat text file for
+cross-referencing against a matching Python-side dump) and several
+`LLM_DEBUG_*`-env-var-gated early-return taps inside `audio.rs` were used
+to do this layer-by-layer comparison, then all removed before commit -
+same temporary-tooling pattern as part 7. The `/tmp/hf-ref-env` venv and
+cached reference model from part 7 are still in place and still work,
+so this comparison loop can be re-entered directly by anyone continuing
+this investigation (re-add an env-var-gated early return at the point
+you want to inspect, dump both sides' tensors, compare).
+
+### Full test suite + hardware_check.sh
+
+`cargo test --workspace --exclude llm-py --features metal`: 101 passed
+(llm-core) + 94 passed (llm-cli), 0 failed, no regressions from any of
+the six fixes above. `scripts/hardware_check.sh --skip-download --release`
+with the real Gemma-4 vision+audio GGUF and mmproj: all 7 checks pass
+(build, hardware detection, text generation - bit-identical token IDs to
+prior runs, confirming zero impact on the non-audio path - vision smoke
+test, audio smoke test, cluster registration, cluster failure detection).
+
+### CPU/GPU benchmark re-run (M4 Pro, Metal + CPU-forced; llama.cpp bcfd1989e as baseline)
+
+Same `SmolLM3-3B-Q4_K_M.gguf`, `llama-bench` vs `benchmark_speed`, steady
+state (repeated runs, not first-run outliers):
+
+| | Prefill | Decode |
+|---|---|---|
+| llama.cpp, Metal | 371.9 t/s | 54.8 t/s |
+| llama.cpp, CPU-only | 49.8 t/s | 18.6 t/s |
+| llm-rs, Metal | 163.8-166.1 t/s | 34.2-34.8 t/s |
+| llm-rs, CPU-forced (`LLM_FORCE_CPU=1`) | 26.2 t/s | 16.5 t/s |
+
+No decode/prefill-path code changed this session (only `audio.rs`'s
+Conformer/mel/SSCP logic, which text-only generation never touches), so
+this is a **re-confirmation**, not a new result: llm-rs's CPU decode
+(16.5 t/s) is now within ~11% of llama.cpp's CPU decode (18.6 t/s) - a
+real, competitive result. The Metal gap is real and unchanged from prior
+sessions: llm-rs Metal decode (34.2-34.8 t/s) is ~63% of llama.cpp's
+(54.8 t/s), and llm-rs Metal prefill (163.8-166.1 t/s) is ~44% of
+llama.cpp's (371.9 t/s) - prefill is the larger relative gap and the
+better target for future profiling (`quant-performance-plan.md`'s
+"Phase 1: profile before optimizing" still applies; not attempted this
+pass since it's orthogonal to the audio work this session focused on).
+
+### What this means for CPU vs GPU (Metal/CUDA) code paths
+
+All six fixes above are in `llm-core/src/backends/audio.rs`, which is
+pure `candle_core::Tensor` operations (`conv2d`, `layer_norm`, `matmul`,
+elementwise ops) with **no backend-specific branching** - the same code
+runs on CPU, Metal, and (once built with `--features cuda`) CUDA, with
+candle's `Device` enum picking the actual kernel per op. There is no
+separate `cubecl.rs`/CUDA-specific audio path to duplicate these fixes
+into (checked: only `candle.rs` references `AudioEncoder` anywhere in
+the codebase; `CandleBackend` is the only `impl LlmBackend` that exists
+today). Concretely, this means:
+
+- **These fixes apply identically and automatically to a CUDA build** -
+  there is nothing CUDA-specific left to write for this batch of bugs.
+  The only difference between backends is the compute dtype
+  (`audio_dtype = if device.is_cpu() { F32 } else { F16 }` in
+  `AudioEncoder::load`, so both Metal and CUDA run the Conformer in F16)
+  and raw kernel throughput.
+- **What's NOT yet verified on real CUDA hardware** (this environment has
+  none - no `nvcc`, no NVIDIA GPU): that F16 numerics behave the same on
+  CUDA as they measurably do on Metal for this specific masking/softcap/
+  RMSNorm-heavy computation (the `MASKED_BIAS = -1.0e4` constant in
+  `conformer_attention_mask_bias` was chosen to stay safely inside F16's
+  representable range on Metal; CUDA's F16 handling should be identical
+  since it's the same IEEE 754 binary16 format via candle's own F16
+  kernels, but has not been run to confirm), and that `hardware_check.sh`
+  passes end-to-end (build + text + vision + audio smoke tests) on a real
+  CUDA box. **Action for whoever has CUDA hardware**: pull this branch,
+  `cargo build --release --features cuda`, run
+  `scripts/hardware_check.sh --release` with the same Gemma-4 vision/
+  audio models used here, and share the report - a pass there is real
+  verification this environment cannot provide itself (same posture as
+  AWQ/GPTQ in v5 and the CUDA-path work in v4).
+- **What CPU-side work remains**: none specific to this pass's fixes -
+  CPU already ran the identical code (this whole verification loop was
+  done in `Device::Cpu` for reproducibility) and the existing CPU
+  benchmark/regression numbers above already reflect it.
+- **The still-open encoder-level numeric divergence** (see above) is
+  likewise backend-agnostic - it is a logic/math issue that will
+  reproduce identically on CPU, Metal, and CUDA, not something that
+  needs separate diagnosis per backend.
+
 ## v2026.7.20 (part 7) — found and fixed the wrong-reference-model mistake; real numeric verification
 
 **Critical correction to part 6**: this project's actual target is
