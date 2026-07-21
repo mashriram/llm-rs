@@ -33,22 +33,93 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
         }
     }
 
-    let vocab_size = val.get("vocab_size").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("vocab_size missing from config"))? as usize;
-    let hidden_size = val.get("hidden_size").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("hidden_size missing from config"))? as usize;
-    let num_hidden_layers = val.get("num_hidden_layers").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("num_hidden_layers missing from config"))? as usize;
-    let num_attention_heads = val.get("num_attention_heads").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("num_attention_heads missing from config"))? as usize;
+    // Real multimodal HF configs (LLaVA-style, Qwen2-VL, Gemma3/Gemma4, ...)
+    // commonly nest the actual text-decoder dimensions under a `text_config`
+    // object, with the top level carrying only multimodal glue fields
+    // (image/audio token ids, `vision_config`/`audio_config`, etc.) and NO
+    // top-level `vocab_size`/`hidden_size`/... at all. Confirmed against a
+    // real checkpoint, not assumed: `mlx-community/gemma-4-e2b-it-4bit`'s
+    // own `config.json` has no top-level `vocab_size` - only
+    // `text_config.vocab_size`. Without this fallback, `parse_config` would
+    // reject every such model with "vocab_size missing from config" even
+    // though the real value is right there, one level down - a direct
+    // violation of "any model from HF should run." `lookup` checks the top
+    // level first (so a model that DOES set these at the top level, or
+    // deliberately overrides a text_config value, still wins), falling back
+    // to `text_config` only when the top-level key is absent.
+    let text_config = val.get("text_config");
+    let lookup = |key: &str| -> Option<&serde_json::Value> {
+        val.get(key).or_else(|| text_config.and_then(|tc| tc.get(key)))
+    };
+
+    let vocab_size = lookup("vocab_size").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("vocab_size missing from config"))? as usize;
+    let hidden_size = lookup("hidden_size").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("hidden_size missing from config"))? as usize;
+    let num_hidden_layers = lookup("num_hidden_layers").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("num_hidden_layers missing from config"))? as usize;
+    let num_attention_heads = lookup("num_attention_heads").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("num_attention_heads missing from config"))? as usize;
     if num_attention_heads == 0 {
         return Err(anyhow!("num_attention_heads must be nonzero (malformed config.json)"));
     }
 
-    let num_key_value_heads = val.get("num_key_value_heads").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(num_attention_heads);
-    let head_dim = val.get("head_dim").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(hidden_size / num_attention_heads);
-    
-    let intermediate_size = val.get("intermediate_size").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("intermediate_size missing from config"))? as usize;
-    let max_position_embeddings = val.get("max_position_embeddings").and_then(|v| v.as_u64()).unwrap_or(2048) as usize;
-    let rope_theta = val.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(10000.0) as f32;
-    
-    let torch_dtype = val.get("torch_dtype").and_then(|v| v.as_str()).unwrap_or("float16");
+    let num_key_value_heads = lookup("num_key_value_heads").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(num_attention_heads);
+    let head_dim = lookup("head_dim").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(hidden_size / num_attention_heads);
+
+    let intermediate_size = lookup("intermediate_size").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("intermediate_size missing from config"))? as usize;
+    let max_position_embeddings = lookup("max_position_embeddings").and_then(|v| v.as_u64()).unwrap_or(2048) as usize;
+    let mut rope_theta = lookup("rope_theta").and_then(|v| v.as_f64()).unwrap_or(10000.0) as f32;
+
+    // Gemma3/Gemma4-style hybrid local/global attention: real HF configs
+    // (confirmed against `mlx-community/gemma-4-e2b-it-4bit`'s own
+    // `text_config`) describe this via `layer_types` (one
+    // "sliding_attention"/"full_attention" string per layer),
+    // `sliding_window`, `num_kv_shared_layers`, and a nested
+    // `rope_parameters.{full_attention,sliding_attention}.rope_theta` dict
+    // (NOT the flat `rope_theta` field read above, which this family of
+    // configs may omit or use only as an unrelated default). The GGUF
+    // loading path already reads GGUF's equivalent metadata keys into these
+    // exact `ModelMeta` fields (`shared_kv_layers`/`sliding_window_pattern`/
+    // `sliding_window`/`key_length`/`key_length_swa`/`rope_theta_swa` -
+    // see `backends/candle.rs`), and the graph/forward-pass consumption of
+    // these fields is already fully generic - only THIS safetensors config
+    // parser was missing the equivalent read, silently leaving every layer
+    // as plain full-attention/non-shared-KV for any hybrid-attention model
+    // loaded from safetensors (correct-looking but numerically wrong
+    // output, with no error). Ported from the GGUF path's field semantics,
+    // NOT independently verified against a real forward pass here - same
+    // "written, not numerically verified" posture as this codebase's
+    // AWQ/GPTQ CUDA dequant path (see quant-performance-plan.md phase 4).
+    let sliding_window_pattern: Option<Vec<bool>> = lookup("layer_types")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(|v| v.as_str() == Some("sliding_attention")).collect());
+    let sliding_window = lookup("sliding_window").and_then(|v| v.as_u64()).map(|v| v as usize);
+    let shared_kv_layers = lookup("num_kv_shared_layers").and_then(|v| v.as_u64()).map(|v| v as usize);
+    let rope_parameters = lookup("rope_parameters");
+    let rope_theta_full = rope_parameters
+        .and_then(|rp| rp.get("full_attention"))
+        .and_then(|t| t.get("rope_theta"))
+        .and_then(|v| v.as_f64());
+    let rope_theta_swa = rope_parameters
+        .and_then(|rp| rp.get("sliding_attention"))
+        .and_then(|t| t.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32);
+    // `rope_parameters.full_attention.rope_theta`, when present, is this
+    // family's real primary/non-sliding rope_theta - takes priority over
+    // the flat `rope_theta` field read above (which this family's configs
+    // may set to a default that's actually only correct for sliding
+    // layers, per `ModelMeta::get_rope_theta`'s non-swa branch using the
+    // top-level `rope_theta`).
+    if let Some(v) = rope_theta_full {
+        rope_theta = v as f32;
+    }
+    // `global_head_dim`, when present, is the K/V head dim for full-
+    // attention layers specifically (Gemma-4's `head_dim`/`global_head_dim`
+    // split - confirmed present side-by-side in the real config); the base
+    // `head_dim` computed above serves sliding-window layers via
+    // `ModelMeta::get_head_dim`'s swa branch.
+    let key_length_swa = Some(head_dim);
+    let key_length = lookup("global_head_dim").and_then(|v| v.as_u64()).map(|v| v as usize);
+
+    let torch_dtype = lookup("torch_dtype").or_else(|| lookup("dtype")).and_then(|v| v.as_str()).unwrap_or("float16");
     let weight_dtype = match torch_dtype {
         "float32" => WeightDtype::F32,
         "float16" => WeightDtype::F16,
@@ -56,23 +127,32 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
         _ => WeightDtype::F16,
     };
 
-    let rms_norm_eps = val.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-5) as f32;
-    let tie_word_embeddings = val.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false);
+    let rms_norm_eps = lookup("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-5) as f32;
+    let tie_word_embeddings = lookup("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false);
     // Matches candle.rs's GGUF-metadata activation detection: substring match
     // so variants like "gelu_new"/"gelu_pytorch_tanh" still resolve to GeLU,
     // and "silu"/"swish" (the same function under two names, both common in
     // real HF configs) resolve to SiLU explicitly.
     //
-    // Anything else - a genuinely missing `hidden_act` field, or a real but
-    // unrecognized value like "relu"/"geglu"/"swiglu" - used to silently
-    // fall through to SiLU. SiLU-gated and e.g. ReLU MLPs compute different
-    // math, not just a different nonlinearity curve, so guessing wrong here
-    // produces numerically wrong output with no warning - exactly the class
-    // of bug this codebase's "no silent fallback" rule (see the unknown-
-    // GGML-quant-type and missing-architecture-metadata bails elsewhere in
-    // this file/candle.rs) exists to prevent. Bail with a clear, actionable
-    // error instead.
-    let hidden_act = match val.get("hidden_act").and_then(|v| v.as_str()) {
+    // Real Gemma2/Gemma3/Gemma4 HF configs use a DIFFERENT field name,
+    // `hidden_activation`, instead of the more common `hidden_act` -
+    // confirmed against `mlx-community/gemma-4-e2b-it-4bit`'s own
+    // `text_config.hidden_activation = "gelu_pytorch_tanh"` (it has no
+    // `hidden_act` field at all). Missing this alias would make every real
+    // Gemma-family HF checkpoint hit the "missing field" bail below - a
+    // regression from even the old silent-SiLU-default behavior for the
+    // one family that behavior was ALSO already wrong for (Gemma uses GeLU,
+    // not SiLU). Check both names; anything else - a genuinely missing
+    // field under either name, or a real but unrecognized value like
+    // "relu"/"geglu"/"swiglu" - is a clear error instead of a silent guess:
+    // SiLU-gated and e.g. ReLU MLPs compute different math, not just a
+    // different nonlinearity curve, so guessing wrong here produces
+    // numerically wrong output with no warning - exactly the class of bug
+    // this codebase's "no silent fallback" rule (see the unknown-GGML-
+    // quant-type and missing-architecture-metadata bails elsewhere in this
+    // file/candle.rs) exists to prevent.
+    let hidden_act_raw = lookup("hidden_act").or_else(|| lookup("hidden_activation"));
+    let hidden_act = match hidden_act_raw.and_then(|v| v.as_str()) {
         Some(s) if s.contains("gelu") => HiddenAct::GeLU,
         Some(s) if s.contains("silu") || s.contains("swish") => HiddenAct::SiLU,
         Some(other) => return Err(anyhow!(
@@ -201,7 +281,7 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
         audio_num_mel_bins = val.get("audio_num_mel_bins").and_then(|v| v.as_u64()).map(|v| v as usize);
     }
 
-    let final_logit_softcapping = val.get("final_logit_softcapping").and_then(|v| v.as_f64()).map(|v| v as f32);
+    let final_logit_softcapping = lookup("final_logit_softcapping").and_then(|v| v.as_f64()).map(|v| v as f32);
 
     let model_type = val.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
     let architectures: Vec<String> = val.get("architectures")
@@ -212,7 +292,7 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
     // see `is_gemma_arch`'s doc comment for why this must not be duplicated independently.
     let is_gemma = crate::types::is_gemma_arch(model_type, &architectures);
 
-    let ple_dim = val.get("hidden_size_per_layer_input").and_then(|v| v.as_u64()).map(|v| v as usize);
+    let ple_dim = lookup("hidden_size_per_layer_input").and_then(|v| v.as_u64()).map(|v| v as usize);
     let embed_scale = if is_gemma {
         Some((hidden_size as f32).sqrt())
     } else {
@@ -249,12 +329,12 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
         audio_block_count,
         audio_embedding_length,
         audio_num_mel_bins,
-        shared_kv_layers: None,
-        sliding_window_pattern: None,
-        sliding_window: None,
-        key_length: None,
-        key_length_swa: None,
-        rope_theta_swa: None,
+        shared_kv_layers,
+        sliding_window_pattern,
+        sliding_window,
+        key_length,
+        key_length_swa,
+        rope_theta_swa,
         final_logit_softcapping,
         is_gemma,
         ple_dim,

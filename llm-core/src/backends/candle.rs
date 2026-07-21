@@ -1126,19 +1126,38 @@ impl LlmBackend for CandleBackend {
             // threading a new field through `ModelMeta` (which has ~9
             // construction sites across the codebase) to keep this change's
             // blast radius small.
-            let packed_quant: Option<(String, usize)> = std::fs::read_to_string(&config_path)
+            let config_value: Option<serde_json::Value> = std::fs::read_to_string(&config_path)
                 .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| {
-                    let qc = v.get("quantization_config")?;
-                    let method = qc.get("quant_method")?.as_str()?.to_lowercase();
-                    if method == "awq" || method == "gptq" {
-                        let group_size = qc.get("group_size").and_then(|g| g.as_u64()).unwrap_or(128) as usize;
-                        Some((method, group_size))
-                    } else {
-                        None
-                    }
-                });
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+            let packed_quant: Option<(String, usize)> = config_value.as_ref().and_then(|v| {
+                let qc = v.get("quantization_config")?;
+                let method = qc.get("quant_method")?.as_str()?.to_lowercase();
+                if method == "awq" || method == "gptq" {
+                    let group_size = qc.get("group_size").and_then(|g| g.as_u64()).unwrap_or(128) as usize;
+                    Some((method, group_size))
+                } else {
+                    None
+                }
+            });
+            // Detect MLX affine-quantized pre-quantization (see
+            // `loader/mlx.rs`'s module doc for the format, verified against
+            // a real `mlx-community/*` checkpoint's own bytes) - independent
+            // of and mutually exclusive with the AWQ/GPTQ check above (a
+            // real checkpoint carries one or the other, never both).
+            let mlx_quant: Option<crate::loader::mlx::MlxQuantConfig> = if packed_quant.is_none() {
+                match &config_value {
+                    // Propagate a real detection error (unsupported mode/bits)
+                    // instead of silently treating it as "not MLX-quantized" -
+                    // that would fall through to the plain-safetensors path
+                    // and load the packed integer bytes as if they were dense
+                    // F16/BF16 weights, producing meaningless output with no
+                    // warning.
+                    Some(v) => crate::loader::mlx::detect_mlx_quantization(v)?,
+                    None => None,
+                }
+            } else {
+                None
+            };
 
             // Load all SafeTensors tensors to CPU memory first, at their
             // native dtype (NOT cast to compute_dtype yet: AWQ/GPTQ pack
@@ -1151,6 +1170,34 @@ impl LlmBackend for CandleBackend {
                 let loaded = candle_core::safetensors::load(&sf_file, &Device::Cpu)?;
                 for (name, tensor) in loaded {
                     raw_tensors.insert(name, tensor);
+                }
+            }
+
+            // Some real multimodal-wrapped checkpoints (confirmed against
+            // `mlx-community/gemma-4-e2b-it-4bit`'s own safetensors header)
+            // nest the ENTIRE text decoder under a `language_model.` prefix
+            // (`language_model.model.embed_tokens.weight`,
+            // `language_model.model.layers.0...`, `language_model.lm_head.
+            // weight`) alongside sibling `vision_tower.*`/`audio_tower.*`
+            // trees for the multimodal encoders - a different convention
+            // from the flat `model.layers.N...` layout the rest of this
+            // loading path (and `scan_tensors`/`build_graph`) expect. Without
+            // stripping it, every LLM tensor lookup fails with "Weight
+            // 'model.embed_tokens.weight' not found" even though the data is
+          // right there under a different name. `vision_tower.`/
+            // `audio_tower.` tensors are untouched here - `VisionEncoder`/
+            // `AudioEncoder` already load and filter them independently by
+            // their own prefix conventions (confirmed working against this
+            // same checkpoint).
+            if raw_tensors.keys().any(|k| k.starts_with("language_model.")) {
+                let renamed: Vec<(String, String)> = raw_tensors.keys()
+                    .filter(|k| k.starts_with("language_model."))
+                    .map(|k| (k.clone(), k.strip_prefix("language_model.").unwrap().to_string()))
+                    .collect();
+                for (old_name, new_name) in renamed {
+                    if let Some(t) = raw_tensors.remove(&old_name) {
+                        raw_tensors.insert(new_name, t);
+                    }
                 }
             }
 
@@ -1203,6 +1250,62 @@ impl LlmBackend for CandleBackend {
                      against real safetensors headers but not yet numerically verified against \
                      Python (transformers/autoawq/auto-gptq) output on real hardware.",
                     bases.len(), self.compute_dtype
+                );
+            } else if let Some(mlx_cfg) = mlx_quant {
+                // MLX's `.weight` suffix is ambiguous (see `loader/mlx.rs`'s
+                // doc comment: plain dense tensors - embeddings, norms, and
+                // even some unquantized submodules' linear layers - use the
+                // exact same suffix). A base is only actually MLX-quantized
+                // if BOTH `.scales` and `.biases` siblings exist AND
+                // `.weight`'s own dtype is U32 (the packed-integer type) -
+                // anything else passes through unchanged, even if its name
+                // happens to match `mlx_component`.
+                let mut bases: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for name in raw_tensors.keys() {
+                    if let Some((base, "weight")) = crate::loader::mlx::mlx_component(name) {
+                        let is_packed = raw_tensors.get(name).map(|t| t.dtype() == DType::U32).unwrap_or(false);
+                        let has_scales = raw_tensors.contains_key(&format!("{base}.scales"));
+                        let has_biases = raw_tensors.contains_key(&format!("{base}.biases"));
+                        if is_packed && has_scales && has_biases {
+                            bases.insert(base.to_string());
+                        }
+                    }
+                }
+                for base in &bases {
+                    let weight = raw_tensors.get(&format!("{base}.weight"))
+                        .ok_or_else(|| anyhow!("mlx: missing {base}.weight"))?;
+                    let scales = raw_tensors.get(&format!("{base}.scales"))
+                        .ok_or_else(|| anyhow!("mlx: missing {base}.scales"))?;
+                    let biases = raw_tensors.get(&format!("{base}.biases"))
+                        .ok_or_else(|| anyhow!("mlx: missing {base}.biases"))?;
+                    let dequantized = crate::loader::mlx::dequantize_mlx_linear(
+                        weight, scales, biases, mlx_cfg.group_size, mlx_cfg.bits, &Device::Cpu,
+                    )?;
+                    cpu_tensors.insert(format!("{base}.weight"), dequantized.to_dtype(self.compute_dtype)?);
+                }
+                for (name, tensor) in raw_tensors {
+                    // Skip anything belonging to a base already handled above
+                    // (its packed `.weight`/`.scales`/`.biases` triple) -
+                    // otherwise re-inserting the raw packed `.weight` tensor
+                    // here under the same `{base}.weight` key would silently
+                    // OVERWRITE the correct dequantized tensor with the raw
+                    // packed U32 bit pattern reinterpreted as the compute
+                    // dtype - exactly the kind of silent wrong-output bug
+                    // this codebase's rules forbid.
+                    let belongs_to_dequantized_base = crate::loader::mlx::mlx_component(&name)
+                        .map(|(base, _kind)| bases.contains(base))
+                        .unwrap_or(false);
+                    if !belongs_to_dequantized_base {
+                        cpu_tensors.insert(name, tensor.to_dtype(self.compute_dtype)?);
+                    }
+                }
+                tracing::info!(
+                    "Dequantized {} MLX affine-quantized linear layer(s) (group_size={}, \
+                     bits={}) to dense {:?} weights at load time (correctness-first path, \
+                     same pattern as AWQ/GPTQ - see quant-performance-plan.md phase 3). \
+                     Verified against the real mlx-community/gemma-4-e2b-it-4bit checkpoint's \
+                     own dequantized bytes, not documentation alone - see loader/mlx.rs.",
+                    bases.len(), mlx_cfg.group_size, mlx_cfg.bits, self.compute_dtype
                 );
             } else {
                 for (name, tensor) in raw_tensors {
