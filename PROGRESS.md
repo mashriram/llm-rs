@@ -113,6 +113,43 @@ verification checklist for whoever has that hardware. See CHANGELOG's
 "part 8" entry for the complete writeup, numeric before/after table, and
 full benchmark data.
 
+**Then**: fixed the RoPE `inv_freq`-rebuilt-every-call bug the profiler
+flagged (same `Mutex<HashMap>` caching pattern used elsewhere) - real,
+measured **+~30% decode throughput** on both Metal and CPU, confirming a
+genuine cross-backend win. Found and cached the same class of redundant
+recompute in the KV-quantization Hadamard rotation matrix too (correct
+cleanup, no measurable speedup - the tensor involved is small). Fixed a
+real silent-fallback bug in HF `hidden_act` parsing (missing/unrecognized
+values used to guess SiLU, sometimes wrong-MLP-math wrong). Then
+implemented the MLX-format loader (quant-performance-plan.md Phase 3) -
+dequantizes MLX's affine-quantized weights to dense tensors, routed
+through candle's existing kernels; **verified against real bytes**
+(loaded `mlx-community/gemma-4-e2b-it-4bit`'s actual packed weights via
+`mlx.core`, reverse-derived the exact nibble order and dequant formula
+from real output, encoded as a regression test). Testing it end-to-end
+against that real checkpoint surfaced and fixed three more real,
+broadly-applicable HF-config/tensor-naming gaps (nested `text_config`
+fallback, `hidden_activation` alias, Gemma hybrid local/global attention
+config, a `language_model.` tensor-prefix convention, and - found by
+cross-referencing this codebase's graph builder against a real
+mlx_vlm reference implementation - QK-norm and per-layer-embedding
+tensor names silently unrecognized for the safetensors naming
+convention). **Honest result**: the real MLX checkpoint (vision + audio
+included) now loads completely and runs to completion, but Gemma-4's
+output is still not coherent - a precisely-identified, NOT-yet-resolved
+discrepancy remains in per-layer norm tensor semantics that needs either
+llama.cpp's own GGUF conversion source or further real-numerical
+verification work to resolve safely, not a guess. Also audited Qwen2-VL's
+vision encoder (still confirmed missing 2D RoPE entirely) and wrote the
+exact real specification needed to fix it correctly, without blind-
+implementing something that could easily be subtly wrong. Reviewed
+concurrency/KV-cache/scheduler correctness (no real hazard found in the
+current single-task architecture; confirmed the existing prefix-cache
+"computes matches but shares zero physical blocks" gap is still
+accurate). Confirmed this environment still cannot even type-check
+`--features cuda` (no `nvcc`). See CHANGELOG's "part 9" entry for the
+complete writeup.
+
 ## v5 — Real GPU-throughput investigation + AWQ/GPTQ loaders, 2026-07-20
 
 ### Measured, not assumed: llm-rs vs llama.cpp head-to-head

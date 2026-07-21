@@ -1,5 +1,247 @@
 # Changelog
 
+## v2026.7.21 (part 9) — MLX loader, RoPE/KV-cache perf fixes, model-agnostic config fixes, concurrency audit
+
+This entry covers a broad pass across quant-performance-plan.md Phase 1.3,
+Phase 3 (MLX loader), a real HF-config/tensor-naming audit, a concurrency/
+KV-cache correctness review, and an honest look at Qwen2-VL vision RoPE.
+Everything below was verified (tests, hardware_check.sh, or real-checkpoint
+loading) except where explicitly flagged otherwise.
+
+### Fixed and verified
+
+- **`hidden_act` silent fallback removed** (`llm-core/src/model/config.rs`).
+  Any `hidden_act` value that wasn't a `"gelu"` substring silently defaulted
+  to SiLU - including a genuinely missing field, or real values like
+  `"relu"`/`"geglu"`/`"swiglu"`. SiLU-gated and ReLU-gated MLPs compute
+  different math, not just a different curve - this could silently produce
+  numerically wrong output for any HF safetensors model with an unusual or
+  missing `hidden_act`. Now: `"gelu"`-family and `"silu"`/`"swish"` resolve
+  explicitly; anything else - including a missing field - bails with a
+  clear error. 4 new unit tests. Existing test fixtures across
+  `llm-tests/tests/mlc_parity.rs`/`mlc_test.rs` that omitted `hidden_act`
+  updated to specify it explicitly.
+
+- **RoPE `inv_freq` and KV-quantization's Hadamard rotation matrix cached**
+  (`llm-core/src/backends/candle.rs`, `attention.rs`). Both were pure
+  functions of architecture constants (`head_dim`/`rope_theta` for RoPE;
+  `head_dim` for the Hadamard matrix) but were rebuilt from a fresh host
+  `Vec` + device tensor upload on **every single call** - every layer,
+  every prefill/decode step. Found via `LLM_PROFILE_STEP=1` (added last
+  session): `rope` was disproportionately expensive relative to its actual
+  (cheap, elementwise) math. Fixed with `inv_freq_cache`/`hadamard_cache`
+  (same `Mutex<HashMap>` pattern as `qmatmul_cache`/`kv_history_cache`
+  elsewhere in this file). **Measured**: decode 34.2-34.8 → 44.8-45.4 t/s
+  on Metal (+~30%), 16.5 → 18.9 t/s on `LLM_FORCE_CPU=1` - a genuine
+  cross-backend win, confirming it's architecture-derived caching, not a
+  Metal-specific patch. The Hadamard fix alone showed no measurable win
+  (the matrix involved is small, e.g. 128x128 floats - kept anyway as a
+  correct, zero-risk cleanup, not oversold as a speedup). Token IDs
+  bit-identical before/after on both backends and both KV dtypes (F16
+  and Q8).
+
+- **New MLX-format loader** (`llm-core/src/loader/mlx.rs`,
+  quant-performance-plan.md Phase 3). Dequantizes MLX's affine-quantized
+  weights (`mlx.core.quantize`, 4-bit/8-bit groupwise) to dense tensors at
+  load time, routed through candle's existing dense/`QMatMul` execution
+  path - no separate MLX runtime dependency. **Format verified against
+  real bytes, not documentation**: loaded `mlx-community/gemma-4-e2b-
+  it-4bit`'s actual `q_proj` weight/scales/biases via `mlx.core.load`, ran
+  the real `mlx.core.dequantize`, and reverse-derived the packed integer
+  values and nibble order from its output - confirmed low-nibble-first
+  packing and `w = value*scale + bias` exactly (encoded as a regression
+  test using this real data point). 6 new unit tests.
+
+- **Three more real, broadly-applicable HF-config parsing gaps**, found
+  while testing the MLX loader against the real checkpoint end-to-end
+  (`llm-core/src/model/config.rs`):
+  1. Real multimodal HF configs (LLaVA-style, Qwen2-VL, Gemma3/Gemma4...)
+     commonly nest the text decoder's real dimensions under a
+     `text_config` object with no top-level `vocab_size`/`hidden_size`/
+     etc at all - confirmed against this checkpoint. `parse_config` now
+     falls back to `text_config` when a field is absent at the top level.
+  2. Gemma2/Gemma3/Gemma4 HF configs use `hidden_activation`, not
+     `hidden_act` - confirmed (no `hidden_act` field exists at all in
+     this checkpoint's config). This would have made every real
+     Gemma-family safetensors checkpoint hit the new "missing hidden_act"
+     bail above - both names now checked.
+  3. `torch_dtype`'s newer alias `dtype` (a real field in this
+     checkpoint's config), and Gemma3/4's hybrid local/global attention
+     config (`layer_types`, `sliding_window`, `num_kv_shared_layers`,
+     per-layer-type `rope_theta` via `rope_parameters`, `global_head_dim`)
+     - the GGUF loading path already reads GGUF's equivalent metadata
+     into these exact `ModelMeta` fields and the graph/forward-pass
+     consumption is already fully generic; only the safetensors config
+     parser was missing the read. **Cross-verified, not guessed**: dumped
+     the real GGUF `gemma-4-E2B-it-Q4_K_M.gguf`'s own resolved metadata
+     for these exact fields and confirmed byte-identical values to what
+     the new safetensors parser derives from the MLX checkpoint's
+     `config.json` for the same real model (`shared_kv_layers=20`,
+     `sliding_window=512`, `key_length=512`/`key_length_swa=256`,
+     `rope_theta=1000000`/`rope_theta_swa=10000`, and the same 4:1
+     sliding:full layer pattern across all 35 layers).
+
+- **`language_model.` tensor-name-prefix stripping** (`candle.rs`). Some
+  real multimodal-wrapped checkpoints nest the entire text decoder under
+  a `language_model.` prefix (confirmed: this checkpoint's tensors are
+  `language_model.model.layers.N...` alongside sibling `vision_tower.*`/
+  `audio_tower.*` trees) - a different convention from the flat
+  `model.layers.N...` this loading path expects. Added a normalization
+  pass stripping a detected `language_model.` prefix before graph
+  building.
+
+- **`scan_tensors` recognizes real HF names for QK-norm and per-layer-
+  embedding tensors** (`llm-core/src/graph/scan.rs`), found the same way
+  and cross-verified against the real, working GGUF model's own tensor
+  names (dumped directly from its GGUF header, not guessed):
+  - `self_attn.q_norm.weight`/`self_attn.k_norm.weight` (real HF names)
+    alongside GGUF's own `attn_q_norm.weight`/`attn_k_norm.weight`.
+    Without this, **QK-norm was silently dropped for every safetensors-
+    loaded model that uses it** (Gemma2/3/4, Qwen3, others) - architecturally
+    significant, not a minor detail, and not specific to Gemma or MLX.
+  - `model.embed_tokens_per_layer.weight`/`model.per_layer_model_
+    projection.weight`/`model.per_layer_projection_norm.weight` (real HF
+    names for Gemma-4 2B/4B's per-layer-embedding mechanism) alongside
+    GGUF's own flat names.
+
+### Honest status: MLX loading works at the infrastructure level; Gemma-4 coherence is NOT achieved
+
+Real progress, precisely bounded: the real MLX checkpoint (including its
+vision AND audio encoders) now **loads completely** via `llm-cli` (`LLM_
+FORCE_CPU=1`, since the default Metal-selecting hardware-headroom check
+was blocked by transient system memory pressure on this dev machine, not
+a code issue) and the forward pass **runs to completion** producing real
+vocabulary-shaped tokens (not garbage bytes, not a crash). Output is
+**still not coherent** after all of the above fixes.
+
+Chased this down further than a quick "not supported" writeoff would -
+cross-referenced the real `mlx_vlm/models/gemma4/language.py` reference
+line-by-line against this codebase's graph builder
+(`llm-core/src/graph/builder.rs`) and found a precisely-identified,
+NOT-yet-resolved discrepancy: the real GGUF model (which works
+correctly) has **five** per-layer norm tensors (`attn_norm`,
+`post_attention_norm`, `post_norm`, `ffn_norm`, `post_ffw_norm` - dumped
+directly from the real GGUF header), while the real HF/mlx_vlm reference
+structure describes only **four** (`input_layernorm`,
+`post_attention_layernorm`, `pre_feedforward_layernorm`,
+`post_feedforward_layernorm`). This codebase's `LayerTensors` fields
+(`post_attention_norm` used before the attention residual add,
+`post_attention_layernorm` used after it, pre-MLP) don't have an
+established, verified 1:1 correspondence to either naming scheme without
+guessing - resolving this needs llama.cpp's own Gemma-4 GGUF conversion
+source (not available in this environment: no internet access to browse
+it, and it's C++, not something to reverse-engineer from tensor names
+alone) or the same real-numerical-comparison methodology used for the
+audio work (tap intermediate layer outputs, compare against a live
+`mlx_vlm` forward pass, narrow down layer-by-layer) - not attempted this
+pass to avoid guessing at norm-placement correctness, which would risk
+producing a confidently-wrong "fix."
+
+**Recommendation, stated plainly per direction to not oversell this**:
+do not recommend MLX-format loading for Gemma-4 checkpoints as a working
+feature yet - the loader and config-parsing infrastructure are real and
+correct (verified independently, several fixes benefit the GGUF-
+independent HF safetensors path in general, not just MLX), but end-to-end
+coherent generation is not there for this specific, unusually complex
+hybrid architecture. A simpler, non-hybrid-attention MLX checkpoint (no
+`layer_types`/`rope_parameters`/PLE mechanism) would likely exercise a
+much smaller fraction of this session's open questions and is a
+reasonable next thing to try - not attempted this pass due to time spent
+chasing the Gemma-4 case as far as safely possible.
+
+### Vision: Qwen2-VL missing 2D RoPE - audited and precisely specified, not blind-implemented
+
+Confirmed (again) that `llm-core/src/backends/vision.rs`'s forward pass
+has no rotary position embedding implementation at all - when
+`vision.pos_embed.weight` is absent (as it is for Qwen2-VL, which uses
+RoPE instead of an absolute position table), patches get **zero**
+positional information in self-attention.
+
+Read the real reference (`transformers/models/qwen2_vl/modeling_qwen2_
+vl.py`'s `VisionRotaryEmbedding`/`apply_rotary_pos_emb_vision`, and
+`transformers/vision_utils.py`'s `get_vision_position_ids`) to get the
+exact, real specification rather than guess:
+- `VisionRotaryEmbedding(dim=head_dim//2)`: `inv_freq = 1/theta^(arange(0,dim,2)/dim)`,
+  applied to (h, w) position ids separately then concatenated
+  (`emb = cat([rotary_pos_emb, rotary_pos_emb], dim=-1)`, `cos=emb.cos()`,
+  `sin=emb.sin()`).
+- Position ids are **not** simple raster (row-major) order - they're laid
+  out **block-major over `spatial_merge_size × spatial_merge_size`
+  blocks** (`get_vision_position_ids`: reshape into
+  `(h//merge, merge, w//merge, merge)`, transpose, flatten), matching the
+  later spatial-merge step's expected token order.
+
+**Not implemented this pass.** This requires the patch token ordering
+produced by this codebase's `PatchEmbed`+reshape (currently plain raster
+order) and the spatial-merge step (`vision.rs`'s `spatial_merge`) to
+already agree with whatever ordering the real GGUF/mmproj conversion
+(llama.cpp's `clip.cpp`, external C++ not available in this environment)
+actually uses - getting the (patch order) × (RoPE position-id order) ×
+(merge order) interaction wrong is a subtle, easy-to-silently-mis-verify
+bug class, and the same kind of "looks plausible, numerically wrong"
+mistake this session's audio work spent significant effort catching and
+fixing (see parts 6-8). Flagged with the exact real specification above
+so a future pass with either `clip.cpp` source access or a live numerical
+verification loop (same methodology as the audio work) can implement it
+correctly rather than guessing.
+
+### Concurrency / KV-cache / scheduler audit (no code changes - review only)
+
+Read `llm-scheduler`'s `engine.rs`/`scheduler.rs`/`block_allocator.rs`/
+`prefix_cache.rs` in full plus the relevant `candle.rs` call sites.
+Findings:
+- **No real concurrency hazard found in the current architecture**: the
+  engine's single spawned task owns one `Scheduler` (which owns the one
+  `CandleBackend`) and processes one sequential `loop { scheduler.step()
+  }` - there is exactly one caller of `forward_pass` at any time. Most
+  "shared mutable state under concurrent access" concerns are moot by
+  construction, not by explicit locking.
+- **Multimodal single-slot globals** (`ACTIVE_IMAGE_PATH`/
+  `ACTIVE_AUDIO_PATH`) are only set by the REPL binary (`chat.rs`),
+  which is genuinely sequential (blocks on stdin, awaits full generation
+  before the next line) - not currently reachable concurrently. But
+  there IS a real latent architectural gap if multimodal input is ever
+  wired into the concurrent HTTP server (`chat_completions` in `lib.rs`
+  has zero image/audio handling today): these are single global "active
+  path" slots, not per-sequence, so two different concurrent
+  image/audio requests batched together would incorrectly get the same
+  single image/audio applied to the whole batch. Flagged for whoever
+  adds multimodal to the HTTP server - not an issue in the current
+  feature set.
+- **Prefix cache computes correct matches but provides ZERO actual reuse
+  benefit** - already honestly flagged in-code
+  (`scheduler.rs:124-138`, "NOTE(#7 audit finding)") from an earlier pass:
+  `insert_sequence`'s match result is deliberately discarded because
+  wiring up real KV-block sharing correctly requires keeping recycled
+  blocks alive across the free/reuse boundary and mapping token-
+  granularity radix matches onto block-granularity ref-counting - "a real
+  feature-completion task, not a small bug fix." Independently confirmed
+  this is still accurate; not attempted this pass for the same reason it
+  wasn't attempted before (KV-cache sharing/ref-counting correctness bugs
+  are exactly the class of thing not to rush).
+- `inv_freq_cache`/`hadamard_cache` (added this session): confirmed
+  check-then-insert-without-holding-lock is a benign TOCTOU (worst case:
+  redundant recomputation of an identical deterministic value), not a
+  correctness hazard.
+- Block allocator: sound for the current single-owner design; no locking
+  needed given the architecture above.
+
+### CUDA status (unchanged - still cannot be verified in this environment)
+
+Confirmed (not assumed) that this environment genuinely cannot even
+type-check `--features cuda`: `cargo check --features cuda` fails at
+`cudarc`'s own build script (`nvcc --version` not found - no CUDA
+toolkit installed, no NVIDIA GPU). Writing more CUDA-specific code
+blind, without being able to compile-check it at all, risks shipping
+basic syntax/type errors that would immediately fail on real CUDA
+hardware, wasting time there instead of saving it. The existing AWQ/GPTQ/
+MLX dequant-to-dense loaders should already work on CUDA today (same
+generic `candle_core::Tensor`/`QMatMul` code path used everywhere else,
+no CUDA-specific branching) - unverified, per the existing honest
+posture in `quant-performance-plan.md` Phase 4. Action for whoever has
+CUDA hardware: pull this branch, `cargo build --release --features
+cuda`, try an AWQ/GPTQ/MLX-quantized model, and share the result.
+
 ## v2026.7.21 (part 8) — five more real audio bugs found and fixed via layer-by-layer numeric verification; CPU/Metal benchmarks re-run
 
 Continuation of part 7's investigation, using the exact same tooling
