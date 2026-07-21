@@ -38,9 +38,24 @@ a focused subagent review, Qwen2-VL vision directly): found and removed
 one more real, unjustified constant in the audio attention math
 (verified no regression, real behavior change, still not coherent), and
 documented several more suspected-but-unverifiable issues precisely
-rather than guessing at fixes for them. See CHANGELOG's "part 5" entry
-for the full audit writeup - it's the most complete account. Not yet
-merged to master.
+rather than guessing at fixes for them. Then obtained a real reference:
+`pip install transformers` gives direct access to the actual
+`modeling_gemma3n.py`/`feature_extraction_gemma3n.py` source (no
+weights/GPU needed) - reading it directly resolved most of the
+previously "could not verify" items with real ground truth. Four more
+reference-verified fixes landed: the mel-spectrogram front-end was
+completely wrong for Gemma (independently double-confirmed against the
+real deployed model's own `preprocessor_config.json`), the SSCP conv
+stages used the wrong normalization type (plain LayerNorm instead of a
+real cumulative group norm) and the wrong (symmetric, not reverse-
+causal) time-axis padding, and the earlier k_scale removal is now
+externally confirmed correct by the reference. All four verified with no
+regression and real behavior changes on both a synthetic tone and a real
+speech sample. **Audio is still not fully coherent** even after all of
+this - reported honestly; the most likely remaining cause (missing
+validity/causal attention masking for zero-padded buffer positions) is
+identified and scoped but not implemented this pass. See CHANGELOG's
+"part 6" entry for the complete writeup. Not yet merged to master.
 
 ## v5 — Real GPU-throughput investigation + AWQ/GPTQ loaders, 2026-07-20
 

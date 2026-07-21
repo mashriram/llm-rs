@@ -322,26 +322,38 @@ impl AudioEncoder {
         let norm0_w = self.weights.get("a.conv1d.0.norm.weight")
             .ok_or_else(|| anyhow!("a.conv1d.0.norm.weight not found"))?;
 
-        let x = x.conv2d(conv0_w, 1, 2, 1, 1)?; // padding 1, stride 2
+        // Reference (`Gemma3nAudioSSCPConvBlock`) pads TIME (0 before,
+        // kernel_h-1=2 after - "reverse causal": every output step only ever
+        // looks at past+current input, never future) and FREQ (1 before, 1
+        // after - ordinary symmetric "same"-ish padding) asymmetrically per
+        // axis, then convolves with padding=0. candle's `conv2d` only takes
+        // one symmetric padding value applied to both axes, so the padding
+        // is done manually here instead of via conv2d's own padding param
+        // (which previously applied the WRONG symmetric 1-before/1-after
+        // shape to the time axis too, letting each output step see one
+        // step into the future it shouldn't - a real, confirmed-against-
+        // reference bug, distinct from the normalization/scale ones above).
+        let x = x.pad_with_zeros(2, 0, 2)?.pad_with_zeros(3, 1, 1)?;
+        let x = x.conv2d(conv0_w, 0, 2, 1, 1)?; // padding already applied manually above
 
-        // Permute to (batch, h, w, channels) for LayerNorm
+        // Permute to (batch, time, freq, channels) for CumulativeGroupNorm
         let x = x.permute((0, 2, 3, 1))?.contiguous()?;
 
-        let norm0_b = Tensor::zeros(128, dtype, device)?;
-        let x = candle_nn::ops::layer_norm(&x, norm0_w, &norm0_b, 1e-5)?;
+        const SSCP_GROUP_NORM_EPS: f64 = 1e-3; // config.sscp_conv_group_norm_eps
+        let x = cumulative_group_norm(&x, norm0_w, SSCP_GROUP_NORM_EPS)?;
         let x = x.relu()?;
         let x = x.permute((0, 3, 1, 2))?; // Back to (batch, channels, h, w)
 
-        // layer 1: Conv2d(stride=2, padding=1), LayerNorm, ReLU
+        // layer 1: same reverse-causal-time/symmetric-freq padding, CumulativeGroupNorm, ReLU
         let conv1_w = self.weights.get("a.conv1d.1.weight")
             .ok_or_else(|| anyhow!("a.conv1d.1.weight not found"))?;
         let norm1_w = self.weights.get("a.conv1d.1.norm.weight")
             .ok_or_else(|| anyhow!("a.conv1d.1.norm.weight not found"))?;
 
-        let x = x.contiguous()?.conv2d(conv1_w, 1, 2, 1, 1)?; // padding 1, stride 2
+        let x = x.contiguous()?.pad_with_zeros(2, 0, 2)?.pad_with_zeros(3, 1, 1)?;
+        let x = x.conv2d(conv1_w, 0, 2, 1, 1)?;
         let x = x.permute((0, 2, 3, 1))?.contiguous()?;
-        let norm1_b = Tensor::zeros(32, dtype, device)?;
-        let x = candle_nn::ops::layer_norm(&x, norm1_w, &norm1_b, 1e-5)?;
+        let x = cumulative_group_norm(&x, norm1_w, SSCP_GROUP_NORM_EPS)?;
         let x = x.relu()?;
         let x = x.permute((0, 3, 1, 2))?; // (batch, 32, 32, 750)
 
@@ -653,6 +665,51 @@ impl AudioEncoder {
     }
 }
 
+/// Gemma 3n's `Gemma3nAudioCumulativeGroupNorm`, ported exactly from the real
+/// `transformers` reference source (`modeling_gemma3n.py`, read directly
+/// rather than assumed): normalizes over a SINGLE group spanning all
+/// non-batch/non-time feature dims (here: frequency and channel jointly,
+/// matching `num_groups=1`), with statistics accumulated CUMULATIVELY over
+/// the time axis (dim 1) rather than independently per time step - i.e. the
+/// stats at time `t` include every time step from `0..=t`, not just `t`
+/// itself. This replaces a plain per-frame `LayerNorm`, which computes
+/// completely different (non-cumulative, per-step-only) statistics and was
+/// a real, confirmed-against-reference correctness bug for both of the SSCP
+/// conv-subsampling stages that use it.
+///
+/// `x`: `[B, T, F, C]` (batch, time, freq, channel). `weight`: `[C]`, applied
+/// per-channel after normalization. No masking is applied (this codebase
+/// does not yet track which time steps are real audio vs. zero-padding —
+/// see CHANGELOG for that separately-tracked gap), matching the reference's
+/// own behavior when no mask is supplied (all time steps treated as valid).
+fn cumulative_group_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+    let original_dtype = x.dtype();
+    let x_f32 = x.to_dtype(DType::F32)?;
+    let (_b, t, f, c) = x_f32.dims4()?;
+    let elements_per_step = (f * c) as f64;
+
+    // Cumulative mean: cumsum of the per-step sum, divided by cumsum of the
+    // (constant, since unmasked) per-step element count.
+    let sum_at_t = x_f32.sum_keepdim((2, 3))?; // [B, T, 1, 1]
+    let cum_sum = sum_at_t.cumsum(1)?;
+    let step_indices: Vec<f32> = (1..=t as u32).map(|i| i as f32 * elements_per_step as f32).collect();
+    let cum_count = Tensor::from_vec(step_indices, (1, t, 1, 1), x.device())?;
+    let cum_mean = cum_sum.broadcast_div(&cum_count)?; // [B, T, 1, 1]
+
+    // Cumulative variance: each time step's squared-diff-from-ITS-OWN cum_mean
+    // is computed first, summed over (F,C), THEN cumsum'd over time - matching
+    // the reference exactly (not a Welford-style incremental update).
+    let sq_diff_at_t = x_f32.broadcast_sub(&cum_mean)?.sqr()?.sum_keepdim((2, 3))?;
+    let cum_sum_sq_diff = sq_diff_at_t.cumsum(1)?;
+    let cum_variance = cum_sum_sq_diff.broadcast_div(&cum_count)?;
+
+    let normalized = x_f32.broadcast_sub(&cum_mean)?
+        .broadcast_div(&(cum_variance + eps)?.sqrt()?)?;
+    let weight_f32 = weight.to_dtype(DType::F32)?.reshape((1, 1, 1, c))?;
+    let scaled = normalized.broadcast_mul(&weight_f32)?;
+    Ok(scaled.to_dtype(original_dtype)?)
+}
+
 fn rms_norm(x: &Tensor, weight: Option<&Tensor>, eps: f64) -> Result<Tensor> {
     let original_dtype = x.dtype();
     let x_f32 = x.to_dtype(DType::F32)?;
@@ -869,7 +926,7 @@ fn normalize_audio_tensors(
     Ok(normalized)
 }
 
-pub fn load_audio(path: &Path, device: &Device, num_mel_bins: usize) -> Result<Tensor> {
+pub fn load_audio(path: &Path, device: &Device, architecture: AudioArchitecture) -> Result<Tensor> {
     tracing::info!("Loading audio from {:?}", path);
 
     let src = std::fs::File::open(path)
@@ -981,22 +1038,28 @@ pub fn load_audio(path: &Path, device: &Device, num_mel_bins: usize) -> Result<T
         pcm_data.truncate(target_samples);
     }
 
-    // Real log-mel spectrogram (Whisper's feature-extraction convention:
-    // 16kHz audio, 25ms/400-sample Hann-windowed frames, 10ms/160-sample hop,
-    // 3000 frames for 30s of audio). This replaces a previous placeholder
-    // that computed only a per-frame scalar RMS energy and fanned it out
-    // across mel bins via a fixed sine envelope — a real but content-blind
-    // "spectrogram" that could not carry any actual frequency information
-    // regardless of what audio encoder architecture consumed it (Whisper or
-    // Gemma-Conformer). Every audio-capable model was affected equally,
-    // since the bug was here, not in any per-architecture encoder code.
+    match architecture {
+        AudioArchitecture::Whisper => whisper_mel_spectrogram(&pcm_data, device),
+        AudioArchitecture::GemmaConformer => gemma3n_mel_spectrogram(&pcm_data, device),
+    }
+}
+
+/// Whisper's feature-extraction convention: 16kHz audio, 25ms/400-sample
+/// Hann-windowed frames, 10ms/160-sample hop, 3000 frames for 30s of audio,
+/// power spectrum, and Whisper's specific final normalization (clip dynamic
+/// range to the top 8 natural-log units, then rescale to roughly [-1, 1]).
+/// This replaces a previous placeholder that computed only a per-frame
+/// scalar RMS energy fanned out via a fixed sine envelope — a real but
+/// content-blind "spectrogram" carrying no actual frequency information.
+fn whisper_mel_spectrogram(pcm_data: &[f32], device: &Device) -> Result<Tensor> {
     const N_FFT: usize = 400;
     const HOP_LENGTH: usize = 160;
     const SAMPLE_RATE: f32 = 16000.0;
+    const NUM_MEL_BINS: usize = 80;
     let window = hann_window(N_FFT);
-    let mel_filters = build_mel_filterbank(num_mel_bins, N_FFT, SAMPLE_RATE);
+    let mel_filters = build_mel_filterbank(NUM_MEL_BINS, N_FFT, SAMPLE_RATE, 0.0, SAMPLE_RATE / 2.0);
 
-    let mut mel_data = vec![0.0f32; num_mel_bins * 3000];
+    let mut mel_data = vec![0.0f32; NUM_MEL_BINS * 3000];
     let mut frame_buf = vec![0.0f32; N_FFT];
     for frame in 0..3000 {
         let start_idx = frame * HOP_LENGTH;
@@ -1021,7 +1084,85 @@ pub fn load_audio(path: &Path, device: &Device, num_mel_bins: usize) -> Result<T
         *v = (*v + 4.0) / 4.0;
     }
 
-    let t = Tensor::from_vec(mel_data, (1, num_mel_bins, 3000), device)?;
+    let t = Tensor::from_vec(mel_data, (1, NUM_MEL_BINS, 3000), device)?;
+    Ok(t)
+}
+
+/// Gemma 3n's real audio feature extractor (`Gemma3nAudioFeatureExtractor`),
+/// ported exactly from HuggingFace `transformers`' reference source
+/// (`transformers/models/gemma3n/feature_extraction_gemma3n.py`, read
+/// directly rather than assumed) — confirmed to differ from Whisper's
+/// convention in every parameter that matters:
+///   - 32ms/512-sample frames (not 25ms/400), 10ms/160-sample hop (same).
+///   - FFT length 1024 (`2^ceil(log2(512))`, doubled for "FFT overdrive"),
+///     not a same-length-as-frame DFT.
+///   - Mel filterbank spans 125-7600 Hz (not 0-8000 Hz).
+///   - HTK-flavor preemphasis (coefficient 0.97) applied to every frame -
+///     entirely absent from the previous implementation.
+///   - Magnitude spectrum (`|STFT|`), not power spectrum (`|STFT|^2`).
+///   - `ln(max(mel, 1e-5))` with NO final clip/rescale - the "clip to top 8
+///     log units, rescale to roughly [-1,1]" step is a Whisper-specific
+///     convention that was previously (incorrectly) applied to Gemma too.
+fn gemma3n_mel_spectrogram(pcm_data: &[f32], device: &Device) -> Result<Tensor> {
+    const SAMPLE_RATE: f32 = 16000.0;
+    const FRAME_LENGTH: usize = 512; // round(16000 * 32ms / 1000)
+    const HOP_LENGTH: usize = 160; // round(16000 * 10ms / 1000)
+    const FFT_LENGTH: usize = 1024; // 2^ceil(log2(512)), doubled for fft_overdrive
+    const NUM_MEL_BINS: usize = 128;
+    const MEL_MIN_FREQ: f32 = 125.0;
+    const MEL_MAX_FREQ: f32 = 7600.0;
+    const PREEMPHASIS: f32 = 0.97;
+    const MEL_FLOOR: f32 = 1e-5;
+
+    let window = hann_window(FRAME_LENGTH);
+    let mel_filters = build_mel_filterbank(NUM_MEL_BINS, FFT_LENGTH, SAMPLE_RATE, MEL_MIN_FREQ, MEL_MAX_FREQ);
+
+    // `_unfold(waveform, size=frame_length+1, step=hop_length)`: each frame
+    // needs one extra leading sample so the HTK preemphasis below has a
+    // "previous sample" for every position in the output frame.
+    let frame_size_for_unfold = FRAME_LENGTH + 1;
+    let num_frames = if pcm_data.len() >= frame_size_for_unfold {
+        (pcm_data.len() - frame_size_for_unfold) / HOP_LENGTH + 1
+    } else {
+        0
+    };
+
+    let mut mel_data = vec![0.0f32; NUM_MEL_BINS * num_frames];
+    let mut raw_frame = vec![0.0f32; frame_size_for_unfold];
+    let mut preemph_frame = vec![0.0f32; FRAME_LENGTH];
+    let mut fft_input = vec![0.0f32; FFT_LENGTH];
+
+    for frame in 0..num_frames {
+        let start_idx = frame * HOP_LENGTH;
+        for (i, slot) in raw_frame.iter_mut().enumerate() {
+            *slot = pcm_data.get(start_idx + i).copied().unwrap_or(0.0);
+        }
+
+        // HTK-flavor preemphasis: first output sample is the first raw
+        // sample scaled by (1-coeff) (no earlier sample to reference);
+        // every subsequent sample is `x[i] - coeff * x[i-1]`.
+        preemph_frame[0] = raw_frame[0] * (1.0 - PREEMPHASIS);
+        for i in 1..FRAME_LENGTH {
+            preemph_frame[i] = raw_frame[i] - PREEMPHASIS * raw_frame[i - 1];
+        }
+
+        for (i, w) in window.iter().enumerate() {
+            fft_input[i] = preemph_frame[i] * w;
+        }
+        for slot in fft_input.iter_mut().skip(FRAME_LENGTH) {
+            *slot = 0.0;
+        }
+
+        let power_spectrum = dft_power_spectrum(&fft_input);
+        for (bin, filter) in mel_filters.iter().enumerate() {
+            let magnitude_energy: f32 = filter.iter().zip(power_spectrum.iter())
+                .map(|(f, p)| f * p.sqrt())
+                .sum();
+            mel_data[bin * num_frames + frame] = magnitude_energy.max(MEL_FLOOR).ln();
+        }
+    }
+
+    let t = Tensor::from_vec(mel_data, (1, NUM_MEL_BINS, num_frames), device)?;
     Ok(t)
 }
 
@@ -1051,10 +1192,10 @@ fn mel_to_hz(m: f32) -> f32 {
 /// collapse a linear-frequency power spectrum into a perceptually-scaled
 /// log-mel spectrogram, matching standard Whisper/wav2vec2-style audio
 /// feature extraction.
-fn build_mel_filterbank(num_mel_bins: usize, n_fft: usize, sample_rate: f32) -> Vec<Vec<f32>> {
+fn build_mel_filterbank(num_mel_bins: usize, n_fft: usize, sample_rate: f32, f_min: f32, f_max: f32) -> Vec<Vec<f32>> {
     let num_fft_bins = n_fft / 2 + 1;
-    let mel_min = hz_to_mel(0.0);
-    let mel_max = hz_to_mel(sample_rate / 2.0);
+    let mel_min = hz_to_mel(f_min);
+    let mel_max = hz_to_mel(f_max);
     let mel_points: Vec<f32> = (0..num_mel_bins + 2)
         .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (num_mel_bins + 1) as f32)
         .collect();
@@ -1154,7 +1295,7 @@ mod arch_detection_tests {
         let sample_rate = 16000.0f32;
         let num_mel_bins = 80;
         let window = hann_window(n_fft);
-        let filters = build_mel_filterbank(num_mel_bins, n_fft, sample_rate);
+        let filters = build_mel_filterbank(num_mel_bins, n_fft, sample_rate, 0.0, sample_rate / 2.0);
 
         let tone_bin = |freq_hz: f32| -> usize {
             let frame: Vec<f32> = (0..n_fft)
@@ -1183,7 +1324,7 @@ mod arch_detection_tests {
 
     #[test]
     fn mel_filterbank_rows_are_nonzero() {
-        let filters = build_mel_filterbank(80, 400, 16000.0);
+        let filters = build_mel_filterbank(80, 400, 16000.0, 0.0, 8000.0);
         for (i, row) in filters.iter().enumerate() {
             assert!(row.iter().any(|&v| v > 0.0), "mel filter row {i} is all zero");
         }

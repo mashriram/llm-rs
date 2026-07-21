@@ -1,5 +1,113 @@
 # Changelog
 
+## v2026.7.20 (part 6) — audio fixes verified against the real Gemma3n reference source
+
+Part 5's audit flagged several audio issues as "could not verify without a
+reference implementation." This session obtained one: `pip install
+transformers` (no GPU/weights needed) gives direct access to the real
+`Gemma3nAudioEncoder`/`Gemma3nAudioFeatureExtractor` PyTorch source in
+`site-packages` - reading it directly resolved most of part 5's open
+questions with actual ground truth instead of further guessing. Four
+real, reference-verified fixes landed as a result.
+
+### Fixed
+- **Mel-spectrogram front-end was fundamentally wrong for Gemma-Conformer**
+  (`llm-core/src/backends/audio.rs`): the previous implementation shared
+  Whisper's exact convention (400-sample/25ms frames, no preemphasis,
+  power spectrum, 0-8000Hz mel range, Whisper-specific final rescale) for
+  BOTH architectures. The real Gemma3n front-end (confirmed via
+  `feature_extraction_gemma3n.py`) uses none of that: 512-sample/32ms
+  frames, a 1024-point FFT (`2^ceil(log2(512))`, doubled for "FFT
+  overdrive"), HTK-flavor preemphasis (coefficient 0.97, previously
+  entirely absent), a 125-7600Hz mel range (not 0-8000Hz), a magnitude
+  spectrum (not power), and a plain `ln(max(x, 1e-5))` with NO final
+  clip/rescale (Whisper's rescale step doesn't apply to Gemma at all).
+  Implemented as a new `gemma3n_mel_spectrogram` function, dispatched by
+  architecture (`whisper_mel_spectrogram` kept unchanged for Whisper
+  checkpoints - both are real, correct, architecture-specific pipelines
+  now, not one guessed-shared one). **Independently double-confirmed**:
+  every parameter matches the real deployed model's own
+  `preprocessor_config.json` (fetched from a public mirror,
+  `unsloth/gemma-3n-E2B-it`) exactly, including confirming
+  `per_bin_mean`/`per_bin_stddev` are genuinely unset (null) for this
+  model, so correctly omitting that optional normalization step is
+  itself verified, not assumed.
+- **SSCP conv-subsampling used the wrong normalization type**: replaced
+  a plain per-frame `LayerNorm` with a real `cumulative_group_norm`
+  function, ported exactly from `Gemma3nAudioCumulativeGroupNorm` -
+  normalizes over a single group spanning frequency+channel jointly,
+  with statistics accumulated cumulatively over time (each time step's
+  stats include every step from `0..=t`, not computed independently
+  per-step). Also fixed the normalization epsilon (`1e-3`, not `1e-5` -
+  confirmed from `sscp_conv_group_norm_eps`'s real config default).
+- **SSCP conv time-axis padding was symmetric; the reference uses
+  asymmetric "reverse-causal" padding** (0 before, kernel_size-1=2 after
+  - every output step sees only past+current input, never future).
+  candle's `conv2d` only supports one symmetric padding value for both
+  axes, so padding is now applied manually (`pad_with_zeros`) before a
+  `padding=0` conv2d call - frequency axis stays symmetric (1,1,
+  unchanged, already correct), only the time axis changes. Output shape
+  is unaffected (same arithmetic result either way); only which specific
+  positions get zero-padded changes.
+- **K-side attention scale removal (from part 5) is now externally
+  confirmed correct**: `Gemma3nAudioAttention.forward` in the real
+  reference applies `q_scale`/`per_dim_scale` to queries only - keys are
+  used completely unscaled. This is exactly what part 5's removal
+  (based on "no principled derivation found," without a reference to
+  fully confirm) already changed the code to do - independent
+  confirmation, no further change needed.
+
+**Verified, every fix**: no regression (full test suite - 101 llm-core +
+94 llm-cli tests - and `scripts/hardware_check.sh`'s all 7 checks pass;
+Gemma-4 text-only output is bit-identical throughout, since none of
+these fixes touch the text-only path at all), and a real behavior change
+on audio input after each fix (tested with both a synthetic tone and a
+real 11-second speech sample, `whisper.cpp`'s own public `jfk.wav` test
+fixture - output changed meaningfully and differently after each fix).
+
+**Honest status: audio is still not fully coherent** even after all
+four verified fixes. This is not a failure of the fixes themselves (each
+is independently confirmed correct against real reference source, not
+guessed) - it means at least one more issue remains. The most likely
+remaining candidate, identified but NOT implemented this pass:
+
+### Confirmed real, NOT fixed: missing validity/causal attention masking
+The reference's `Gemma3nAudioAttention` builds a real combined mask
+(local causal window + which time steps are actual audio vs zero-padding)
+and applies it before softmax (`torch.where(mask, logits, -inf)`); it
+also zeroes out padded positions before the light-conv step
+(`Gemma3nAudioConformerBlock`'s `validity_mask_for_lconv`). This
+codebase's fixed-size 480,000-sample (30s) buffer means a short clip
+(e.g. the 11-second JFK sample - barely a third of the buffer) is mostly
+zero-padding, and none of that masking exists here - every position
+attends/convolves as if the whole buffer were real audio.
+**Reassessed impact, on reflection**: likely smaller than initially
+feared, specifically because this architecture is almost entirely
+causal/backward-looking already (the light-conv is manually causal-
+padded; `cumulative_group_norm`'s running stats only ever look backward
+in time, so trailing padding can't contaminate earlier real-content
+statistics; the chunked attention's `max_future_horizon=0` means no
+position ever looks forward at all) - so the missing masking mostly
+under-constrains the padded tail itself, not the real content that
+precedes it, though it's not ruled out as still-significant. Not
+implemented this pass: doing it right requires plumbing a real-vs-padded
+frame count from `load_audio` through `AudioEncoder::encode` and every
+downstream norm/attention/conv call, touching several function
+signatures - a real, distinct, well-scoped follow-up rather than
+something to guess at partially.
+
+### Minor, deliberately unfixed: `build_mel_filterbank`'s bin-index formula
+A small, low-confidence-impact discrepancy noticed while reading the
+reference: this codebase's shared filterbank builder converts a mel
+frequency to an FFT bin index via `freq_hz * (fft_length+1) /
+sample_rate`; the reference computes filters directly in Hz-space using
+plain `fft_length` (no `+1`). For `fft_length=1024` this is a ~0.1%
+relative scale discrepancy - likely negligible, but NOT fixed here
+because `build_mel_filterbank` is shared between the Gemma and Whisper
+paths, and there is no reference confirmation either way for Whisper's
+own convention - changing it could as easily introduce a new bug for
+Whisper as fix a negligible one for Gemma. Flagged, not guessed at.
+
 ## v2026.7.20 (part 5) — full audio/vision multimodal correctness audit
 
 A dedicated audit pass on the two remaining open multimodal correctness

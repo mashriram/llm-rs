@@ -1529,11 +1529,12 @@ impl LlmBackend for CandleBackend {
             };
             let audio_val = if needs_load {
                 let audio_dtype = self.compute_dtype;
-                let num_mel_bins = self.audio_encoder.as_ref()
-                    .map(|e| e.architecture.num_mel_bins())
-                    .unwrap_or(128);
+                let architecture = self.audio_encoder.as_ref()
+                    .map(|e| e.architecture)
+                    .unwrap_or(crate::backends::audio::AudioArchitecture::GemmaConformer);
+                let num_mel_bins = architecture.num_mel_bins();
                 let loaded = if let Some(ref path_str) = active_path {
-                    match crate::backends::audio::load_audio(Path::new(path_str), &dev, num_mel_bins) {
+                    match crate::backends::audio::load_audio(Path::new(path_str), &dev, architecture) {
                         Ok(t) => t.to_dtype(audio_dtype)?,
                         Err(e) => {
                             tracing::warn!("Failed to load audio from {path_str}: {e}, using zeros");
