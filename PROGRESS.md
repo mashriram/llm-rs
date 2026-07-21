@@ -32,8 +32,15 @@ fixed a real, model-agnostic multimodal magnitude bug (Gemma's
 never see it), and extended the KV-history-cache fast path to also cover
 quantized (Q8/Q4, Hadamard-rotated) KV, verified bit-identical to the
 old slow path. Multimodal output is measurably less broken but **still
-not coherent** - reported honestly as partial progress, not a fix. See
-"v5"'s final update. Not yet merged to master.
+not coherent** - reported honestly as partial progress, not a fix. Then
+did a full, dedicated audit of both remaining gaps (audio Conformer via
+a focused subagent review, Qwen2-VL vision directly): found and removed
+one more real, unjustified constant in the audio attention math
+(verified no regression, real behavior change, still not coherent), and
+documented several more suspected-but-unverifiable issues precisely
+rather than guessing at fixes for them. See CHANGELOG's "part 5" entry
+for the full audit writeup - it's the most complete account. Not yet
+merged to master.
 
 ## v5 — Real GPU-throughput investigation + AWQ/GPTQ loaders, 2026-07-20
 

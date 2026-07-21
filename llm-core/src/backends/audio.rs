@@ -488,9 +488,21 @@ impl AudioEncoder {
         let q_reshaped = q.reshape((batch_size, seq_len, num_heads, head_dim))?;
         let q_scaled = q_reshaped.broadcast_mul(&q_scale_factor)?;
 
-        let k_scale = (1.0f64 + std::f64::consts::E).ln() / 2.0f64.ln();
+        // NOTE: a fixed K-side multiplier `ln(1+e)/ln(2) ~= 1.894` (softplus(1.0)
+        // over ln(2)) previously lived here, applied uniformly to every key
+        // vector. Unlike `q_scale` above (`1/softplus(0) = head_dim^-0.5/ln(2)`,
+        // a documented Google Conformer/USM "PerDimScale" trick chosen so a
+        // *learned*, zero-initialized `per_dim_scale` reduces to plain
+        // scaled-dot-product attention at init), no reference for this
+        // architecture defines an analogous fixed or learned K-side scale, and
+        // no `k_per_dim_scale` weight is loaded anywhere in this file. Audited
+        // and could not find a principled derivation for "softplus evaluated at
+        // 1.0" in this family of attention formulas - removed rather than kept
+        // un-justified or replaced with another guess. If a future reference
+        // implementation confirms a real K-side scale value, restore it here
+        // with a citation.
         let k_reshaped = k.reshape((batch_size, seq_len, num_heads, head_dim))?;
-        let k_scaled = (k_reshaped * k_scale)?;
+        let k_scaled = k_reshaped;
         let v_reshaped = v.reshape((batch_size, seq_len, num_heads, head_dim))?;
 
         // convert to block/context

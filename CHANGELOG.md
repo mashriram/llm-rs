@@ -1,5 +1,128 @@
 # Changelog
 
+## v2026.7.20 (part 5) — full audio/vision multimodal correctness audit
+
+A dedicated audit pass on the two remaining open multimodal correctness
+gaps (Gemma-4 audio Conformer incoherence; Qwen2-VL vision incoherence),
+requested explicitly after part 4 fixed the `embed_scale` bug without
+fully solving either. Audio was audited via a focused subagent review
+against known Gemma3n/Google Conformer/USM lineage conventions (no
+internet or Python reference available in this environment); vision was
+audited directly. Documenting everything found - fixed, suspected-but-
+not-fixed, and confirmed-correct - per an explicit request for full
+honesty rather than a partial or rosy account.
+
+### Fixed
+- **Unjustified K-side attention scale removed** (`llm-core/src/backends/
+  audio.rs`, Gemma Conformer's `forward_conformer_block`): a fixed
+  multiplier `ln(1+e)/ln(2) ≈ 1.894` was applied to every key vector
+  before attention. The analogous Q-side scale (`head_dim^-0.5/ln(2)`,
+  combined with a *learned*, zero-initialized `per_dim_scale` weight) is
+  a documented Google Conformer/USM "PerDimScale" trick - chosen
+  specifically so the learned scale reduces to plain scaled-dot-product
+  attention at initialization. No reference for this architecture
+  defines an analogous K-side scale (learned or fixed), and no
+  `k_per_dim_scale` weight is loaded anywhere in this codebase. Audited
+  and found no principled derivation for "softplus evaluated at 1.0" in
+  this family of formulas - most likely a garbled/misattributed constant
+  from translation. Removed rather than replaced with another guess (no
+  reference available to derive a correct replacement value, if any is
+  even needed). Verified no regression: full test suite (101+94 tests)
+  and `hardware_check.sh` still pass, Gemma-4 text-only output is
+  bit-identical. **Real behavior change on audio input** (different
+  garbled output than before), consistent with the removed multiplier
+  being real, but **audio output is still not coherent** - see below.
+
+### Audited, found suspicious, deliberately NOT fixed (would require a reference implementation to verify)
+Each of these was a real candidate for "the actual bug," but fixing any
+of them means guessing a replacement formula/constant with no way to
+confirm it's more correct than what's there now - which would violate
+this project's "no silent, unverified claims" principle just as much as
+leaving a known bug unfixed silently would. Flagging all of them
+precisely instead:
+- **SSCP conv-subsample normalization may use the wrong norm type.**
+  `encode_conformer`'s two subsampling stages (`llm-core/src/backends/
+  audio.rs` ~lines 328-345) use a plain per-frame `LayerNorm`. Gemma3n's
+  real audio front-end (`Gemma3nAudioSSCPConvBlock`) is recalled to use a
+  **cumulative group norm** (causally-accumulated statistics over the
+  time axis, not independent per-frame normalization) - a streaming-
+  friendly norm distinct from a fixed LayerNorm. If so, every frame's
+  normalization would be systematically wrong (worse for early frames) -
+  plausibly a major contributor to the incoherence. Channel dimensions
+  (128 then 32) are confirmed correct; only the normalization *type* is
+  in question.
+- **Whisper-specific mel-spectrogram normalization may not apply to
+  Gemma.** `load_audio` (same file, ~lines 1003-1010) applies Whisper's
+  documented `log_max - 8.0` clip + `(v+4)/4` rescale as one shared
+  function for BOTH the `Whisper` and `GemmaConformer` architectures
+  (differentiated only by mel-bin count, 80 vs 128). No confirmation
+  exists that Gemma3n's own feature extractor uses this exact Whisper
+  convention rather than a different one (raw log-mel, different
+  clip/rescale constants, etc.) - the fact this normalization is generic/
+  shared rather than architecture-specific is itself a signal it may
+  have been assumed rather than verified when written.
+- **`rel_shift`'s pad/reshape/narrow skew trick and the
+  `queries`/`keys`/`matrix_ac`/`matrix_bd` permute chains** (relative
+  positional attention, ~lines 512-524 and 730-738): structurally match
+  the well-known Transformer-XL/Music-Transformer relative-attention
+  "skew" algorithm and produce plausible shapes throughout, but this is
+  exactly the class of bug (valid shape, wrong semantic axis) that needs
+  numeric comparison against a real forward pass to rule out - not
+  achievable without a reference implementation.
+- `extract_block_context` silently ignores its own `max_past_horizon`/
+  `max_future_horizon` parameters (ranged, prefixed `_`, only
+  `chunk_size`/`context_size` actually drive the window) - currently
+  harmless only because `max_future_horizon == 0` in the hardcoded
+  config, but not a general implementation of what its name promises.
+  Flagged as a code-quality issue, not fixed (no behavior change today).
+
+### Confirmed correct (audited, no longer worth re-reviewing)
+- `chunk_size=12`/`max_past_horizon=12`/`max_future_horizon=0`/
+  `context_size=24` are self-consistent and match Gemma3n's recalled
+  `conf_attention_context_left=13` convention.
+- The Q-side "PerDimScale" formula itself (distinct from the removed
+  K-side one above).
+- `grad_clip`, `softcap=50.0`, residual weight `0.5` are plausible/
+  consistent Gemma-Conformer hyperparameters.
+- The shared `rms_norm` free function correctly omits Gemma's HF-only
+  `(1+weight)` convention, consistent with `attention.rs`'s documented
+  GGUF-already-bakes-in-the-+1 rule - this encoder's tensors come from
+  the same native-GGUF export path as the main LLM.
+- `num_mel_bins` is correctly differentiated per architecture (128
+  Gemma / 80 Whisper), not blindly shared like the normalization above.
+- Conv-subsample channel dimensions are internally consistent with their
+  LayerNorm bias tensor sizes at every stage.
+
+### Qwen2-VL vision: confirmed, not newly fixed
+Re-confirmed by direct code reading (`llm-core/src/backends/vision.rs`
+~lines 195-251): there is **no rotary position embedding implementation
+at all** for the vision transformer. Qwen2-VL ships no absolute
+`vision.pos_embed.weight` tensor (it relies entirely on 2D RoPE instead),
+so patches currently get **zero positional information** in
+self-attention - the transformer sees an unordered set of patches, not a
+grid. This matches the previously-documented gap exactly (see "v3").
+Deliberately not implemented this pass: real Qwen2-VL 2D vision RoPE
+requires replicating its exact rotary-frequency/patch-grid convention
+(including the patch-window reordering interaction with `spatial_merge`)
+with no reference available to verify a from-scratch implementation
+against - the risk of a "looks plausible, still wrong" implementation
+giving false confidence was judged worse than leaving this as a clearly
+documented, known-missing feature. `spatial_merge`'s post-hoc grid
+reshape/permute (raster-order patches, ~lines 454-466) was checked and
+is internally consistent with how patches are laid out earlier in the
+same function - not itself a bug, just working around the missing RoPE
+rather than depending on it.
+
+### Honest bottom line
+Neither Gemma-4 audio nor Qwen2-VL vision produces coherent output as of
+this commit. Real progress was made (the `embed_scale` fix in part 4,
+the K-scale removal here), verified with no regressions each time - but
+"still broken, differently" is the accurate status, not "fixed." The
+next actionable step for either would require a Python/HF reference
+implementation to run side-by-side (not available in this environment)
+to numerically confirm or rule out the suspected items above, rather
+than another round of plausible-looking guesses.
+
 ## v2026.7.20 (part 4) — multimodal embed_scale fix + quantized-KV cache extension
 
 ### Fixed
