@@ -24,7 +24,10 @@ bit-identical output before/after), plus first-pass AWQ/GPTQ safetensors
 loaders (dequantize-at-load-time, correctness-first, numerically
 **unverified** — needs the GPU machine and a Python reference to confirm).
 See "v5" below and `quant-performance-plan.md` for the full plan and
-honest status. Not yet merged to master.
+honest status. Re-ran the llama.cpp comparison and multimodal (vision +
+audio, Gemma-4 and Qwen2-VL) tests after that work to confirm the fix
+holds and nothing regressed — see "v5" update below. Not yet merged to
+master.
 
 ## v5 — Real GPU-throughput investigation + AWQ/GPTQ loaders, 2026-07-20
 
@@ -131,6 +134,68 @@ Cannot be built or tested end-to-end in this environment at all (no
 `nvcc`, no NVIDIA GPU, and no local AWQ/GPTQ model on disk to load) -
 this is scaffolding for the GPU machine to build on, exactly like the
 CUDA-path work documented in "v4".
+
+### Re-run: llama.cpp comparison (steady state) + real multimodal re-check
+Re-ran everything after the KV-cache fix + AWQ/GPTQ loaders landed, to
+confirm the numbers hold and nothing regressed - including on Gemma-4
+specifically, since that's this project's own primary target
+architecture.
+
+**llama.cpp vs llm-rs, steady state** (same `SmolLM3-3B-Q4_K_M.gguf`,
+same M4 Pro; first-run numbers are consistently an outlier on this
+machine - warm/repeated runs are the representative figures):
+
+| | Prefill | Decode |
+|---|---|---|
+| llama.cpp, Metal | ~588 t/s | ~57 t/s |
+| llama.cpp, CPU-only | ~57 t/s | ~22 t/s |
+| llm-rs, Metal | ~430 t/s | ~31 t/s |
+| llm-rs, CPU-forced | ~29 t/s | ~9.9 t/s |
+
+llm-rs Metal is now ~1.4x slower on prefill and ~1.8x slower on decode
+than llama.cpp on this machine (was ~2.4x / ~2.9x before the KV-cache
+fix) - real, repeated-run-confirmed improvement, though both engines'
+absolute numbers vary run-to-run on this machine (thermal/system state),
+so treat the ratio as the meaningful comparison, not either single
+number in isolation.
+
+**Multimodal re-check, with actual coherence checked (not just
+crash-free)**: fed a real solid-color test image (clear expected answer:
+"red") to both vision-capable models, and a real WAV tone to Gemma-4's
+audio path, via `chat`'s `/image`/`/audio` commands:
+- **Gemma-4 vision**: ran without crashing, but output is **not
+  coherent** ("covering this / word / ing this / ing this ..." -
+  repetitive, non-answering degenerate text).
+- **Gemma-4 audio**: same - ran without crashing, output not coherent
+  (repetitive tokens, some stray non-English tokens - consistent with a
+  confused model given a pure sine tone with no linguistic content, but
+  still not a real answer).
+- **Qwen2-VL vision**: also ran without crashing, output not coherent
+  (near-nonsense token soup) - consistent with its already-documented
+  missing 2D vision RoPE.
+- **Gemma-4 TEXT-ONLY generation (no image/audio), same session**: fully
+  coherent - "The capital of France is **Paris**." This isolates the
+  problem precisely: the core engine (including today's KV-cache fix) is
+  correct; the incoherence is specific to the vision/audio embedding-
+  splice path, not a general regression.
+- **Verified this is pre-existing, not a regression from today's
+  KV-cache change**: built a `git worktree` at the commit immediately
+  before that fix (`a7f2887`) and ran the identical Gemma-4 vision prompt
+  against it - it also produced incoherent (different, but equally
+  non-answering) output. This matches what "v3" already documented
+  ("output is not yet fully coherent for either" [vision or audio]) -
+  today's testing re-confirms that gap still exists with a real
+  descriptive prompt (stronger than the earlier crash-only smoke test),
+  but does not newly introduce or worsen it.
+
+**Honest status**: vision/audio pipelines run end-to-end without
+crashing on real files, on real production-family models, and don't
+corrupt unrelated text/audio-only requests (fixed earlier this branch) -
+but neither produces a *correct* answer yet. This is real, open,
+pre-existing work, distinct from anything fixed in this session - the
+root cause (encoder correctness? projector correctness? something in the
+splice/positional-encoding path?) is not yet isolated for Gemma-4
+specifically (Qwen2-VL's cause - missing 2D RoPE - is already known).
 
 ## v4 — Re-verification of GPU/CPU-machine fixes on this Mac, 2026-07-20
 Commit `c7ece93` (authored on a separate CUDA/CPU machine) added an

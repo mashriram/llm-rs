@@ -1,5 +1,32 @@
 # Changelog
 
+## v2026.7.20 (part 3) — re-verification: llama.cpp comparison + multimodal coherence check
+
+No code changes - a verification pass on part 2's work, requested
+explicitly to confirm the numbers hold and that Gemma-4/multimodal still
+work after the KV-cache fix.
+
+- **llama.cpp comparison, steady state** (repeated runs, not just the
+  first/outlier one): llm-rs Metal is ~1.4x slower on prefill and ~1.8x
+  slower on decode than llama.cpp on this machine (same GGUF file/
+  hardware) - down from ~2.4x/~2.9x before the KV-cache fix. See
+  PROGRESS.md "v5" for the full numbers table.
+- **Multimodal coherence re-checked with real prompts** (not just "did it
+  crash"): fed a real test image to Gemma-4 and Qwen2-VL, and a real WAV
+  tone to Gemma-4's audio path. Both vision models and the audio path run
+  end-to-end without crashing, but produce **incoherent output** -
+  confirmed this is a pre-existing gap (already noted in "v3"), not a
+  regression from today's KV-cache change, by A/B testing the identical
+  prompt against a `git worktree` build of the commit immediately before
+  that fix (also incoherent, differently). Gemma-4's plain text-only
+  generation in the same session is fully coherent ("The capital of
+  France is **Paris**."), isolating the problem to the vision/audio
+  splice path specifically, not the core engine.
+- **CHANGELOG completeness pass**: added a missing entry for
+  `scripts/hardware_check.sh` and the `llm-cluster` recovery-log fix
+  (commit `e40e351`), which had no CHANGELOG entry despite being
+  committed and documented in PROGRESS.md.
+
 ## v2026.7.20 (part 2) — decode-speed fix + first-pass AWQ/GPTQ loaders
 
 Prompted by a real, measured comparison against llama.cpp (installed on
@@ -39,6 +66,34 @@ same GGUF file/hardware.
   dequant at load time trades away AWQ/GPTQ's memory savings and speed
   advantage for simplicity; real throughput needs a tensor-core kernel
   (Marlin-class), not attempted here. See `quant-performance-plan.md`.
+
+## v2026.7.19 (branch, unreleased) — phase 2b: end-to-end hardware verification script
+
+### Added
+- **`scripts/hardware_check.sh`**: a single, portable smoke-test script for
+  any machine (CPU/CUDA/Metal/Raspberry Pi/generic Linux ARM). Auto-detects
+  the platform and picks the right cargo feature flags, builds, runs `llm
+  devices` to confirm hardware detection, runs a real text-generation
+  correctness check (not just "did it crash"), optional vision/audio smoke
+  tests (auto-generating a synthetic PNG via pure-stdlib zlib/struct and a
+  synthetic WAV tone if none are supplied), and a real two-process
+  `llm-cluster` networking + kill-detection test. `--check-mobile` prints an
+  honest "not implemented, here's what it needs" report instead of faking a
+  result for Android/iOS, which doesn't exist yet. Verified with a full real
+  run on this machine (release/Metal): all 7 checks (build, hardware
+  detection, text, vision, audio, cluster registration, cluster failure
+  detection) pass.
+
+### Fixed
+- **`llm-cluster/src/recovery.rs`**: `ClusterHealthMonitor::check_failures`
+  logged "Triggering Pause-Replicate-Retry" on a node failure - false; only
+  eviction from the active-node roster happens, no re-partitioning or
+  re-prefill is implemented anywhere. Found while wiring up the cluster
+  step of the new script (the check first failed silently because
+  `RUST_LOG` wasn't set, then once fixed, the log message itself turned out
+  to be lying about what had actually happened). Logging a recovery action
+  that didn't happen is exactly the kind of silent-seeming-success this
+  project's rules forbid - message now just reports the failure honestly.
 
 ## v2026.7.20 — Multimodal Stabilization, Explicit Projectors & Multi-GPU VRAM Auto-Selection
 
