@@ -385,6 +385,17 @@ pub struct CandleBackend {
     /// avoids recomputing an architecture-constant tensor that was already
     /// being redundantly rebuilt.
     inv_freq_cache: Mutex<HashMap<(usize, u32), Tensor>>,
+    /// Same class of bug/fix as `inv_freq_cache`, found while auditing KV-
+    /// cache quantization specifically: `generate_hadamard_orthogonal(d)`
+    /// (the rotation matrix applied to Q/K/V before Q8/Q4 KV quantization,
+    /// so quantization error is spread evenly across dimensions rather than
+    /// concentrated on a few large-magnitude ones) is a pure function of
+    /// `head_dim` - an architecture constant - but was rebuilt (host
+    /// `Vec<f32>` construction + fresh device tensor upload) on every single
+    /// `PagedAttention` call when quantized KV is active. Cached the same
+    /// way, keyed by `(head_dim, dtype)` since the tensor is cast to the
+    /// caller's compute dtype before being cached.
+    hadamard_cache: Mutex<HashMap<(usize, DType), Tensor>>,
 }
 
 
@@ -434,6 +445,7 @@ impl CandleBackend {
             custom_mmproj_path: None,
             qmatmul_cache: Mutex::new(HashMap::new()),
             inv_freq_cache: Mutex::new(HashMap::new()),
+            hadamard_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -456,6 +468,21 @@ impl CandleBackend {
         let inv_freq = crate::backends::attention::build_inv_freq(half_dim, head_dim, rope_theta, device)?;
         self.inv_freq_cache.lock().insert(key, inv_freq.clone());
         Ok(inv_freq)
+    }
+
+    /// Cached lookup for the Hadamard rotation matrix applied before Q8/Q4
+    /// KV quantization - see `hadamard_cache`'s doc comment for why this is
+    /// safe to cache (pure function of `head_dim`, an architecture
+    /// constant, cast to a fixed compute dtype).
+    fn get_hadamard(&self, head_dim: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+        let key = (head_dim, dtype);
+        if let Some(cached) = self.hadamard_cache.lock().get(&key) {
+            return Ok(cached.clone());
+        }
+        let r_vec = generate_hadamard_orthogonal(head_dim);
+        let r_tensor = Tensor::from_vec(r_vec, (head_dim, head_dim), device)?.to_dtype(dtype)?;
+        self.hadamard_cache.lock().insert(key, r_tensor.clone());
+        Ok(r_tensor)
     }
 
     /// Set an explicit custom mmproj path for vision/audio encoders.
@@ -1851,8 +1878,7 @@ impl LlmBackend for CandleBackend {
 
                     let is_quantized = self.kv_config.dtype == KvDtype::Q8 || self.kv_config.dtype == KvDtype::Q4;
                     let r_tensor = if is_quantized {
-                        let r_vec = generate_hadamard_orthogonal(head_dim);
-                        Some(Tensor::from_vec(r_vec, (head_dim, head_dim), q_dev)?.to_dtype(q_4d.dtype())?)
+                        Some(self.get_hadamard(head_dim, q_4d.dtype(), q_dev)?)
                     } else {
                         None
                     };
