@@ -59,11 +59,32 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
     let rms_norm_eps = val.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-5) as f32;
     let tie_word_embeddings = val.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false);
     // Matches candle.rs's GGUF-metadata activation detection: substring match
-    // so variants like "gelu_new"/"gelu_pytorch_tanh" still resolve to GeLU
-    // rather than silently falling through to SiLU.
+    // so variants like "gelu_new"/"gelu_pytorch_tanh" still resolve to GeLU,
+    // and "silu"/"swish" (the same function under two names, both common in
+    // real HF configs) resolve to SiLU explicitly.
+    //
+    // Anything else - a genuinely missing `hidden_act` field, or a real but
+    // unrecognized value like "relu"/"geglu"/"swiglu" - used to silently
+    // fall through to SiLU. SiLU-gated and e.g. ReLU MLPs compute different
+    // math, not just a different nonlinearity curve, so guessing wrong here
+    // produces numerically wrong output with no warning - exactly the class
+    // of bug this codebase's "no silent fallback" rule (see the unknown-
+    // GGML-quant-type and missing-architecture-metadata bails elsewhere in
+    // this file/candle.rs) exists to prevent. Bail with a clear, actionable
+    // error instead.
     let hidden_act = match val.get("hidden_act").and_then(|v| v.as_str()) {
         Some(s) if s.contains("gelu") => HiddenAct::GeLU,
-        _ => HiddenAct::SiLU,
+        Some(s) if s.contains("silu") || s.contains("swish") => HiddenAct::SiLU,
+        Some(other) => return Err(anyhow!(
+            "config.json's hidden_act = \"{other}\" is not a recognized activation \
+             function (this codebase currently supports SiLU and GeLU variants only) - \
+             defaulting silently here would run the wrong MLP math with no warning"
+        )),
+        None => return Err(anyhow!(
+            "config.json is missing the hidden_act field - cannot determine this model's \
+             MLP activation function without guessing, which risks running the wrong MLP \
+             math silently"
+        )),
     };
 
     let no_rope_layers = if let Some(arr) = val.get("no_rope_layers").and_then(|v| v.as_array()) {
@@ -242,4 +263,64 @@ pub fn parse_config(path: &Path) -> Result<ModelMeta> {
         chat_template: None,  // Will be populated from tokenizer_config.json in candle.rs
         eos_token_str: if is_gemma { Some("<end_of_turn>".to_string()) } else { None },
     })
+}
+
+#[cfg(test)]
+mod hidden_act_tests {
+    use super::parse_config;
+    use crate::types::HiddenAct;
+    use std::io::Write;
+
+    fn write_config(dir: &std::path::Path, extra_hidden_act_line: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("llm_rs_hidden_act_test_{}_{}.json", std::process::id(), id));
+        let json = format!(
+            r#"{{
+                "vocab_size": 32000,
+                "hidden_size": 4096,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "intermediate_size": 11008
+                {extra_hidden_act_line}
+            }}"#
+        );
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(json.as_bytes()).unwrap();
+        path
+    }
+
+    /// A missing `hidden_act` must be a clear load-time error, not a silent
+    /// SiLU guess - see the doc comment on this field in `parse_config`.
+    #[test]
+    fn missing_hidden_act_is_an_error_not_a_silent_default() {
+        let path = write_config(&std::env::temp_dir(), "");
+        let err = parse_config(&path).unwrap_err();
+        assert!(err.to_string().contains("hidden_act"));
+    }
+
+    /// A real but unrecognized `hidden_act` value (this codebase only
+    /// supports SiLU/GeLU today) must also be a clear error, not silently
+    /// treated as SiLU.
+    #[test]
+    fn unrecognized_hidden_act_is_an_error_not_a_silent_default() {
+        let path = write_config(&std::env::temp_dir(), r#", "hidden_act": "relu""#);
+        let err = parse_config(&path).unwrap_err();
+        assert!(err.to_string().contains("relu"));
+    }
+
+    #[test]
+    fn silu_and_swish_both_resolve_to_silu() {
+        let path = write_config(&std::env::temp_dir(), r#", "hidden_act": "silu""#);
+        assert!(matches!(parse_config(&path).unwrap().hidden_act, HiddenAct::SiLU));
+        let path = write_config(&std::env::temp_dir(), r#", "hidden_act": "swish""#);
+        assert!(matches!(parse_config(&path).unwrap().hidden_act, HiddenAct::SiLU));
+    }
+
+    #[test]
+    fn gelu_variants_resolve_to_gelu() {
+        let path = write_config(&std::env::temp_dir(), r#", "hidden_act": "gelu_pytorch_tanh""#);
+        assert!(matches!(parse_config(&path).unwrap().hidden_act, HiddenAct::GeLU));
+    }
 }

@@ -174,7 +174,8 @@ fn write_dummy_config(path: &std::path::Path, vocab_size: usize) {
         "intermediate_size": 11008,
         "max_position_embeddings": 2048,
         "rope_theta": 10000.0,
-        "torch_dtype": "float16"
+        "torch_dtype": "float16",
+        "hidden_act": "silu"
     }}"#, vocab_size);
     std::fs::write(path, config_json).unwrap();
 }
@@ -236,6 +237,7 @@ fn test_gemma4_agnostic_metadata() {
         "intermediate_size": 4096,
         "max_position_embeddings": 131072,
         "rope_theta": 10000.0,
+        "hidden_act": "gelu_pytorch_tanh",
         "model_type": "gemma4_audio",
         "architectures": ["Gemma4ForConditionalGeneration"],
         "audio_config": {
@@ -494,6 +496,7 @@ fn test_smollm3_agnostic_metadata() {
         "intermediate_size": 5632,
         "max_position_embeddings": 8192,
         "rope_theta": 10000.0,
+        "hidden_act": "silu",
         "model_type": "smollm3_vl",
         "vision_config": {
             "hidden_size": 768,

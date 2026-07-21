@@ -206,7 +206,8 @@ fn write_dummy_config(path: &std::path::Path, vocab_size: usize, n_layers: usize
         "intermediate_size": 11008,
         "max_position_embeddings": 2048,
         "rope_theta": 10000.0,
-        "torch_dtype": "float16"
+        "torch_dtype": "float16",
+        "hidden_act": "silu"
     }}"#);
     std::fs::write(path, json).unwrap();
 }
