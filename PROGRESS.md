@@ -11,7 +11,46 @@ pass before this session. See "v3 — Model-agnostic/hardware-agnostic
 push" below for the full account, including a precise, honest breakdown
 of what's still open (CUDA/x86/Vulkan/mobile/Raspberry Pi/physical USB —
 none of which this environment can verify — and exactly what each would
-need). Not yet merged to master.
+need). A separate CUDA/CPU machine then applied more real-hardware fixes
+(explicit `--mmproj-path`, multi-GPU VRAM selection, vision bias-shape
+guards — see CHANGELOG's v2026.7.20 entry, commit `c7ece93`); those
+changes were re-verified end-to-end on this Mac (Metal + CPU) via
+`scripts/hardware_check.sh` with no regressions — see "v4" below. Not yet
+merged to master.
+
+## v4 — Re-verification of GPU/CPU-machine fixes on this Mac, 2026-07-20
+Commit `c7ece93` (authored on a separate CUDA/CPU machine) added an
+explicit `--mmproj-path` CLI flag, fixed a multi-GPU VRAM-selection bug
+in `query_nvidia_smi` (was always reading the first `nvidia-smi` line,
+which is wrong on dual-GPU laptops where line 1 can be an iGPU reporting
+0 free VRAM), fixed a vision patch-embed bias shape mismatch, added an
+`LLM_FORCE_CPU` override, and added CUDA-tensor-load-failure-falls-back-
+to-CPU handling plus a real bug fix in the VRAM-budget size estimate
+(dequantized tensors are F32 = 4 bytes/element, was calculating as if F16
+= 2 bytes/element, undercounting VRAM usage by 2x on CUDA).
+
+Reviewed the full diff and re-ran, on this machine (Apple Silicon):
+- `cargo build --release --features metal` and plain `cargo build
+  --release` (CPU-only, no feature flags) both compile clean.
+- `cargo test --workspace --exclude llm-py --features metal`: 94/94
+  passed, no regressions.
+- A real forced-CPU generation via the new `LLM_FORCE_CPU=1` env var
+  (bypassing Metal entirely) produced correct output ("The capital of
+  France is Paris.") — proves the CPU path specifically, not just that
+  it compiles.
+- Full `scripts/hardware_check.sh --release` run (build, hardware
+  detection, text generation, vision, audio, cluster registration,
+  cluster failure-detection): **all 7 checks pass** on Metal, same as
+  before this commit landed.
+
+**Honestly still true**: none of this verifies CUDA itself — no NVIDIA
+GPU or CUDA toolchain (`nvcc`) exists in this environment, so the CUDA-
+specific code paths (the VRAM-selection fix, the load-failure-falls-
+back-to-CPU path, the F32 size-estimate fix) were reviewed by reading the
+diff only, not executed. They are additive and gated behind
+`self.device.is_cuda()` / non-CPU-device checks, so they cannot affect
+the Metal/CPU paths that WERE verified above — but "reviewed, looks
+correct" is not the same claim as "ran on a CUDA GPU and confirmed."
 
 ## v3 — Model-agnostic / hardware-agnostic push, 2026-07-19
 
