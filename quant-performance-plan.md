@@ -96,9 +96,23 @@ is gone.
 Only pursue this once Phase 1 shows the gap is genuinely kernel-side, not
 Rust-side overhead that Phase 1.3 already fixed.
 
-- [ ] **2.1 — Check whether upgrading `candle-core`/`candle-nn` past the
+- [x] **2.1 — Check whether upgrading `candle-core`/`candle-nn` past the
   currently-pinned 0.9.2 (Cargo.toml: `candle-core = { version = "0.9" }`)
-  already closes some of the gap.** Candle 0.9.2 (released Jan 2026) does
+  already closes some of the gap.**
+  **DONE 2026-07-21 — tried, no measured benefit, reverted.** Bumped to
+  0.11.0, full workspace built clean (also transitively updated
+  `tokenizers` 0.22.2, `safetensors` 0.8.0), full test suite passed, and
+  SmolLM3 text-only output was bit-identical to 0.9.2. But 5 repeated
+  Metal decode benchmarks on the same prompt/model landed at ~22-28 t/s,
+  overlapping the 0.9.2 baseline's own noisy ~25-31 t/s range - no clear
+  win, and given this machine's real run-to-run variance (confirmed
+  repeatedly throughout this session), that's not enough signal to
+  justify the risk of a major dependency bump (larger diff surface,
+  unverified CUDA-path implications since this environment can't test
+  CUDA at all). Reverted `Cargo.toml`/`Cargo.lock` back to 0.9.2. If
+  revisited, do it with a CUDA-capable machine in the loop so the CUDA
+  side of the bump gets real signal too, not just Metal's inconclusive
+  result. Candle 0.9.2 (released Jan 2026) does
   postdate the big Metal matrix-*matrix* kernel fix (PR #2615, merged
   2025-07-18, ~6x prompt-processing speedup upstream) — so prefill should
   already reflect that. But 0.10.0 (2026-03-31) and 0.11.0 (2026-06-26) are
