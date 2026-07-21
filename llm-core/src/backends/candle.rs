@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail, Context};
 use candle_core::{Device, Tensor, DType, Module};
 use candle_core::quantized::QMatMul;
@@ -443,6 +444,27 @@ impl CandleBackend {
     /// Set pre-computed visual embeddings (called by the CLI before forward_pass).
     pub fn set_visual_embeddings(&self, embeds: Tensor) {
         *self.visual_embeddings.lock() = Some(embeds);
+    }
+}
+
+/// quant-performance-plan.md Phase 1.1: coarse per-operator-type bucket used
+/// by `forward_pass`'s `LLM_PROFILE_STEP` instrumentation. Buckets by what
+/// kind of work an operator represents (matmul-heavy, attention, norm, ...)
+/// rather than by exact `Operator` variant name, since several variants
+/// (Rope/RopeQ/RopeSkip, Softcap/Scale/TensorScale) are cheap and only
+/// meaningful in aggregate.
+fn profile_operator_category(op: &Operator) -> &'static str {
+    match op {
+        Operator::MatMul { .. } => "matmul",
+        Operator::PagedAttention { .. } => "attention",
+        Operator::RMSNorm { .. } => "norm",
+        Operator::Rope { .. } | Operator::RopeQ { .. } | Operator::RopeSkip { .. } => "rope",
+        Operator::Activation { .. } | Operator::Mul { .. } | Operator::Add { .. }
+        | Operator::Softcap { .. } | Operator::Scale { .. } | Operator::TensorScale { .. } => "elementwise",
+        Operator::Embed { .. } | Operator::PleInput { .. } | Operator::PleLayer { .. } => "embed_ple",
+        Operator::VisualEmbed { .. } | Operator::SpliceTensors { .. }
+        | Operator::AudioEmbed { .. } | Operator::SpliceAudioTensors { .. }
+        | Operator::DeepStackFuse { .. } => "multimodal",
     }
 }
 
@@ -1416,6 +1438,18 @@ impl LlmBackend for CandleBackend {
     }
 
     fn forward_pass(&self, batch: &BatchInput) -> Result<BatchOutput> {
+        // quant-performance-plan.md Phase 1.1: coarse wall-clock breakdown of
+        // one forward_pass call (covers both prefill and decode - they share
+        // this same code path, see the packed-batch comment below), gated
+        // behind an env var so this instrumentation carries zero cost by
+        // default. Buckets operator execution time by category rather than
+        // timing every individual `Operator` variant, since that would mean
+        // invasively wrapping every match arm; this still answers Phase 1.1's
+        // question ("what fraction of a step is kernel time vs everything
+        // else") without changing any actual execution logic.
+        let profile_step = std::env::var("LLM_PROFILE_STEP").is_ok();
+        let profile_t_entry = Instant::now();
+        let mut profile_stage_times: HashMap<&'static str, Duration> = HashMap::new();
         if batch.seq_ids.is_empty() {
             return Err(anyhow!("empty batch: seq_ids is empty"));
         }
@@ -1595,8 +1629,14 @@ impl LlmBackend for CandleBackend {
             }
         }
 
+        if profile_step {
+            profile_stage_times.insert("00_setup_before_op_loop", profile_t_entry.elapsed());
+        }
+        let profile_t_op_loop_start = Instant::now();
+
         // Execute operators sequentially
         for (idx, op) in graph.ops.iter().enumerate() {
+            let profile_t_op_start = profile_step.then(Instant::now);
             /*
             if batch.seq_ids[0] == 1 && kv_cache.get_seq_len(batch.seq_ids[0]) == 0 {
                 use std::io::Write;
@@ -2481,7 +2521,10 @@ impl LlmBackend for CandleBackend {
                 }
             }
 
-
+            if let Some(t0) = profile_t_op_start {
+                let cat = profile_operator_category(op);
+                *profile_stage_times.entry(cat).or_insert(Duration::ZERO) += t0.elapsed();
+            }
 
             // Evict tensors that are no longer needed
             let mut to_remove = Vec::new();
@@ -2494,6 +2537,11 @@ impl LlmBackend for CandleBackend {
                 ctx.remove(&key);
             }
         }
+
+        if profile_step {
+            profile_stage_times.insert("01_op_loop_total", profile_t_op_loop_start.elapsed());
+        }
+        let profile_t_post_loop_start = Instant::now();
 
         // Retrieve logits
         let logits = ctx.get("logits")?;
@@ -2547,6 +2595,24 @@ impl LlmBackend for CandleBackend {
 
             next_tokens.push(max_idx as TokenId);
             batch_logits.push(seq_logits);
+        }
+
+        if profile_step {
+            profile_stage_times.insert("02_post_loop_logits_argmax", profile_t_post_loop_start.elapsed());
+            let total = profile_t_entry.elapsed();
+            let mut rows: Vec<(&str, Duration)> = profile_stage_times.into_iter().collect();
+            rows.sort_by_key(|(name, _)| *name);
+            eprintln!(
+                "[LLM_PROFILE_STEP] seqs={} total_tokens={} total={:.3}ms",
+                num_seqs, total_tokens, total.as_secs_f64() * 1000.0
+            );
+            for (name, dur) in &rows {
+                eprintln!(
+                    "[LLM_PROFILE_STEP]   {name:<28} {:>8.3}ms ({:>5.1}%)",
+                    dur.as_secs_f64() * 1000.0,
+                    100.0 * dur.as_secs_f64() / total.as_secs_f64().max(1e-9)
+                );
+            }
         }
 
         Ok(BatchOutput {

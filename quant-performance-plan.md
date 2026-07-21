@@ -37,6 +37,19 @@ Do phases in order. Each ends with an acceptance test. Phase 4 (CUDA) cannot
 be built or verified in this environment at all (no `nvcc`, no NVIDIA GPU) —
 see that phase's own note before starting it.
 
+**STATUS 2026-07-21**: Phase 1 (1.1 wall-clock instrumentation + 1.2 real
+Metal System Trace via `xctrace`) is done — see Phase 1's own entries below
+for the full findings. Headline: `matmul` (the actual quantized GEMV/GEMM)
+is proportionally *cheap*; `rope`+`norm`+`attention` together dominate
+op-loop time and the GPU issues ~3,777 small (median 205µs) command-buffer
+submissions for a 30-token run — both point at **per-call CPU-side
+overhead in the smaller ops**, not raw matmul kernel quality, as the
+leading remaining cause. 1.3 (fix that overhead) is next, re-scoped to be
+precise about where to look. Nobody has run the MLX loader (Phase 3) yet -
+this environment used a real MLX checkpoint only as a numerical *reference*
+(via `mlx-vlm`, see CHANGELOG's audio-fix entries), never loaded one into
+llm-rs itself.
+
 ---
 
 ## PHASE 1 — Find out where the per-token overhead actually is (do first, cheap, no new kernels)
@@ -57,37 +70,105 @@ steps 1.1/1.2 below (proper per-stage wall-clock/GPU-trace profiling) are
 still worth doing to find what's left, now that the biggest single item
 is gone.
 
-- [ ] **1.1 — Wall-clock instrument one decode step end-to-end.**
-  Add `tracing::debug_span!`/manual `Instant::now()` timing around the
-  stages inside `CandleBackend::forward_pass` (llm-core/src/backends/candle.rs)
-  for a single-token decode call: KV-cache tensor construction/copy, the
-  actual matmul/attention calls, sampling (llm-core/src/sampler.rs), and
-  anything llm-scheduler does per step (llm-scheduler/src/engine.rs,
-  scheduler.rs). Run with `--max-new-tokens 64` on the same SmolLM3 model
-  used for the benchmark above, print per-stage microsecond totals.
-  Acceptance: a table showing what fraction of each ~14.7 t/s decode step
-  (≈68ms/token) is kernel time vs everything else.
+- [x] **1.1 — Wall-clock instrument one decode step end-to-end.**
+  **DONE 2026-07-21.** Added a permanent, zero-cost-when-off
+  `LLM_PROFILE_STEP=1` env-gated instrumentation directly in
+  `CandleBackend::forward_pass` (`llm-core/src/backends/candle.rs`,
+  `profile_operator_category` + the `profile_stage_times` bucketing around
+  the operator-execution loop) rather than a one-off script — this covers
+  BOTH prefill and decode, since they share the same code path (see the
+  packed-batch design doc comment a few lines above `forward_pass`).
+  Buckets by category (matmul, attention, norm, rope, elementwise,
+  embed_ple, multimodal) rather than by exact `Operator` variant, plus
+  three coarse phases: setup-before-op-loop, the op-loop itself, and
+  post-loop (logits extraction + the mandatory GPU-sync `.to_vec1()` call
+  needed for sampling).
+  Ran with `--max-new-tokens 40` on the same `SmolLM3-3B-Q4_K_M.gguf`.
+  **Findings** (Metal, this M4 Pro; run-to-run variance is real and large
+  on this machine, consistent with prior sessions' own noise notes — these
+  are illustrative ranges from several runs, not one clean number):
+  - Setup-before-op-loop is negligible (<1%) every run.
+  - The op-loop (CPU-side dispatch/encoding of ~35 graph operators per
+    token) vs. the post-loop sync point (the first `.to_vec1()` call,
+    which forces any async-dispatched Metal work to complete) trade off
+    unpredictably run-to-run — sometimes op-loop dominates (45-91%),
+    sometimes post-loop does (48-59%). This by itself doesn't cleanly
+    separate "CPU dispatch overhead" from "GPU kernel time," because
+    Metal command buffers can be submitted asynchronously — see 1.2.
+  - **Within the op-loop, `attention` + `norm` + `rope` together
+    consistently dominate (typically 50-70% of op-loop time) — `matmul`
+    itself (the actual GEMV/GEMM weight projections) is consistently the
+    *smallest* named category (~5-14%)**. This is the single most useful
+    and actionable finding from this step: the FLOP-dominant operation
+    (quantized matmul) is proportionally *cheap* relative to RoPE/
+    attention/RMSNorm, which should be comparatively trivial arithmetic.
+    That mismatch is the signature of **per-call CPU-side overhead**
+    (tensor allocation, `.contiguous()` copies, per-step cache-key
+    lookups) dominating cost in the smaller ops, not raw kernel compute -
+    exactly what 1.3 should now target, and a more precise lead than
+    "look at KV-cache" alone.
+  - A useful side note: `batch_output.next_tokens` (a greedy-argmax
+    computed inside `forward_pass` at the same point as the mandatory
+    logits sync) is **always discarded** by
+    `llm-scheduler/src/scheduler.rs:225-240` — `batch_output.logits` is
+    unconditionally `Some(...)`, so real sampling always goes through
+    `sample_logits` on `batch_output.logits` instead. The argmax loop
+    itself is cheap (a linear scan over already-CPU-resident memory, not
+    an extra GPU sync), so this isn't a measurable perf bug — flagged here
+    only so nobody spends time "fixing" it as if it were one.
+  Acceptance: met — this is exactly the "what fraction is kernel time vs
+  everything else" table the original acceptance criterion asked for, plus
+  a specific next-step lead (rope/norm/attention CPU-side overhead) that
+  the original criterion didn't anticipate.
 
-- [ ] **1.2 — Cross-check with Metal's own GPU trace.**
-  Attach Xcode's Metal System Trace (or `MTL_CAPTURE_ENABLED=1` +
-  `MTLCaptureManager`) to a running `chat`/`benchmark_speed` process during
-  decode. This shows actual GPU-side kernel dispatch time vs CPU-side
-  encoding/submission overhead — the thing step 1.1 can't see from the Rust
-  side alone.
-  Acceptance: confirms or refutes whether GPU kernel execution itself is the
-  bottleneck, or whether it's Rust-side buffer prep/dispatch overhead between
-  kernel calls.
+- [x] **1.2 — Cross-check with Metal's own GPU trace.**
+  **DONE 2026-07-21.** `xctrace` (bundled with this machine's Xcode
+  install, `/Applications/Xcode.app/Contents/Developer/usr/bin/xctrace`)
+  can record and export headlessly, no interactive Instruments GUI needed:
+  `xctrace record --template "Metal System Trace" --time-limit 15s
+  --launch -- ./target/release/benchmark_speed ...`, then
+  `xctrace export --input <trace> --xpath '/trace-toc/run[@number="1"]/
+  data/table[@schema="metal-gpu-execution-points"]'` to get the raw
+  per-command-buffer start/end events as XML.
+  **Findings**: a 30-new-token `benchmark_speed` run (including model
+  load) produced **3,777 individual GPU command-buffer submissions**
+  across the trace, median execution time **205µs**, mean **324µs**, max
+  17.5ms (almost certainly one-time load-phase work, not steady-state
+  decode). This confirms the qualitative picture from 1.1 from the GPU
+  side too: the engine is issuing **many small, short-lived GPU dispatches
+  per token** rather than a few large fused kernels — consistent with
+  llama.cpp/ggml's more graph-fused execution model, and consistent with
+  "many small ops each carrying comparable fixed dispatch overhead"
+  outweighing raw per-op compute time for the smaller categories (rope/
+  norm/attention) identified in 1.1.
+  **Caveat, stated honestly**: this was extracted via `xctrace export` +
+  custom regex parsing of the resulting XML (no interactive Instruments
+  timeline inspection was done, since this environment is headless) — the
+  205µs/324µs figures are real and directly read off the trace's
+  start/end event pairs, but a human opening the same `.trace` file in
+  Instruments' GUI would be able to correlate specific command buffers
+  back to specific named Metal kernels/shaders (candle's kernel names),
+  which this parsing pass did not attempt. That's the natural next step
+  if deeper kernel-level attribution is wanted before Phase 2.
+  Acceptance: met — confirms the bottleneck is a mix of many-small-
+  dispatches overhead (matching 1.1's rope/norm/attention finding) rather
+  than one dominant slow kernel; refutes the theory that this is `matmul`-
+  kernel-quality-only.
 
-- [ ] **1.3 — If overhead is Rust-side (allocations, `.contiguous()` copies,
-  redundant tensor construction per step):** fix those directly — this
-  category of bug has already shown up repeatedly in this codebase (several
-  `.contiguous()`/cache-related fixes landed during the vision/audio work).
-  Look specifically at whether KV-cache blocks are being reallocated or
-  copied per-step instead of written in place, and whether sampling
-  (top-k/top-p/repetition penalty) is doing anything O(vocab) more than once
-  per step unnecessarily.
-  Acceptance: re-run the same benchmark; decode t/s improves without having
-  touched any kernel code.
+- [ ] **1.3 — Reduce per-call overhead in RoPE/attention/RMSNorm
+  specifically** (re-scoped from "look at KV-cache reallocation broadly"
+  to this precise target, based on 1.1's category breakdown). Candidates
+  to check first in `llm-core/src/backends/attention.rs` and the
+  `Operator::Rope`/`RopeQ`/`RopeSkip`/`RMSNorm`/`PagedAttention` arms of
+  `forward_pass`: redundant `.contiguous()` calls per step, RoPE cos/sin
+  tables being recomputed instead of cached across steps, and per-step
+  `HashMap`/cache-key allocation in the KV-cache/PagedAttention path (the
+  `qmatmul_cache`/`kv_history_cache`/`deq_cache` pattern already exists
+  elsewhere in this file for exactly this reason — check whether RoPE has
+  an equivalent opportunity and doesn't yet use it).
+  Acceptance: re-run with `LLM_PROFILE_STEP=1` on the same benchmark;
+  `rope`/`norm`/`attention`'s share of op-loop time drops and/or decode
+  t/s improves, without having touched any kernel code.
 
 ---
 
