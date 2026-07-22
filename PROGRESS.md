@@ -1,5 +1,103 @@
 # Progress
 
+## Qwen3.5 (Gated DeltaNet hybrid) — real, precisely-scoped future work, NOT implemented
+
+Researched thoroughly (not guessed) after being asked to make a real
+`unsloth/Qwen3.5-2B-GGUF` checkpoint work. Real ground truth found via
+`transformers` 5.14.1 (which ships `models/qwen3_5/modeling_qwen3_5.py`,
+2106 lines, real reference implementation) plus direct GGUF metadata/tensor
+inspection of the actual downloaded file. Recorded here precisely so the next
+attempt can implement directly instead of re-researching.
+
+**Architecture**: hybrid "Gated DeltaNet" (linear/SSM-style attention,
+matrix-valued per-head state updated via a delta rule) + periodic full
+attention, same family as Qwen3-Next. Confirmed via real GGUF metadata
+(`qwen35.full_attention_interval = 4`): layers where `(idx+1) % 4 == 0`
+(3, 7, 11, 15, 19, 23 of 24) are full attention; the rest (18 of 24) are
+Gated DeltaNet.
+
+**Confirmed absent from the Rust ecosystem**: `candle-transformers` (main
+branch, checked twice) has `mamba`/`mamba2`/`rwkv_v5/6/7`/`qwen3`/`qwen3_moe`/
+`qwen3_vl` but no Gated DeltaNet, Qwen3-Next, or Qwen3.5 anywhere. This has to
+be written from scratch, in this codebase's own `Operator`/graph idiom (not
+imported), same as every other operator already is — candle-transformers'
+per-architecture Rust structs don't plug into this project's shared
+`LlmBackend`/graph/scheduler design anyway (they're Candle-only, bypass the
+paged-KV scheduler). llama.cpp's own upstream `conversion/` package (checked
+directly on GitHub) also has no `qwen3_5.py`/gated-delta file — the
+`unsloth/Qwen3.5-2B-GGUF` checkpoint was produced by an unmerged fork, so
+there's no official reference GGUF-tensor-name mapping to check against
+either; the mapping below was derived from first principles (real shapes).
+
+**GatedDeltaNet tensor mapping** (verified: every GGUF tensor shape matches
+the HF module's shape computed from real config hyperparameters exactly, not
+guessed — see `blk.0` shapes below vs. `Qwen3_5GatedDeltaNet.__init__`):
+
+| GGUF tensor | HF parameter | Shape (candle `[out,in]` convention) |
+|---|---|---|
+| `attn_qkv.weight` | `in_proj_qkv.weight` | `[6144, 2048]` (hidden→key_dim\*2+value_dim) |
+| `attn_gate.weight` | `in_proj_z.weight` | `[2048, 2048]` (hidden→value_dim, the "z" gate for `RMSNormGated`) |
+| `ssm_alpha.weight` | `in_proj_a.weight` | `[16, 2048]` (hidden→num_v_heads) |
+| `ssm_beta.weight` | `in_proj_b.weight` | `[16, 2048]` (hidden→num_v_heads) |
+| `ssm_a` | `A_log` | `[16]` |
+| `ssm_dt.bias` | `dt_bias` | `[16]` |
+| `ssm_conv1d.weight` | `conv1d.weight.squeeze(1)` | `[6144, 4]` (channels, kernel — depthwise) |
+| `ssm_norm.weight` | `norm.weight` (`RMSNormGated`) | `[128]` (per head_v_dim, applied after reshape) |
+| `ssm_out.weight` | `out_proj.weight` | `[2048, 2048]` (value_dim→hidden) |
+
+Real GGUF metadata (source of truth, no need to re-derive from HF config):
+`qwen35.rope.dimension_count=64` (partial rotary — only 64 of 256 head_dims
+rotated), `qwen35.rope.freq_base=1e7`, `qwen35.attention.head_count=8`,
+`head_count_kv=2`, `key_length=value_length=256`,
+`qwen35.ssm.conv_kernel=4`, `inner_size=2048`, `state_size=128`,
+`group_count=16`, `qwen35.full_attention_interval=4`.
+
+**Recurrence** (per real `torch_recurrent_gated_delta_rule` in the reference
+— the sequential/decode-step formulation, not the parallel chunked one; the
+sequential form is the one to port first, correctness before throughput,
+matching this project's own established "MVP first" pattern): per head, a
+`(head_k_dim × head_v_dim)` state matrix `S` persists across steps (fixed
+size — NOT a growing KV cache, needs a genuinely new per-(seq_id, layer_idx)
+persistent-state store in `CandleBackend`, cleared in `clear_sequence`,
+architecturally distinct from `gpu_kv_cache`/`kv_history_cache`). Each step:
+`S = S * exp(g_t)` (decay), `kv_mem = S @ k_t`, `delta = beta_t * (v_t -
+kv_mem)`, `S = S + outer(k_t, delta)` (delta-rule write), output `= S @ q_t`.
+Where `g_t = -exp(A_log) * softplus(a_t + dt_bias)`, `beta_t = sigmoid(b_t)`,
+q/k get L2-normalized before use. Also needs a short causal-conv1d (kernel=4,
+depthwise, SiLU activation) applied to the fused q/k/v projection before the
+recurrence, with its own small persistent state (last 3 pre-conv steps).
+
+**Second, separate new mechanism needed for the full-attention layers (real,
+not assumed)**: `Qwen3_5Attention` is NOT this codebase's existing attention —
+`q_proj` outputs `2×` the expected width (`num_heads * head_dim * 2`), split
+into `query` and a `gate`; after attention, `attn_output = attn_output *
+sigmoid(gate)` before `o_proj`. Combined with partial rotary (only 64 of 256
+head_dims), this is real new plumbing even for the "already supported"
+attention mechanism, not just the SSM layers.
+
+**Open question, explicitly flagged, NOT resolved**: this codebase's
+existing RoPE (`rotate_interleaved` in `attention.rs`, confirmed correct
+adjacent-pair convention for every currently-supported architecture — see
+this session's own regression-and-revert earlier) may or may not be the
+right convention for this specific bespoke unsloth GGUF export — the
+reference Python implementation uses `rotate_half` (split-half) rotation,
+which is the *opposite* convention. Since no official llama.cpp conversion
+source exists to check against, this must be settled by real numerical
+verification (compare intermediate tensors against a live reference forward
+pass) before implementing, not assumed either way — guessing this exact
+thing wrong is the precise failure mode this session already found and fixed
+once today for a different model.
+
+**Decision**: deferred, not implemented, per explicit direction after seeing
+the real scope (two new mechanisms + new persistent-state type + an open,
+verification-required RoPE-convention question — realistically multi-day
+work). `Qwen3-4B-Instruct-2507` (standard dense architecture, already
+supported) used instead to verify a modern Qwen model generates coherent
+output on this hardware: real CUDA generation, greedy decode —
+`"The capital of France is Paris."` (37.56 t/s decode) — confirming this
+codebase's existing architecture support already covers modern, non-hybrid
+Qwen releases correctly on this GPU.
+
 ## Current task
 **2026-07-22 update**: Now running on real CUDA hardware for the first time
 (RTX 2000 Ada, 8GB VRAM) — see CHANGELOG's "part 10" entry for the full
