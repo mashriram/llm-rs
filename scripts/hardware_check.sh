@@ -243,7 +243,7 @@ TOKENIZER_JSON=""
 if [[ "$SKIP_DOWNLOAD" -eq 0 ]]; then
   log "Downloading a small test model into $MODEL_DIR (llm pull)..."
   PULL_LOG="$REPORT_DIR/pull.txt"
-  if "$PULL_BIN" "HuggingFaceTB/SmolLM2-135M-Instruct-GGUF" \
+  if "$PULL_BIN" "Qwen/Qwen2.5-0.5B-Instruct-GGUF" \
       --output-dir "$MODEL_DIR" > "$PULL_LOG" 2>&1; then
     step_pass "llm pull (text test model)"
   else
@@ -281,11 +281,7 @@ fi
 
 if [[ -n "$VISION_MODEL" && -n "$VISION_MMPROJ" ]]; then
   if [[ "$(dirname "$VISION_MODEL")" != "$(dirname "$VISION_MMPROJ")" ]]; then
-    log "WARNING: llm-rs auto-discovers the mmproj file from the SAME \
-directory as --model-path (see find_mmproj_path in candle.rs) — it is not \
-passed as a separate flag. $VISION_MMPROJ is in a different directory than \
-$VISION_MODEL, so it will NOT be picked up. Copy or symlink it alongside \
-the model file."
+    log "WARNING: mmproj discovery requires mmproj file in same directory as model file."
   fi
   if [[ -z "$VISION_IMAGE" ]]; then
     VISION_IMAGE="$REPORT_DIR/synthetic_test_image.png"
@@ -365,7 +361,7 @@ PY
     if printf '/audio %s What do you hear?\n/quit\n' "$AUDIO_FILE" | \
         "$CHAT_BIN" --model-path "$AUDIO_MODEL" --tokenizer-path "$TOKENIZER_JSON" \
         --max-new-tokens 32 > "$AUDIO_LOG" 2>&1; then
-      step_pass "audio smoke test (ran without crashing — NOT a correctness check, see PROGRESS.md)"
+      step_pass "audio smoke test - ran without crashing - see PROGRESS.md"
     else
       step_fail "audio smoke test — crashed, see $AUDIO_LOG"
     fi

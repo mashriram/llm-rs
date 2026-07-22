@@ -40,11 +40,11 @@ impl RawKvCache {
 ///
 /// When `is_gemma` is `true`, applies Gemma-style `(1 + weight)` scaling
 /// (for HuggingFace SafeTensors format only — GGUF Gemma weights are already
-/// stored without the +1 offset).
+/// stored without the +1 offset). Applied once here at construction (baked
+/// into `weight`) rather than on every `forward()` call.
 pub(crate) struct RmsNorm {
     weight: Tensor,
     eps: f64,
-    is_gemma: bool,
 }
 
 impl RmsNorm {
@@ -54,31 +54,27 @@ impl RmsNorm {
         } else {
             weight
         };
-        Self { weight: w_scaled, eps, is_gemma }
+        Self { weight: w_scaled, eps }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let orig_dtype = x.dtype();
         let w_len = self.weight.dim(0)?;
         let last_dim = x.dim(x.rank() - 1)?;
-
-        let w_scaled = if self.weight.dtype() != orig_dtype {
-            self.weight.to_dtype(orig_dtype)?
-        } else {
-            self.weight.clone()
-        };
+        let x_f32 = if orig_dtype == DType::F32 { x.clone() } else { x.to_dtype(DType::F32)? };
+        let w_f32 = if self.weight.dtype() == DType::F32 { self.weight.clone() } else { self.weight.to_dtype(DType::F32)? };
 
         // QK-Norm case: weight covers a head_dim slice but x has full concat dim.
         if last_dim != w_len && last_dim % w_len == 0 {
-            let rank = x.rank();
+            let rank = x_f32.rank();
             let reshaped = if rank == 3 {
-                let (b, s, _) = x.dims3()?;
+                let (b, s, _) = x_f32.dims3()?;
                 let h = last_dim / w_len;
-                x.reshape((b, s, h, w_len))?
+                x_f32.reshape((b, s, h, w_len))?
             } else if rank == 2 {
-                let (s, _) = x.dims2()?;
+                let (s, _) = x_f32.dims2()?;
                 let h = last_dim / w_len;
-                x.reshape((s, h, w_len))?
+                x_f32.reshape((s, h, w_len))?
             } else {
                 return Err(anyhow!("Unsupported rank {} in RmsNorm with QK reshaping", rank));
             };
@@ -86,20 +82,21 @@ impl RmsNorm {
             let variance = reshaped.sqr()?.mean_keepdim(reshaped.rank() - 1)?;
             let x_norm = reshaped.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
 
-            let out_reshaped = x_norm.broadcast_mul(&w_scaled)?;
-            let out = if rank == 3 {
+            let out_reshaped = x_norm.broadcast_mul(&w_f32)?;
+            let out_f32 = if rank == 3 {
                 let (b, s, _, _) = out_reshaped.dims4()?;
                 out_reshaped.reshape((b, s, last_dim))?
             } else {
                 let (s, _, _) = out_reshaped.dims3()?;
                 out_reshaped.reshape((s, last_dim))?
             };
-            Ok(out)
+            if orig_dtype == DType::F32 { Ok(out_f32) } else { Ok(out_f32.to_dtype(orig_dtype)?) }
         } else {
-            let variance = x.sqr()?.mean_keepdim(x.rank() - 1)?;
+            let variance = x_f32.sqr()?.mean_keepdim(x_f32.rank() - 1)?;
             let denom = (variance + self.eps)?.sqrt()?;
-            let x_norm = x.broadcast_div(&denom)?;
-            Ok(x_norm.broadcast_mul(&w_scaled)?)
+            let x_norm = x_f32.broadcast_div(&denom)?;
+            let out_f32 = x_norm.broadcast_mul(&w_f32)?;
+            if orig_dtype == DType::F32 { Ok(out_f32) } else { Ok(out_f32.to_dtype(orig_dtype)?) }
         }
     }
 }
@@ -149,54 +146,6 @@ pub(crate) fn apply_rope_q_with_cos_sin(
     }
     let (b_sz, seq_len, n_heads, head_dim) = q.dims4()?;
     rotate_interleaved(q, cos, sin, b_sz, seq_len, n_heads, head_dim)
-}
-
-/// Apply interleaved RoPE to both Q and K.
-pub(crate) fn apply_rope(
-    q: &Tensor,
-    k: &Tensor,
-    batch: &BatchInput,
-    kv_cache: &RawKvCache,
-    rope_theta: f32,
-    inv_freq: &Tensor,
-) -> Result<(Tensor, Tensor)> {
-    if rope_theta == 0.0 {
-        return Ok((q.clone(), k.clone()));
-    }
-    let dev = q.device();
-    let (b_sz, seq_len, n_heads, head_dim) = q.dims4()?;
-    let (_, _, n_kv_heads, _) = k.dims4()?;
-    let half_dim = head_dim / 2;
-
-    let (cos, sin) = build_cos_sin(b_sz, seq_len, batch, kv_cache, inv_freq, q.dtype(), dev)?;
-    let cos = cos.reshape((b_sz, seq_len, 1, half_dim, 1))?;
-    let sin = sin.reshape((b_sz, seq_len, 1, half_dim, 1))?;
-
-    let q_out = rotate_interleaved(q, &cos, &sin, b_sz, seq_len, n_heads, head_dim)?;
-    let k_out = rotate_interleaved(k, &cos, &sin, b_sz, seq_len, n_kv_heads, head_dim)?;
-    Ok((q_out, k_out))
-}
-
-/// Apply interleaved RoPE to Q only.
-pub(crate) fn apply_rope_q(
-    q: &Tensor,
-    batch: &BatchInput,
-    kv_cache: &RawKvCache,
-    rope_theta: f32,
-    inv_freq: &Tensor,
-) -> Result<Tensor> {
-    if rope_theta == 0.0 {
-        return Ok(q.clone());
-    }
-    let dev = q.device();
-    let (b_sz, seq_len, n_heads, head_dim) = q.dims4()?;
-    let half_dim = head_dim / 2;
-
-    let (cos, sin) = build_cos_sin(b_sz, seq_len, batch, kv_cache, inv_freq, q.dtype(), dev)?;
-    let cos = cos.reshape((b_sz, seq_len, 1, half_dim))?;
-    let sin = sin.reshape((b_sz, seq_len, 1, half_dim))?;
-
-    rotate_interleaved(q, &cos, &sin, b_sz, seq_len, n_heads, head_dim)
 }
 
 /// Build the inverse frequency vector: `1 / theta^(2i / head_dim)`. Pure
@@ -267,23 +216,36 @@ pub(crate) fn build_cos_sin(
 }
 
 /// Apply interleaved rotation to a Q or K tensor.
+///
+/// Weights stored in GGUF use an interleaved rotation layout where positions
+/// `(2i, 2i+1)` are rotated as a pair (as opposed to the "rotate-half"/NeoX
+/// convention, which splits the head dim into two contiguous blocks). This
+/// codebase's loaders never permute weights to the rotate-half layout, so
+/// this function must stay adjacent-pair — switching it to rotate-half
+/// without a matching weight permutation silently produces wrong attention
+/// math for every RoPE-using model on every backend.
+///
+/// `cos`/`sin` are `(b_sz, seq_len, 1, half_dim)`.
 fn rotate_interleaved(
     x: &Tensor,
     cos: &Tensor,
     sin: &Tensor,
-    _b_sz: usize,
-    _seq_len: usize,
-    _n_heads: usize,
+    b_sz: usize,
+    seq_len: usize,
+    n_heads: usize,
     head_dim: usize,
 ) -> Result<Tensor> {
     let half_dim = head_dim / 2;
-    let x1 = x.narrow(candle_core::D::Minus1, 0, half_dim)?;
-    let x2 = x.narrow(candle_core::D::Minus1, half_dim, half_dim)?;
-    let neg_x2 = x2.neg()?;
-    let rotate_x = Tensor::cat(&[&neg_x2, &x1], candle_core::D::Minus1)?;
-    let cos_cat = Tensor::cat(&[cos, cos], candle_core::D::Minus1)?;
-    let sin_cat = Tensor::cat(&[sin, sin], candle_core::D::Minus1)?;
-    Ok((x.broadcast_mul(&cos_cat)? + rotate_x.broadcast_mul(&sin_cat)?)?)
+    let x_reshaped = x.reshape((b_sz, seq_len, n_heads, half_dim, 2))?;
+    let x1 = x_reshaped.narrow(candle_core::D::Minus1, 0, 1)?;
+    let x2 = x_reshaped.narrow(candle_core::D::Minus1, 1, 1)?;
+
+    let cos = cos.reshape((b_sz, seq_len, 1, half_dim, 1))?;
+    let sin = sin.reshape((b_sz, seq_len, 1, half_dim, 1))?;
+
+    let out1 = (x1.broadcast_mul(&cos)? - x2.broadcast_mul(&sin)?)?;
+    let out2 = (x1.broadcast_mul(&sin)? + x2.broadcast_mul(&cos)?)?;
+    Ok(Tensor::cat(&[out1, out2], candle_core::D::Minus1)?.reshape((b_sz, seq_len, n_heads, head_dim))?)
 }
 
 // ---------------------------------------------------------------------------

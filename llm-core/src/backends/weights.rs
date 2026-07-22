@@ -140,21 +140,24 @@ impl<'a> WeightStore<'a> {
                 Ok(t)
             }
         }
-        // 5. Tied-embedding fallback: lm_head.weight → model.embed_tokens.weight
-        else if name == "lm_head.weight" {
-            let embed = "model.embed_tokens.weight";
-            if let Some(t) = self.weights.get(embed) {
-                let t = t.to_device(self.device)?;
-                local_cache.insert(name.to_string(), t.clone());
-                return Ok(t);
+        // 5. Tied-embedding & embedding alias fallback (exact match only — no
+        // fuzzy substring matching, which risks silently substituting the
+        // wrong tensor for architectures with similarly-named norm/proj weights).
+        else if name == "lm_head.weight" || name == "model.embed_tokens.weight" || name == "token_embd.weight" {
+            for candidate in &["token_embd.weight", "model.embed_tokens.weight", "lm_head.weight", "output.weight"] {
+                if let Some(t) = self.weights.get(*candidate) {
+                    let t = t.to_device(self.device)?;
+                    local_cache.insert(name.to_string(), t.clone());
+                    return Ok(t);
+                }
+                let cache = self.deq_cache.lock();
+                if let Some(t) = cache.get(*candidate) {
+                    let t = t.to_device(self.device)?;
+                    local_cache.insert(name.to_string(), t.clone());
+                    return Ok(t);
+                }
             }
-            let cache = self.deq_cache.lock();
-            if let Some(t) = cache.get(embed) {
-                let t = t.to_device(self.device)?;
-                local_cache.insert(name.to_string(), t.clone());
-                return Ok(t);
-            }
-            Err(anyhow!("Weight '{}' not found (tried tied-embedding alias '{}')", name, embed))
+            Err(anyhow!("Weight '{}' not found (tried embedding aliases 'token_embd.weight', 'model.embed_tokens.weight', 'lm_head.weight')", name))
         } else {
             Err(anyhow!("Weight '{}' not found", name))
         }

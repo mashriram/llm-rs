@@ -396,6 +396,7 @@ pub struct CandleBackend {
     /// way, keyed by `(head_dim, dtype)` since the tensor is cast to the
     /// caller's compute dtype before being cached.
     hadamard_cache: Mutex<HashMap<(usize, DType), Tensor>>,
+    causal_mask_cache: Mutex<HashMap<(usize, usize, DType), Tensor>>,
 }
 
 
@@ -450,7 +451,41 @@ impl CandleBackend {
             qmatmul_cache: Mutex::new(HashMap::new()),
             inv_freq_cache: Mutex::new(HashMap::new()),
             hadamard_cache: Mutex::new(HashMap::new()),
+            causal_mask_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Model-agnostic and hardware-agnostic causal mask caching to eliminate
+    /// per-layer host vector allocations and PCIe host-to-device transfers.
+    fn get_causal_mask(
+        &self,
+        num_tokens: usize,
+        total_seq_len: usize,
+        seq_len_before: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let key = (num_tokens, total_seq_len, dtype);
+        {
+            let cache = self.causal_mask_cache.lock();
+            if let Some(mask) = cache.get(&key) {
+                if mask.device().same_device(device) {
+                    return Ok(mask.clone());
+                }
+            }
+        }
+
+        let mut mask_vec = vec![0.0f32; num_tokens * total_seq_len];
+        for q_idx in 0..num_tokens {
+            for k_idx in 0..total_seq_len {
+                if k_idx > seq_len_before + q_idx {
+                    mask_vec[q_idx * total_seq_len + k_idx] = f32::NEG_INFINITY;
+                }
+            }
+        }
+        let mask = Tensor::from_vec(mask_vec, (1, num_tokens, total_seq_len), device)?.to_dtype(dtype)?;
+        self.causal_mask_cache.lock().insert(key, mask.clone());
+        Ok(mask)
     }
 
     /// Cached lookup for RoPE's `inv_freq` table - see `inv_freq_cache`'s
@@ -1534,12 +1569,12 @@ impl LlmBackend for CandleBackend {
                         } else {
                             // QMatMul requires a 2D matrix weight. If 1D or 3D+, keep in quantized_weights.
                             if qt.shape().dims().len() == 2 {
-                                match QMatMul::from_qtensor(qt) {
+                                match QMatMul::from_arc(std::sync::Arc::new(qt)) {
                                     Ok(qmatmul) => {
                                         local_qmatmul.insert(name.clone(), qmatmul);
                                     }
                                     Err(e) => {
-                                        tracing::warn!("QMatMul::from_qtensor failed for {}: {:?}", name, e);
+                                        tracing::warn!("QMatMul::from_arc failed for {}: {:?}", name, e);
                                     }
                                 }
                             } else {
@@ -1861,11 +1896,19 @@ impl LlmBackend for CandleBackend {
                     };
 
                     let out = if let Some(qmatmul) = qmatmul_opt {
-                        let in_t_f32 = in_t.to_dtype(DType::F32)?;
-                        // Keep output as f32 — do NOT downcast back to f16.
-                        // f16 overflows at ~65504; Qwen 2.5 residuals reach ~43k by layer 0
-                        // and easily overflow by layer 4, producing NaN that poisons all
-                        // subsequent layers. Staying in f32 costs 2x memory but is correct.
+                        let in_t_f32 = if in_t.dtype() != DType::F32 {
+                            in_t.to_dtype(DType::F32)?
+                        } else {
+                            in_t.clone()
+                        };
+                        // Keep output as f32 — do NOT downcast back to compute_dtype (f16 on
+                        // CUDA). f16 overflows at ~65504; Qwen 2.5 residuals reach ~43k by
+                        // layer 0 and easily overflow by layer 4, producing NaN that poisons
+                        // all subsequent layers. Staying in f32 costs 2x memory but is
+                        // correct. (Confirmed by reproducing this exact failure mode on real
+                        // CUDA hardware: a non-quantized F16 GGUF checkpoint degenerated into
+                        // repetitive garbage tokens with the downcast in place, and generated
+                        // correct output once removed.)
                         qmatmul.forward(&in_t_f32)?
                     } else {
                         let w_t = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
@@ -1886,7 +1929,7 @@ impl LlmBackend for CandleBackend {
                         // Auto-transpose: weight stored row-major [out_features, in_features]
                         let last_dim = in_t_aligned.dim(in_t_aligned.rank() - 1)?;
                         let w_t_final = if w_t_aligned.rank() == 2 && last_dim == w_t_aligned.dim(1)? {
-                            w_t_aligned.transpose(0, 1)?
+                            w_t_aligned.transpose(0, 1)?.contiguous()?
                         } else {
                             w_t_aligned
                         };
@@ -2276,15 +2319,7 @@ impl LlmBackend for CandleBackend {
                         let seq_len_before = total_seq_len - num_tokens;
 
                         let scores = if num_tokens > 1 {
-                            let mut mask_vec = vec![0.0f32; num_tokens * total_seq_len];
-                            for q_idx in 0..num_tokens {
-                                for k_idx in 0..total_seq_len {
-                                    if k_idx > seq_len_before + q_idx {
-                                        mask_vec[q_idx * total_seq_len + k_idx] = f32::NEG_INFINITY;
-                                    }
-                                }
-                            }
-                            let mask = Tensor::from_vec(mask_vec, (1, num_tokens, total_seq_len), q_dev)?.to_dtype(scores_scaled.dtype())?;
+                            let mask = self.get_causal_mask(num_tokens, total_seq_len, seq_len_before, scores_scaled.dtype(), q_dev)?;
                             scores_scaled.broadcast_add(&mask)?
                         } else {
                             scores_scaled

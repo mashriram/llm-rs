@@ -25,7 +25,7 @@ pub struct ServingEngine {
 impl ServingEngine {
     pub fn new(backend: Box<dyn LlmBackend>, block_pool_size: usize) -> Self {
         let (request_tx, request_rx) = unbounded_channel();
-        let (event_tx, _) = broadcast::channel(1024);
+        let (event_tx, _) = broadcast::channel(32768);
 
         let event_tx_clone = event_tx.clone();
         tokio::spawn(async move {

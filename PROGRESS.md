@@ -1,6 +1,28 @@
 # Progress
 
 ## Current task
+**2026-07-22 update**: Now running on real CUDA hardware for the first time
+(RTX 2000 Ada, 8GB VRAM) — see CHANGELOG's "part 10" entry for the full
+writeup. Summary: found and fixed real bugs in a local unpushed "v1-gpu" GPU
+work-in-progress (a RoPE convention regression, a lock-scope regression, a
+quantized-weight-cache-clearing regression, a fuzzy-tensor-matching
+regression — all reverted to correct behavior) plus one new bug only real
+CUDA testing could catch (a qmatmul F32→F16 downcast that reintroduced a
+previously-fixed, explicitly-documented overflow bug for non-quantized F16
+GGUF checkpoints). `cargo build`/`cargo test` clean with `--features cuda`
+(first time ever) and unchanged with no features (proves nothing
+Metal/CPU/MLX-specific regressed). Real, coherent Gemma-4-E2B-it generation
+confirmed on this GPU (`"The capital of France is **Paris**."`, 42.63 t/s
+decode) — the actual proof this phase needed, not just green tests. Also
+discovered (not fixed, honestly scoped): `Qwen3.5-2B` uses a hybrid
+Mamba/SSM + periodic-attention architecture this engine has zero operator
+support for — a real, precisely-identified future-work item, not a
+tensor-naming bug. Currently proceeding into a CUDA performance-closing pass
+(beat llama.cpp's Gemma decode throughput on this hardware, multimodal,
+model-agnostic) per the approved plan; then AWQ/GPTQ verification+MVP on
+real CUDA for the first time; then CPU/GPU layer-split offload for models
+bigger than this card's 8GB VRAM. See CHANGELOG "part 10" for full detail.
+
 v1.0.0 shipped. Branch **v2026.7.19** (off master) has since done: a full
 7-agent audit and fix pass (see "v2" below), a real HF downloader with
 hardware-aware quant recommendation, real TCP networking for

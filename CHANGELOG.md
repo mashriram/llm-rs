@@ -1,5 +1,133 @@
 # Changelog
 
+## v2026.7.22 (part 10) — First real CUDA hardware: build/test/generate verified, two real bugs found and fixed
+
+This machine (RTX 2000 Ada, 8GB VRAM, CUDA 12.0, `nvcc` present) is the
+**first real CUDA hardware this project has ever run on** — every prior
+CUDA-related item in this file/PROGRESS.md was reviewed by reading code only
+("no `nvcc`, no NVIDIA GPU in this environment"). This entry is that real
+verification, plus fixes for real bugs it surfaced.
+
+### Context: a local, unpushed "v1-gpu" attempt needed real fixes
+Before this session, a local-only commit (`c6a5013`, "v1-gpu") plus further
+uncommitted edits had been made on top of `ff8c45c` (== `origin/v2026.7.19`,
+the last-known-good state) attempting GPU-related work, but it "didn't work."
+Investigated by reading the diff directly (not guessing) and, once real CUDA
+hardware was available, by actually running generation and comparing against
+the untouched baseline in an isolated `git worktree`.
+
+### Fixed: build-breaking stray file
+An untracked `llm-cli/src/bin/chat copy.rs` (a strictly-older duplicate of
+`chat.rs`, missing its newer `/v1/chat/completions` client-streaming mode) had
+a space in its filename, which Cargo's bin-per-file discovery can't turn into
+a valid crate name — **`cargo check --workspace` failed on this alone**,
+unrelated to anything GPU. Deleted.
+
+### Fixed: real regressions in the uncommitted "v1-gpu" work
+- **`rotate_interleaved` RoPE convention regression**
+  (`llm-core/src/backends/attention.rs`): had been changed from this
+  codebase's established adjacent-pair `(2i, 2i+1)` rotation (the GGUF-native
+  convention — confirmed no weight-permutation step exists anywhere in the
+  loaders to compensate for a different convention) to "rotate-half"
+  (first-half/second-half block) rotation, silently producing wrong attention
+  math for every RoPE-using model, every backend. Reverted to adjacent-pair
+  rotation while keeping the legitimate new infrastructure around it
+  (precomputed cos/sin, the per-forward-pass `cos_sin_step_cache` in
+  `candle.rs` deduplicating repeated RoPE cos/sin builds within one pass —
+  a valid extra layer on top of the already-landed `inv_freq_cache`).
+- **`qmatmul_cache` lock held across an entire forward pass**
+  (`candle.rs`): a `qmatmul_guard = self.qmatmul_cache.lock()` taken once
+  before the whole operator loop (instead of per-lookup) serializes/risks
+  concurrent forward passes under the scheduler's batching. Narrowed back to
+  locking only around the hashmap lookup.
+- **`quantized_weights.clear()` breaking on-demand dequant fallback**
+  (`candle.rs`): ran unconditionally right after populating `qmatmul_cache`,
+  wiping out non-2D quantized tensors the code two lines above it had just
+  *deliberately* kept in `quantized_weights` for on-demand dequantization.
+  Removed.
+- **Fuzzy tensor-name matching removed** (`weights.rs`): new
+  `ends_with`/`contains` substring matching in the dequant-cache lookup and
+  embedding-alias fallback risked silently substituting the *wrong* tensor
+  (e.g. `post_attention_norm` vs `attn_norm` both satisfy naive suffix
+  checks) — a direct conflict with this project's "no silent fallback" rule.
+  Restored exact-match-only lookups (keeping the existing explicit
+  tied-embedding alias list).
+- Restored a `tracing::warn!` that a leftover debug `println!` had replaced.
+- `hardware_check.sh`'s hardcoded `cargo build -j 4` removed (hardware-aware
+  behavior, matching the whole point of this pass, shouldn't hardcode a job
+  count).
+
+### Found and fixed via real CUDA testing (not caught by any unit test): F16-overflow regression
+Real generation testing on this hardware — not just `cargo test` — surfaced a
+second, more serious bug the diff-reading pass above missed. A non-quantized
+F16 GGUF checkpoint (`Qwen2.5-0.5B-Instruct`, `fp16` variant) generated
+repetitive garbage tokens ("The/é/é/é/é/é...") on CUDA. Bisected via a
+`git worktree` running the untouched `ff8c45c` baseline side-by-side on the
+same file/prompt/hardware: baseline was coherent (if weak), current code was
+not — a real, newly-introduced regression, not a pre-existing gap.
+
+Root cause: `candle.rs`'s `MatMul` operator had an explicit, documented
+invariant — qmatmul output must stay F32, **never** downcast back to
+`compute_dtype` (F16 on CUDA), because "f16 overflows at ~65504; Qwen 2.5
+residuals reach ~43k by layer 0 and easily overflow by layer 4, producing NaN
+that poisons all subsequent layers." The uncommitted work added exactly that
+downcast back. Removed it, restoring the documented F32-only behavior.
+Verified: FP16-on-CUDA generation is coherent again, matching baseline;
+Q4_K_M (the realistic, commonly-used case) unaffected either way. Full
+workspace test suite (`--features cuda` and default/no-cuda) both 101+94+
+other crates all green before and after.
+
+### hardware_check.sh's default smoke-test model repo returns HTTP 401 (external, unrelated)
+`HuggingFaceTB/SmolLM2-135M-Instruct-GGUF` (the script's hardcoded default)
+now returns `401 Unauthorized` from HuggingFace's API for anonymous access —
+confirmed via direct `curl`, not an environment/proxy issue on this machine.
+Swapped the script's default to `Qwen/Qwen2.5-0.5B-Instruct-GGUF` (already
+confirmed reachable and already used elsewhere in this project's own test
+history).
+
+### Real, measured results on this RTX 2000 Ada (first ever for this project)
+- `cargo build --release --features cuda` (llm-core/llm-scheduler/llm-cli/
+  llm-cluster/llm-ffi): clean, first time ever.
+- `cargo test --workspace --exclude llm-py --features cuda`: **all green**
+  (101 llm-core + 94 llm-cli + 3 new concurrency tests + others), and
+  identical pass counts with no `--features` (default/CPU) — proves nothing
+  hardware-specific regressed either direction.
+- `scripts/hardware_check.sh --release`: build/hardware-detection/cluster all
+  pass. Hardware detection correctly reports `Selected backend: Cuda`,
+  `8.59 GB total / 8.16 GB free VRAM` (real `nvidia-smi` numbers, not
+  guessed), 16 CPU cores, AVX2+AVX-512F detected.
+- **The real confirmation that matters**: `gemma-4-E2B-it-Q4_K_M.gguf` (this
+  project's own primary target architecture) generates fully correct,
+  coherent text on this real CUDA GPU for the first time ever —
+  `"The capital of France is **Paris**."` (42.63 t/s decode), plus a second,
+  longer, fully coherent completion for an open-ended prompt. This is the
+  real acceptance signal for this phase, not just green tests.
+- The tiny 0.5B smoke-test model's exact greedy-decode completion for
+  hardware_check.sh's specific "capital of France" wording turned out to be
+  numerically borderline on this quant/hardware combination (sometimes
+  "Paris", sometimes an incomplete-but-coherent echo) — confirmed this
+  borderline-ness exists identically in the untouched baseline too (not a
+  regression), reported honestly rather than tuned to force a specific answer.
+
+### New, honestly-scoped discovery: Qwen3.5 is a hybrid SSM + attention architecture (not implemented, not a naming bug)
+Downloaded a real `unsloth/Qwen3.5-2B-GGUF` checkpoint (per direct request,
+alongside Gemma-4-E2B-it) and hit `Weight 'model.layers.0.self_attn.q_proj.weight'
+not found`. Inspected the real GGUF tensor names directly (Python `gguf`
+library, not guessed): most layers have `attn_qkv` (fused QKV, not separate
+q/k/v), `attn_gate`, and `ssm_a`/`ssm_alpha`/`ssm_beta`/`ssm_conv1d`/`ssm_dt`/
+`ssm_norm`/`ssm_out` (a genuine Mamba-style state-space recurrent layer); a
+minority of layers (3, 7, 11, 15, ...) use plain `attn_q`/`attn_k`/`attn_v`
+full attention. This is a hybrid SSM + periodic-full-attention architecture
+(same family as Jamba/Zamba/Nemotron-H) — confirmed zero support anywhere in
+`graph/scan.rs`/`graph/builder.rs` (no SSM operator type exists at all). This
+is **not a tensor-naming/hardcoding issue to patch** — it's a genuinely new
+architecture family with no operator support in this engine yet, real future
+work on the scale of implementing an actual SSM recurrence (verified against
+a reference, not guessed), not attempted this session per this project's own
+standing rule against guessing at unverified math. `Gemma-4-E2B-it` (a
+supported architecture) was used for this session's real coherence
+verification instead.
+
 ## v2026.7.21 (part 9) — MLX loader, RoPE/KV-cache perf fixes, model-agnostic config fixes, concurrency audit
 
 This entry covers a broad pass across quant-performance-plan.md Phase 1.3,
