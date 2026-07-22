@@ -1,5 +1,63 @@
 # Changelog
 
+## v2026.7.22 (part 13) — CubeCL kernel investigated and rejected: real measured interop tax, not guessed
+
+Per direction to write the `llm-kernel` CubeCL attention kernel "properly,"
+investigated what that actually requires before writing kernel math, and
+found a decisive, measured reason not to proceed at the per-layer-call
+granularity this project's graph executes at.
+
+### Zero-copy interop: confirmed not possible via CubeCL's public API
+`candle-core` and `cubecl-cuda` pin different `cudarc` versions (0.19.8 vs
+0.16.6). Checked both crates' source directly: both use
+`primary_ctx::retain`, so they share the same underlying CUDA context (no
+blocker there - this part would have worked). But `cubecl-cuda`'s memory
+system (`Handle`/`Binding`/`SliceHandle`, resolved via
+`MemoryManagement<CudaStorage>::get_resource`) has no public API to import
+an externally-owned device pointer - every `Handle` must originate from
+`client.reserve()`/`client.create()`/`client.empty()`. Forking/patching
+`cubecl-cuda` to add that would be a disproportionate ongoing-maintenance
+commitment for this.
+
+### Measured (not assumed) the copy-based interop tax
+Built a throwaway proof-of-concept (`llm-kernel/tests/cuda_interop_poc.rs`,
+removed after measuring - this entry documents the finding instead of
+leaving scratch code in the tree): a real candle CUDA tensor (1536 elements,
+Gemma-4-2B's hidden_dim) round-tripped through `client.create()` -> a
+trivial CubeCL SiLU kernel -> `client.read_one()` -> a new candle tensor,
+timed against candle's own equivalent `.silu()` call, 200 iterations, on
+this real RTX 2000 Ada GPU:
+
+| | time |
+|---|---|
+| candle -> cubecl -> candle round trip | 34.21µs |
+| candle-only equivalent (`.silu()`) | 2.83µs |
+| ratio | **12.1x** |
+
+### Why this kills the per-layer-attention-call approach
+`LLM_PROFILE_STEP=1` (see part 12) measured `attention` at ~4ms per decode
+step across Gemma-4's 35 layers - roughly 114µs/layer. A CubeCL kernel
+swapped in at that same per-layer call site would add ~34µs of pure
+interop tax *on top of* the kernel's own compute time, every layer, every
+token (35 x 34µs = ~1.2ms/token just in overhead, before any actual
+attention math runs) - the kernel itself would need to run in well under
+80µs to break even, erasing most or all of the "many small dispatches"
+fusion win a custom kernel would otherwise offer (the exact win RMSNorm's
+fusion fix in part 12 captured by staying *inside* candle's own kernel
+ecosystem instead of crossing a library boundary).
+
+**Conclusion, stated plainly**: a CubeCL kernel is not viable at the
+per-operator-per-layer granularity this graph executes at, given the
+current lack of zero-copy interop. It would only make sense applied at a
+much coarser granularity (e.g. one kernel call for an entire layer's or the
+whole model's worth of attention, batching across all layers in one
+dispatch) - a fundamentally different graph-execution architecture, not a
+kernel swap, and out of scope for this pass. Not pursued further; reverted
+the exploratory `Cargo.toml`/`Cargo.lock` changes cleanly. Real profiling
+work should continue inside candle's own kernel ecosystem (same category as
+the RMSNorm fix), where this session found a genuine, verified 52% decode
+throughput win with none of this interop tax.
+
 ## v2026.7.22 (part 12) — CUDA RMSNorm: real llama.cpp baseline, two verified fixes, honest remaining gap
 
 Phase 1 of closing the llama.cpp performance gap on this real RTX 2000 Ada

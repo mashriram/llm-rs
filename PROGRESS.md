@@ -112,14 +112,12 @@ GGUF checkpoints). `cargo build`/`cargo test` clean with `--features cuda`
 Metal/CPU/MLX-specific regressed). Real, coherent Gemma-4-E2B-it generation
 confirmed on this GPU (`"The capital of France is **Paris**."`, 42.63 t/s
 decode) — the actual proof this phase needed, not just green tests. Also
-discovered (not fixed, honestly scoped): `Qwen3.5-2B` uses a hybrid
-Mamba/SSM + periodic-attention architecture this engine has zero operator
-support for — a real, precisely-identified future-work item, not a
-tensor-naming bug. Also researched (real reference, not guessed) exactly
-what Qwen3.5's Gated DeltaNet architecture requires and confirmed no Rust
-crate or llama.cpp upstream conversion supports it yet — documented
-precisely as scoped future work; verified a modern standard-architecture
-Qwen release (`Qwen3-4B-Instruct-2507`) works correctly instead.
+researched (real reference, not guessed) exactly what Qwen3.5's hybrid
+"Gated DeltaNet" (Mamba/SSM-style + periodic attention) architecture
+requires and confirmed no Rust crate or llama.cpp upstream conversion
+supports it yet — documented precisely as scoped future work (see below);
+verified a modern standard-architecture Qwen release
+(`Qwen3-4B-Instruct-2507`) works correctly instead.
 
 **Phase 1 (closing the llama.cpp gap) — in progress.** Real, same-machine
 llama.cpp baseline obtained (a working local `llama-cpp` snap install with
@@ -136,12 +134,30 @@ prompts, full test suite green on `--features cuda` and default builds,
 multimodal (vision+audio) confirmed unaffected. **Honest status: still ~1.6x
 slower than llama.cpp on Gemma** (56 vs 90.15 t/s decode) — down from
 ~2.45x, target not yet met. Re-profiling shows `attention`
-(`PagedAttention`/KV-cache) is now the largest remaining category, but that
-code is far more complex/correctness-critical than the norm fix — needs
-either careful dedicated work there or the originally-planned CubeCL kernel
-(quant-performance-plan.md/implementaion-plan.md Phase 2.3). See
-CHANGELOG's "part 12" entry for full detail. Then: AWQ/GPTQ verification+MVP
-on real CUDA for the first time; then CPU/GPU layer-split offload for
+(`PagedAttention`/KV-cache) is now the largest remaining category.
+
+**CubeCL kernel investigated and rejected, with real measurements, not a
+guess.** Checked whether `candle`'s and `cubecl-cuda`'s different `cudarc`
+versions could share GPU memory zero-copy (they share the same CUDA primary
+context — fine) but found `cubecl-cuda`'s memory system has no public API
+to import an externally-owned pointer — a real, confirmed dead end, not
+something to fork/patch for this pass. Measured the only viable
+interop (host round-trip via `client.create()`/`client.read()`): **12.1x**
+overhead vs. candle's own equivalent op (34.21µs vs 2.83µs on this GPU, 200
+iterations). Attention costs ~114µs/layer today across Gemma-4's 35 layers
+— a CubeCL kernel swapped in at that same per-layer granularity would add
+~1.2ms/token of pure interop tax before any kernel math runs, erasing most
+plausible wins. Not viable at this granularity without a much larger
+graph-execution restructuring (batching all layers into one kernel call) —
+out of scope for this pass. See CHANGELOG's "part 12"/"part 13" entries for
+full detail and numbers.
+
+Remaining attention-path work needs either careful dedicated optimization
+inside candle's own kernel ecosystem (same category as the RMSNorm fix,
+which had none of this interop tax) or a genuinely different
+graph-execution architecture for CubeCL to make sense — not attempted
+further this pass. Then: AWQ/GPTQ verification+MVP on real CUDA for the
+first time; then CPU/GPU layer-split offload for
 models bigger than this card's 8GB VRAM.
 
 v1.0.0 shipped. Branch **v2026.7.19** (off master) has since done: a full
