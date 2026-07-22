@@ -115,11 +115,34 @@ decode) — the actual proof this phase needed, not just green tests. Also
 discovered (not fixed, honestly scoped): `Qwen3.5-2B` uses a hybrid
 Mamba/SSM + periodic-attention architecture this engine has zero operator
 support for — a real, precisely-identified future-work item, not a
-tensor-naming bug. Currently proceeding into a CUDA performance-closing pass
-(beat llama.cpp's Gemma decode throughput on this hardware, multimodal,
-model-agnostic) per the approved plan; then AWQ/GPTQ verification+MVP on
-real CUDA for the first time; then CPU/GPU layer-split offload for models
-bigger than this card's 8GB VRAM. See CHANGELOG "part 10" for full detail.
+tensor-naming bug. Also researched (real reference, not guessed) exactly
+what Qwen3.5's Gated DeltaNet architecture requires and confirmed no Rust
+crate or llama.cpp upstream conversion supports it yet — documented
+precisely as scoped future work; verified a modern standard-architecture
+Qwen release (`Qwen3-4B-Instruct-2507`) works correctly instead.
+
+**Phase 1 (closing the llama.cpp gap) — in progress.** Real, same-machine
+llama.cpp baseline obtained (a working local `llama-cpp` snap install with
+CUDA already configured): Gemma-4-E2B-it-Q4_K_M 90.15 t/s decode / 4138.93
+t/s prefill; Qwen3-4B-Instruct-2507 56.23 t/s decode / 2532.73 t/s prefill.
+Profiled (`LLM_PROFILE_STEP=1`, not guessed) and found `norm` (RMSNorm) was
+the single largest per-step CUDA cost — more than matmul — pure per-call
+overhead, not real compute. Two verified fixes landed: removed a redundant
+F32→F16→F32 double-cast of the norm weight, then switched to candle-nn's
+native fused `rms_norm` kernel (one GPU dispatch instead of six-plus).
+Gemma-4-2B decode: 36.72 → ~56 t/s (+52%); Qwen3-4B: → 42.38 t/s (~75% of
+its own llama.cpp baseline). Both bit-identical-correct on representative
+prompts, full test suite green on `--features cuda` and default builds,
+multimodal (vision+audio) confirmed unaffected. **Honest status: still ~1.6x
+slower than llama.cpp on Gemma** (56 vs 90.15 t/s decode) — down from
+~2.45x, target not yet met. Re-profiling shows `attention`
+(`PagedAttention`/KV-cache) is now the largest remaining category, but that
+code is far more complex/correctness-critical than the norm fix — needs
+either careful dedicated work there or the originally-planned CubeCL kernel
+(quant-performance-plan.md/implementaion-plan.md Phase 2.3). See
+CHANGELOG's "part 12" entry for full detail. Then: AWQ/GPTQ verification+MVP
+on real CUDA for the first time; then CPU/GPU layer-split offload for
+models bigger than this card's 8GB VRAM.
 
 v1.0.0 shipped. Branch **v2026.7.19** (off master) has since done: a full
 7-agent audit and fix pass (see "v2" below), a real HF downloader with

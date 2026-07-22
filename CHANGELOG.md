@@ -1,5 +1,99 @@
 # Changelog
 
+## v2026.7.22 (part 12) — CUDA RMSNorm: real llama.cpp baseline, two verified fixes, honest remaining gap
+
+Phase 1 of closing the llama.cpp performance gap on this real RTX 2000 Ada
+hardware (multimodal, model-agnostic, per quant-performance-plan.md's
+measure-first methodology applied to CUDA for the first time).
+
+### Real, same-machine llama.cpp baseline
+Found a working local llama.cpp install (`llama-cpp` snap, CUDA component
+already installed, confirmed detecting the real RTX 2000 Ada) rather than
+building from source. Measured (`llama-bench`, `-ngl 999 -p 512 -n 128`):
+
+| model | prefill (pp512) | decode (tg128) |
+|---|---|---|
+| Gemma-4-E2B-it-Q4_K_M | 4138.93 t/s | 90.15 t/s |
+| Qwen3-4B-Instruct-2507-Q4_K_M | 2532.73 t/s | 56.23 t/s |
+
+llm-rs's own baseline on the same Gemma checkpoint/hardware (before today's
+fixes): 36.72 t/s decode - roughly 2.45x slower than llama.cpp.
+
+### Profiled (not guessed) where CUDA time actually goes
+`LLM_PROFILE_STEP=1` on real hardware: `norm` (RMSNorm) was the single
+largest per-decode-step category, ~37% of op-loop time - more than `matmul`
+(~12%), `attention` (~13-17%), or `rope` (~9-10%). The FLOP-dominant
+operation (quantized matmul) being proportionally cheap relative to RMSNorm
+(cheap, O(n) elementwise math) is the same signature this project's Metal
+investigation already established: per-call CPU/GPU-dispatch overhead
+dominating over real compute, not a slow kernel.
+
+### Fixed: two real, verified RMSNorm overhead bugs
+1. **Redundant double-cast** (`llm-core/src/backends/candle.rs`'s
+   `Operator::RMSNorm` branch): the caller downcast the norm weight from F32
+   to `compute_dtype` (F16 on CUDA) before passing it to `RmsNorm::forward`,
+   which then immediately upcast it straight back to F32 internally for the
+   actual computation - two wasted full-vector GPU casts, every RMSNorm
+   call, every layer, every token (roughly 70 calls/token for Gemma-4's 35
+   layers). Removed the caller's pointless pre-alignment.
+2. **Six-plus separate elementwise kernel dispatches per call**
+   (`llm-core/src/backends/attention.rs`'s `RmsNorm::forward`): the manual
+   `sqr`/`mean_keepdim`/`+eps`/`sqrt`/`broadcast_div`/`broadcast_mul` chain
+   was replaced with `candle_nn::ops::rms_norm` - a native, per-backend fused
+   kernel (real `cuda_fwd`/`metal_fwd`/`cpu_fwd` implementations in
+   candle-nn, already used correctly by every other model on this backend
+   ecosystem) that does the whole computation in one GPU dispatch instead of
+   six-plus. Handles the existing QK-norm reshape case too (reshape, then
+   call the fused kernel on the reshaped tensor, reshape back).
+
+**Verified, not assumed**: both fixes together took Gemma-4-2B decode from
+36.72 -> ~56 t/s (+52%, three repeated measurements: 57.68/55.29/55.43 t/s),
+prefill 70.18 -> ~120 t/s. Generated text bit-identical on representative
+prompts before/after both fixes ("The capital of France is **Paris**.",
+exact same token IDs; a longer neural-network-explainer prompt, also exact
+token-ID match). One caveat, stated honestly: the fused kernel's internal
+math (F32 accumulator for the sum-of-squares reduction, but elementwise
+divide/multiply in the input's native dtype, matching candle-nn's own
+long-established, battle-tested convention) is not byte-for-byte identical
+to the old always-F32-until-the-final-cast path - a 128-token greedy
+generation that previously degenerated into a repetition loop instead
+terminated cleanly at 27 tokens after the fix, a real (tiny) precision
+difference nudging one early argmax tie differently, same class of caveat
+that applies to any kernel-precision change (including upstream candle
+version bumps, already noted as a limitation in quant-performance-plan.md
+Phase 2.1). Short/medium generations remain exactly bit-identical.
+
+**Model-agnosticism confirmed**: same two fixes benefit a second,
+architecturally-different model - Qwen3-4B-Instruct-2507 (standard dense
+transformer, QK-norm per-head reshape path, no Gemma PLE/hybrid-attention)
+- decode to 42.38 t/s, ~75% of *its own* llama.cpp baseline (56.23 t/s) -
+closer than Gemma's ratio, consistent with Gemma carrying extra per-token
+overhead (PLE, hybrid local/global attention) that Qwen3 doesn't have.
+Qwen3-4B's own "Paris" test also bit-identical before/after.
+
+**Multimodal confirmed unaffected**: re-ran `/image` and `/audio` on
+Gemma-4-E2B-it after both fixes - both still run to completion without
+crashing, same category of output as before (not coherent, matching the
+already-documented pre-existing gap - not worse, not better, unaffected).
+
+**Full regression suite**: `cargo test --workspace --features cuda` and the
+default (no `--features`) build both green, identical pass counts to before
+(101 llm-core + 94 llm-cli + others) - proves the fix is real and doesn't
+regress the CPU/Metal-agnostic path.
+
+### Honest remaining gap
+Gemma-4-2B decode is now ~56 t/s vs llama.cpp's 90.15 t/s - **still ~1.6x
+slower**, down from ~2.45x before today (real progress, target not yet
+met). Re-profiling after the norm fix shows `attention`
+(`Operator::PagedAttention`) is now the single largest remaining category.
+That code (paged KV-cache block gather/scatter, quantization-aware
+branches, per-block-boundary looping) is far more complex and
+correctness-critical than the norm fix was - closing the rest of this gap
+needs either careful, separate optimization work there, or the originally
+planned CubeCL kernel (quant-performance-plan.md/implementaion-plan.md
+Phase 2.3) - not attempted in this pass to avoid rushing a
+higher-risk change without dedicated review.
+
 ## v2026.7.22 (part 11) — Real bug: explicit --mmproj-path was ignored for vision/audio activation
 
 Found while checking multimodal (vision+audio) coherence on this real CUDA

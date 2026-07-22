@@ -58,45 +58,39 @@ impl RmsNorm {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let orig_dtype = x.dtype();
+        // Use candle-nn's native fused RMSNorm kernel (one GPU dispatch, with an
+        // f32 accumulator for the sum-of-squares reduction internally regardless
+        // of input dtype - same numerically-safe design used by every other
+        // model on this backend) instead of chaining 6+ separate elementwise ops
+        // (sqr/mean/sqrt/div/mul + dtype casts). Confirmed via LLM_PROFILE_STEP=1
+        // on real CUDA hardware: `norm` was the single largest per-step category,
+        // ahead of matmul - the signature of per-call GPU dispatch overhead
+        // dominating over the (tiny) actual compute, exactly what fusion fixes.
+        let dtype = x.dtype();
         let w_len = self.weight.dim(0)?;
         let last_dim = x.dim(x.rank() - 1)?;
-        let x_f32 = if orig_dtype == DType::F32 { x.clone() } else { x.to_dtype(DType::F32)? };
-        let w_f32 = if self.weight.dtype() == DType::F32 { self.weight.clone() } else { self.weight.to_dtype(DType::F32)? };
+        let x = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+        let w = if self.weight.dtype() == dtype { self.weight.clone() } else { self.weight.to_dtype(dtype)? };
 
         // QK-Norm case: weight covers a head_dim slice but x has full concat dim.
         if last_dim != w_len && last_dim % w_len == 0 {
-            let rank = x_f32.rank();
-            let reshaped = if rank == 3 {
-                let (b, s, _) = x_f32.dims3()?;
-                let h = last_dim / w_len;
-                x_f32.reshape((b, s, h, w_len))?
-            } else if rank == 2 {
-                let (s, _) = x_f32.dims2()?;
-                let h = last_dim / w_len;
-                x_f32.reshape((s, h, w_len))?
-            } else {
-                return Err(anyhow!("Unsupported rank {} in RmsNorm with QK reshaping", rank));
-            };
-
-            let variance = reshaped.sqr()?.mean_keepdim(reshaped.rank() - 1)?;
-            let x_norm = reshaped.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-
-            let out_reshaped = x_norm.broadcast_mul(&w_f32)?;
-            let out_f32 = if rank == 3 {
-                let (b, s, _, _) = out_reshaped.dims4()?;
-                out_reshaped.reshape((b, s, last_dim))?
-            } else {
-                let (s, _, _) = out_reshaped.dims3()?;
-                out_reshaped.reshape((s, last_dim))?
-            };
-            if orig_dtype == DType::F32 { Ok(out_f32) } else { Ok(out_f32.to_dtype(orig_dtype)?) }
+            let rank = x.rank();
+            let h = last_dim / w_len;
+            match rank {
+                3 => {
+                    let (b, s, _) = x.dims3()?;
+                    let out = candle_nn::ops::rms_norm(&x.reshape((b, s, h, w_len))?, &w, self.eps as f32)?;
+                    Ok(out.reshape((b, s, last_dim))?)
+                }
+                2 => {
+                    let (s, _) = x.dims2()?;
+                    let out = candle_nn::ops::rms_norm(&x.reshape((s, h, w_len))?, &w, self.eps as f32)?;
+                    Ok(out.reshape((s, last_dim))?)
+                }
+                _ => Err(anyhow!("Unsupported rank {} in RmsNorm with QK reshaping", rank)),
+            }
         } else {
-            let variance = x_f32.sqr()?.mean_keepdim(x_f32.rank() - 1)?;
-            let denom = (variance + self.eps)?.sqrt()?;
-            let x_norm = x_f32.broadcast_div(&denom)?;
-            let out_f32 = x_norm.broadcast_mul(&w_f32)?;
-            if orig_dtype == DType::F32 { Ok(out_f32) } else { Ok(out_f32.to_dtype(orig_dtype)?) }
+            Ok(candle_nn::ops::rms_norm(&x, &w, self.eps as f32)?)
         }
     }
 }

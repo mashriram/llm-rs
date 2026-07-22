@@ -1880,13 +1880,14 @@ impl LlmBackend for CandleBackend {
                 }
                 Operator::RMSNorm { input, weight, output, eps } => {
                     let in_t = ctx.get(input)?;
-                    let w_t_raw = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
-                    // Align weight dtype to match the input activation dtype
-                    let w_t = if w_t_raw.dtype() != in_t.dtype() {
-                        w_t_raw.to_dtype(in_t.dtype())?
-                    } else {
-                        w_t_raw
-                    };
+                    // No dtype pre-alignment here: RmsNorm::forward always upcasts both
+                    // x and weight to F32 internally for the actual computation, so
+                    // pre-casting the weight to in_t's dtype here (e.g. F16 on CUDA) just
+                    // to have it immediately upcast back to F32 inside forward() was two
+                    // wasted full-vector GPU casts per call, every layer, every token -
+                    // confirmed via LLM_PROFILE_STEP=1 showing `norm` disproportionately
+                    // dominating CUDA decode time (~37%, more than matmul).
+                    let w_t = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
                     let is_gemma = self.meta.as_ref().map(|m| m.is_gemma).unwrap_or(false);
                     let is_gemma_hf = is_gemma && !self.weights.is_empty();
                     let out = RmsNorm::new(w_t, *eps as f64, is_gemma_hf).forward(&in_t)?;
