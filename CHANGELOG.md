@@ -1,5 +1,39 @@
 # Changelog
 
+## v2026.7.22 (part 11) — Real bug: explicit --mmproj-path was ignored for vision/audio activation
+
+Found while checking multimodal (vision+audio) coherence on this real CUDA
+machine using real `gemma-4-E2B-it-Q4_K_M.gguf` + `mmproj-BF16.gguf` (a
+real, popular unsloth GGUF pairing). `/image <path>` silently produced a
+text-only response ("Please provide the image...") even with
+`--mmproj-path` passed explicitly.
+
+**Root cause**: `CandleBackend::load_weights` (`candle.rs`) always called
+auto-discovery (`find_mmproj_path(path)`) to load mmproj *metadata* (which
+determines `has_vision_encoder`/`has_audio_encoder`), completely ignoring
+`self.custom_mmproj_path` — the explicit `--mmproj-path` value was only ever
+consulted later, for the actual encoder *construction* step, which never ran
+because `has_vision_encoder` was already false by then. Auto-discovery's
+name-matching heuristic (`find_mmproj_path`) requires the mmproj filename to
+share a token with the model's stem — but unsloth (a major GGUF publisher)
+names mmproj files generically (`mmproj-BF16.gguf`, no model-name prefix) for
+both the Gemma-4 and Qwen3.5 repos checked this session, so discovery always
+missed it even with the file sitting right next to the model.
+
+**Fixed**: `self.custom_mmproj_path` now takes priority over auto-discovery
+for metadata loading too, matching what already happened for encoder
+construction. Verified: `gemma-4-E2B-it-Q4_K_M.gguf` +
+`--mmproj-path mmproj-BF16.gguf` now correctly loads both VisionEncoder and
+AudioEncoder, reports "Vision encoder: YES", and actually runs the
+vision/audio forward path on a real `/image`/`/audio` command (previously it
+silently never did). Output itself is **still not coherent** for either
+modality on this specific model — but that now matches this project's own
+already-documented, honestly-scoped prior finding (PROGRESS.md v3/v5: "runs
+without crashing, not yet coherent" — a deep numerical-reference gap, not
+something to guess-fix here) rather than masking a *different*, worse bug
+(the feature never activating at all). Full test suite still green
+(`--features cuda`).
+
 ## v2026.7.22 (part 10) — First real CUDA hardware: build/test/generate verified, two real bugs found and fixed
 
 This machine (RTX 2000 Ada, 8GB VRAM, CUDA 12.0, `nvcc` present) is the

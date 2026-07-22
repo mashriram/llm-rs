@@ -762,9 +762,15 @@ impl LlmBackend for CandleBackend {
                 }
             })?;
 
-            // Discover and load mmproj metadata if a matching mmproj file exists
+            // Discover and load mmproj metadata if a matching mmproj file exists.
+            // An explicit --mmproj-path always wins over auto-discovery: several
+            // real GGUF publishers (e.g. unsloth) name mmproj files generically
+            // (`mmproj-BF16.gguf`, no model-name prefix), which auto-discovery's
+            // name-matching heuristic can't find even when the file is right next
+            // to the model — confirmed via a real gemma-4-E2B-it + mmproj-BF16.gguf
+            // pair silently running text-only despite --mmproj-path being passed.
             let mut mmproj_metadata = HashMap::new();
-            let mmproj_path = find_mmproj_path(path);
+            let mmproj_path = self.custom_mmproj_path.clone().or_else(|| find_mmproj_path(path));
             if let Some(ref mp_path) = mmproj_path {
                 tracing::info!("Discovered mmproj file at {:?}; loading its metadata...", mp_path);
                 if let Ok(mut mp_file) = std::fs::File::open(mp_path) {
