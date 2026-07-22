@@ -58,6 +58,82 @@ work should continue inside candle's own kernel ecosystem (same category as
 the RMSNorm fix), where this session found a genuine, verified 52% decode
 throughput win with none of this interop tax.
 
+## v2026.7.22 (part 14) — AWQ/GPTQ verified end-to-end on real CUDA; two significant dense-weight bugs found and fixed
+
+Phase 2 of the GPU-enablement plan: AWQ/GPTQ numerical verification + MVP
+on real CUDA hardware, for the first time in this project's history.
+
+### AWQ dequant: found and fixed a real nibble-order bug
+Downloaded two small real checkpoints (`Qwen/Qwen2.5-1.5B-Instruct-AWQ`,
+`Qwen/Qwen2-1.5B-Instruct-GPTQ-Int4`), confirmed real tensor shapes match
+this codebase's documented layout, then dequantized the same real tensor
+two independent ways: this codebase's Rust `awq.rs`/`gptq.rs` and a
+from-scratch numpy reference. GPTQ matched bit-exact immediately (after
+accounting for the function's intentional final F16 downcast). AWQ did
+**not** match — `awq.rs` used `AWQ_ORDER = [0,2,4,6,1,3,5,7]` (a real
+AutoAWQ constant, but the *pack*-direction permutation) as the *unpack*
+order. Fetched AutoAWQ's actual `packing_utils.py` source directly to get
+ground truth (not re-deriving the same assumption a second time, which is
+exactly how the original round-trip unit test also missed this): the real
+unpack order is the pack order's *inverse*, `AWQ_REVERSE_ORDER =
+[0,4,1,5,2,6,3,7]`. Fixed in `llm-core/src/loader/awq.rs`.
+
+### Added the missing Phase 4.4 hardware-dispatch guard
+
+`quant-performance-plan.md` claimed this was already implemented — it
+was not; `CandleBackend::load_weights` dequantized AWQ/GPTQ unconditionally
+regardless of device. Now bails with a clear error naming the actual
+constraint when `HardwareProfile`'s selected device isn't CUDA, per
+CLAUDE.md's "missing kernel = explicit Err, never silent fallback" rule.
+
+### First real end-to-end test found two more bugs, both pre-existing, both affecting every dense-weight CUDA model, not just AWQ/GPTQ
+
+1. **F16 overflow on the plain (non-`qmatmul`) `MatMul` branch.** The exact
+   overflow bug already fixed once for the GGUF/`qmatmul` branch (part 12,
+   below) was never applied to the *other* `Operator::MatMul` branch in
+   `candle.rs` — used by every plain HF safetensors weight and every
+   AWQ/GPTQ/MLX dequantized weight. Found by testing a *plain, unquantized*
+   `Qwen/Qwen2-1.5B-Instruct` on CUDA: garbage output ("!!!!!!!"), proven
+   CUDA-specific (not a general graph/config bug) because the identical
+   model/code produced correct output (`"The capital of France is Paris."`)
+   with `LLM_FORCE_CPU=1`. Fixed by computing this branch's matmul in F32,
+   same invariant as the qmatmul branch.
+2. **Dense-weight transpose recomputed on every forward call.** The same
+   branch's "auto-transpose" step ran a full `transpose(0,1)?.contiguous()?`
+   fresh every layer, every decode step, for every dense weight. Fixed by
+   pre-transposing once at load time (`load_weights`, right after
+   `build_graph`), tracked in a new `pretransposed_matmul_weights` name set
+   so the forward pass can skip its own transpose unambiguously. Two prior
+   attempts were tried and reverted: (a) a lazy runtime cache duplicated
+   every weight's memory (original + transposed copy both resident) and
+   OOM'd this 8GB card on a 1.5B model; (b) a shape-based "does this already
+   look transposed?" runtime check is wrong for square weights (`q_proj`/
+   `o_proj`, where hidden_size == hidden_size gives the same `dim(1)` either
+   way) and silently undid the load-time transpose for exactly those layers
+   — confirmed by reproducing that failure on real hardware before switching
+   to the explicit name-set. Tied embeddings needed separate handling: the
+   `lm_head.weight` alias (when no dedicated lm_head tensor exists) resolves
+   at lookup time to `model.embed_tokens.weight`, which is *also* the
+   `Operator::Embed` row-lookup table and must keep its original
+   `[vocab_size, hidden_size]` orientation — the load-time pass materializes
+   a separate transposed entry under the alias name instead of mutating the
+   shared tensor.
+
+### Real, on-GPU results
+Confirmed correct, coherent generation for: plain `Qwen2-1.5B-Instruct`
+(tied embeddings), `Qwen2.5-1.5B-Instruct-AWQ`, `Qwen2-1.5B-Instruct-GPTQ-
+Int4` — all producing `"The capital of France is Paris."` (or AWQ's shorter
+equivalent) on this RTX 2000 Ada. Decode throughput roughly tripled across
+all three as a side effect of the transpose fix (e.g. plain Qwen2-1.5B:
+3.7 → 11.6 t/s). Gemma-4-2B's GGUF/qmatmul path re-verified unaffected
+(~56.7 t/s decode, unchanged) — both fixes are additive to the dense-weight
+path only. Full test suite green, with and without `--features cuda`.
+
+Not attempted: phase 4.3's Marlin-class tensor-core kernel (the real fix
+for AWQ/GPTQ's memory-savings gap — this pass dequantizes fully to dense
+F16 at load time, proving correctness per 4.2's own acceptance criteria,
+not peak speed/memory efficiency).
+
 ## v2026.7.22 (part 12) — CUDA RMSNorm: real llama.cpp baseline, two verified fixes, honest remaining gap
 
 Phase 1 of closing the llama.cpp performance gap on this real RTX 2000 Ada

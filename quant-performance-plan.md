@@ -303,6 +303,28 @@ executes them through candle's own kernels — matches "one engine, one
 
 ## PHASE 4 — AWQ + GPTQ on CUDA (currently 100% unimplemented — confirmed, not assumed)
 
+**UPDATE 2026-07-22**: 4.1 and 4.2 done and verified on real CUDA hardware
+(RTX 2000 Ada) — see PROGRESS.md's "Phase 2 — AWQ/GPTQ verified end-to-end
+on real CUDA" for the full writeup. Numerically verified against ground
+truth (not just internal self-consistency): found and fixed a real bug in
+`awq.rs`'s nibble-unpack order (was using the *pack*-direction permutation,
+not its inverse — confirmed against AutoAWQ's actual source). GPTQ's dequant
+matched a from-scratch numpy reference bit-exact on the first try. 4.4's
+hardware-dispatch guard was NOT actually implemented despite an earlier
+claim to that effect here — added now (`CandleBackend::load_weights` bails
+with a clear error if the selected device isn't CUDA). Real end-to-end
+generation confirmed correct for `Qwen/Qwen2.5-1.5B-Instruct-AWQ` and
+`Qwen/Qwen2-1.5B-Instruct-GPTQ-Int4` on this GPU. Getting there also
+surfaced and fixed two bugs unrelated to AWQ/GPTQ specifically but affecting
+every dense-weight (non-GGUF) CUDA model: an F16-overflow gap in the plain
+`MatMul` operator branch (same bug class already fixed once for the
+`qmatmul`/GGUF branch, never applied to this one), and a per-forward-call
+weight-transpose recomputation now done once at load time instead (~3x
+decode throughput improvement on the dense path as a side effect). 4.3
+(Marlin-class real throughput kernel) not attempted — still the real fix
+for AWQ/GPTQ's memory-savings gap; this pass proves correctness, not peak
+speed, per 4.2's own acceptance criteria.
+
 **UPDATE 2026-07-20**: 4.1's loaders and a first pass at 4.2's dequant
 path are written (`llm-core/src/loader/awq.rs`, `gptq.rs`, wired into
 `CandleBackend::load_weights`). Tensor layout confirmed against two real
@@ -325,7 +347,7 @@ existing CUDA-path work, which was reviewed by reading the diff only, never
 executed here. Flag every step of this phase honestly as "written, not
 verified here" until that happens.
 
-- [ ] **4.1 — Loaders: `llm-core/src/loader/awq.rs`, `gptq.rs`.** Parse the
+- [x] **4.1 — Loaders: `llm-core/src/loader/awq.rs`, `gptq.rs`.** Parse the
   real tensor layout from `config.json`'s `quantization_config.quant_method`
   (already detected — currently only to *refuse* loading, in
   `llm-core/src/model/config.rs` — this phase changes that from refuse to
@@ -338,7 +360,7 @@ verified here" until that happens.
   into the expected shapes/dtypes, checked against the same tensors read by
   Python (`safetensors` + `transformers`) as ground truth.
 
-- [ ] **4.2 — MVP: dequant-then-cuBLAS (correctness first, not peak
+- [x] **4.2 — MVP: dequant-then-cuBLAS (correctness first, not peak
   speed).** Dequantize AWQ/GPTQ weights to F16 (on load, or per-tile), run
   through candle's existing CUDA F16 matmul path. This is intentionally
   *not* Marlin-class throughput — it's the fastest way to get a real,
@@ -375,7 +397,7 @@ verified here" until that happens.
   the ~700+ t/s class of numbers vLLM+Marlin gets on comparable hardware,
   not just "faster than 4.2's dequant path."
 
-- [ ] **4.4 — Hardware-dispatch compliance.** AWQ/GPTQ's packed-int4 layout
+- [x] **4.4 — Hardware-dispatch compliance.** AWQ/GPTQ's packed-int4 layout
   has no sane CPU or Metal execution path without dequantizing everything
   up front (which defeats the point). Loading one when
   `HardwareProfile.backend != Cuda` must hit the existing "missing

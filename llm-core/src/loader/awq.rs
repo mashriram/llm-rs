@@ -11,22 +11,38 @@
 //!
 //! Dequantized weight: `w[k, n] = (unpack(qweight)[k, n] - unpack(qzeros)[k/group_size, n]) * scales[k/group_size, n]`.
 //!
-//! IMPORTANT — unverified numerically. This implements the AWQ "gemm"-kernel
-//! packing order as documented by the AutoAWQ/llm-awq reference kernels: the
-//! 8 int4 values inside one int32 are NOT in simple sequential nibble order:
-//! AWQ's GEMM kernel packs them in the interleaved order `[0, 2, 4, 6, 1, 3,
-//! 5, 7]` (a detail specific to how its CUDA kernel tiles the computation).
-//! This has NOT been checked against a real AWQ model's dequantized output
-//! from Python (`transformers`/`autoawq`) on real hardware - do that before
-//! trusting this for anything beyond a first correctness pass. See
-//! `quant-performance-plan.md` phase 4.1's acceptance criteria.
-
+//! Verified against AutoAWQ's actual reference implementation
+//! (`awq/utils/packing_utils.py`'s `unpack_awq`/`reverse_awq_order`/
+//! `dequantize_gemm`, casper-hansen/AutoAWQ) and against a real end-to-end
+//! generation test on real CUDA hardware (`Qwen/Qwen2.5-1.5B-Instruct-AWQ`).
+//!
+//! AWQ's packing has two logically separate steps: (1) plain sequential
+//! nibble unpacking (nibble `i`, 0..8, at bit-shift `i*4` - no interleave at
+//! this stage), then (2) a column permutation applied to *groups of 8*
+//! already-unpacked columns, using `AWQ_REVERSE_ORDER = [0, 4, 1, 5, 2, 6, 3,
+//! 7]` - i.e. logical position `i` within a group of 8 reads its value from
+//! the nibble unpacked at raw position `AWQ_REVERSE_ORDER[i]`.
+//!
+//! An earlier version of this file used `AWQ_ORDER = [0, 2, 4, 6, 1, 3, 5,
+//! 7]` directly as the unpack order. That constant is real (it appears in
+//! AutoAWQ too), but it's the *pack* direction's permutation, not the
+//! *unpack* direction's - the two are inverse permutations of each other
+//! (`AWQ_REVERSE_ORDER` is literally `AWQ_ORDER` inverted), so using the
+//! wrong one here silently produced a real 4-bit weight matrix, just the
+//! wrong one, everywhere. This ran end-to-end without erroring and produced
+//! plausible-looking (but garbage) generated text - only caught by actually
+//! reading real generated tokens on real hardware, not by the unit tests
+//! (which only proved this file was internally self-consistent, and by
+//! comparing against a from-scratch Python reference implementing the *same*
+//! assumed order, which is the same mistake twice, not independent
+//! verification).
 use anyhow::{anyhow, Result};
 use candle_core::{DType, Device, Tensor};
 
-/// AWQ's GEMM-kernel nibble order within one packed `qweight`/`qzeros` int32:
-/// logical position `i` (0..8) is stored at nibble index `AWQ_ORDER[i]`.
-const AWQ_ORDER: [u32; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+/// AWQ's GEMM-kernel unpack order: logical position `i` (0..8) within one
+/// packed `qweight`/`qzeros` int32 group of 8 columns is read from the nibble
+/// at bit-shift `AWQ_REVERSE_ORDER[i] * 4`. See module doc comment.
+const AWQ_REVERSE_ORDER: [u32; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
 
 /// Returns `Some(base_name)` if `name` is one of AWQ's three per-linear
 /// tensor suffixes, so the safetensors-loading pass can group them.
@@ -87,7 +103,7 @@ pub fn dequantize_awq_linear(
             let w_word = qweight_u32[k][packed_col];
             let z_word = qzeros_u32[group][packed_col];
             for i in 0..8u32 {
-                let shift = AWQ_ORDER[i as usize] * 4;
+                let shift = AWQ_REVERSE_ORDER[i as usize] * 4;
                 let w_nibble = (w_word >> shift) & 0xF;
                 let z_nibble = (z_word >> shift) & 0xF;
                 let n = packed_col * 8 + i as usize;
@@ -106,19 +122,20 @@ pub fn dequantize_awq_linear(
 mod tests {
     use super::*;
 
-    /// Round-trip check: pack 8 known nibble values using the documented AWQ
-    /// interleaved order, dequantize with zero=0/scale=1, and confirm the
-    /// unpacked values land back in their original logical positions. This
-    /// verifies the unpacking logic is internally self-consistent - it does
-    /// NOT substitute for the real numerical check against a Python
-    /// (autoawq/transformers) reference this module's doc comment calls for.
+    /// Round-trip check: pack 8 known nibble values using AWQ's real unpack
+    /// order (`AWQ_REVERSE_ORDER`, verified against AutoAWQ's actual source -
+    /// see module doc comment), dequantize with zero=0/scale=1, and confirm
+    /// the unpacked values land back in their original logical positions.
+    /// This is a self-consistency check on the arithmetic, not a substitute
+    /// for the real end-to-end verification (numeric dequant check against
+    /// AutoAWQ's source + real CUDA generation test) documented above.
     #[test]
     fn awq_nibble_order_round_trips() {
         let device = Device::Cpu;
         let logical_values: [u32; 8] = [10, 14, 11, 15, 12, 0, 13, 1];
         let mut packed: u32 = 0;
         for (i, &v) in logical_values.iter().enumerate() {
-            let shift = AWQ_ORDER[i] * 4;
+            let shift = AWQ_REVERSE_ORDER[i] * 4;
             packed |= v << shift;
         }
         let qweight = Tensor::from_vec(vec![packed], (1, 1), &device).unwrap();

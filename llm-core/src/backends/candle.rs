@@ -312,6 +312,16 @@ fn rebuild_kv_history_from_blocks(
 pub struct CandleBackend {
     /// Full-precision weights (safetensors path; loaded directly onto device)
     weights: HashMap<String, Tensor>,
+    /// Names of dense `weights` entries that `load_weights` already
+    /// transposed to `[in_features, out_features]` and made contiguous, so
+    /// the `Operator::MatMul` forward-pass branch knows to skip its own
+    /// transpose for exactly these and only these. Deliberately NOT a
+    /// shape-based check ("does this tensor's `dim(1)` already look
+    /// transposed?") - that heuristic is ambiguous for square weights
+    /// (`q_proj`/`o_proj`, hidden_size == hidden_size have the same `dim(1)`
+    /// value transposed or not) and was confirmed, on real CUDA hardware, to
+    /// silently re-transpose (undo) exactly those square weights.
+    pretransposed_matmul_weights: std::collections::HashSet<String>,
     /// Quantized GGUF weights kept on CPU; dequantized lazily
     quantized_weights: HashMap<String, candle_core::quantized::QTensor>,
     /// Dequantization cache: embed/norm weights stored as f32 to avoid f16 overflow
@@ -410,6 +420,7 @@ impl CandleBackend {
         }
         Self {
             weights: HashMap::new(),
+            pretransposed_matmul_weights: std::collections::HashSet::new(),
             quantized_weights: HashMap::new(),
             deq_cache: Mutex::new(HashMap::new()),
             gpu_cache_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -1248,6 +1259,22 @@ impl LlmBackend for CandleBackend {
 
             let mut cpu_tensors = HashMap::new();
             if let Some((method, group_size)) = packed_quant {
+                // AWQ/GPTQ's packed-int4 layout has no sane CPU or Metal
+                // execution path without dequantizing everything to dense
+                // F16 up front, which defeats the point of using a packed
+                // quantized format at all (see quant-performance-plan.md
+                // phase 4.4). Per CLAUDE.md's "missing kernel = explicit
+                // Err, never a silent fallback" rule, bail here rather than
+                // silently dequantizing onto CPU/Metal.
+                if !self.device.is_cuda() {
+                    return Err(anyhow!(
+                        "this model is pre-quantized with '{method}', which llm-rs only supports \
+                         on CUDA (this machine's HardwareProfile selected {:?}) - use a GGUF or \
+                         MLX-quantized version of this model instead, or run this repo on a CUDA \
+                         machine",
+                        self.device
+                    ));
+                }
                 // Group the three (AWQ) or four (GPTQ) packed components per
                 // logical linear layer, dequantize each into one dense
                 // `{base}.weight` tensor; copy anything else (embeddings,
@@ -1431,6 +1458,79 @@ impl LlmBackend for CandleBackend {
         let group = scan_tensors(&names);
         let graph = build_graph(&meta, &group);
         tracing::info!("Compute graph built: {} operators", graph.ops.len());
+
+        // Pre-transpose dense MatMul weights ONCE here, at load time, instead of
+        // redoing `transpose(0, 1)?.contiguous()?` on every forward call (every
+        // layer, every decode step). Only applies to the dense-weight path
+        // (`weights` non-empty - plain HF safetensors, and AWQ/GPTQ/MLX
+        // dequantized weights, none of which go through GGUF's `qmatmul_cache`,
+        // which is already pre-prepared once at load by construction). Found
+        // while investigating decode throughput far below the GGUF/qmatmul
+        // path's numbers on the same CUDA hardware for a real Qwen2-1.5B
+        // checkpoint. Keeps the original dtype (no F32 upcast here) so this
+        // doesn't change steady-state VRAM usage or the `gpu_cache_budget`
+        // device-placement decision above, which already ran against the
+        // original (smaller, non-transposed) tensor sizes - transpose+
+        // contiguous is a reshuffle, not a resize.
+        //
+        // Tied embeddings need care: a tied model's `Operator::MatMul` weight
+        // name is the literal string `"lm_head.weight"`, which usually has NO
+        // tensor of that exact name in the checkpoint - `WeightStore::get`
+        // resolves it at lookup time via an alias fallback to
+        // `model.embed_tokens.weight` (see `weights.rs`). That same
+        // `model.embed_tokens.weight` tensor is ALSO the source for
+        // `Operator::Embed`'s row-lookup, which needs its original
+        // `[vocab_size, hidden_size]` orientation intact - transposing it in
+        // place would silently break embedding lookup. So: a name also used
+        // by `Operator::Embed` is left untouched here (the forward-pass
+        // MatMul branch below falls back to its own transpose for exactly
+        // this case); any OTHER matmul weight not found directly under its
+        // own name is assumed to be this tied-alias case, and gets a
+        // SEPARATE transposed entry materialized under the alias name,
+        // leaving the original (aliased-to) tensor untouched.
+        if !weights.is_empty() {
+            let matmul_weight_names: std::collections::HashSet<String> = graph
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    Operator::MatMul { weight, .. } => Some(weight.clone()),
+                    _ => None,
+                })
+                .collect();
+            let embed_weight_names: std::collections::HashSet<String> = graph
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    Operator::Embed { weight, .. } => Some(weight.clone()),
+                    _ => None,
+                })
+                .collect();
+            let mut pretransposed = std::collections::HashSet::new();
+            for name in &matmul_weight_names {
+                if embed_weight_names.contains(name) {
+                    continue;
+                }
+                if let Some(w) = weights.get(name) {
+                    if w.rank() == 2 {
+                        let prepared = w.transpose(0, 1)?.contiguous()?;
+                        weights.insert(name.clone(), prepared);
+                        pretransposed.insert(name.clone());
+                    }
+                } else {
+                    for candidate in &["token_embd.weight", "model.embed_tokens.weight", "lm_head.weight", "output.weight"] {
+                        if let Some(w) = weights.get(*candidate) {
+                            if w.rank() == 2 {
+                                let prepared = w.transpose(0, 1)?.contiguous()?;
+                                weights.insert(name.clone(), prepared);
+                                pretransposed.insert(name.clone());
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            self.pretransposed_matmul_weights = pretransposed;
+        }
 
         let kv_cache = RawKvCache::new();
 
@@ -1918,27 +2018,65 @@ impl LlmBackend for CandleBackend {
                         // correct output once removed.)
                         qmatmul.forward(&in_t_f32)?
                     } else {
-                        let w_t = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
-
-                        // Align dtypes: dequantize() always returns F32, but safetensors weights
-                        // may be F16. Align both to compute_dtype to avoid matmul dtype mismatch.
-                        let in_t_aligned = if in_t.dtype() != self.compute_dtype {
-                            in_t.to_dtype(self.compute_dtype)?
+                        // Align input dtype to F32 for the matmul itself, same invariant as
+                        // the qmatmul branch above and for the same reason: f16 overflows at
+                        // ~65504, and this project's own models (Qwen 2.5's residual stream
+                        // reaches ~43k by layer 0) cross that ceiling within a few layers,
+                        // producing NaN that poisons every subsequent layer. This branch
+                        // handles every DENSE weight (plain HF safetensors, and AWQ/GPTQ/MLX
+                        // dequantized weights, which are stored as plain dense tensors, not
+                        // QMatMul) - confirmed missing this fix by reproducing garbage CUDA
+                        // output on a real Qwen2-1.5B-Instruct checkpoint (head_dim=128,
+                        // 28 layers) that generated correctly once forced to F32 here, and
+                        // correctly on the CPU backend (which already used F32 throughout)
+                        // the whole time.
+                        let in_t_aligned = if in_t.dtype() != DType::F32 {
+                            in_t.to_dtype(DType::F32)?
                         } else {
                             in_t.clone()
                         };
-                        let w_t_aligned = if w_t.dtype() != self.compute_dtype {
-                            w_t.to_dtype(self.compute_dtype)?
-                        } else {
-                            w_t
-                        };
 
-                        // Auto-transpose: weight stored row-major [out_features, in_features]
-                        let last_dim = in_t_aligned.dim(in_t_aligned.rank() - 1)?;
-                        let w_t_final = if w_t_aligned.rank() == 2 && last_dim == w_t_aligned.dim(1)? {
-                            w_t_aligned.transpose(0, 1)?.contiguous()?
+                        // Dense weights on this path are pre-transposed to
+                        // [in_features, out_features] and cast to F32 once at load time
+                        // (see `load_weights`'s "pre-transpose dense MatMul weights" pass) -
+                        // rebuilding this via a full device-side transpose+copy on every
+                        // decode step was a real, measured bottleneck (a from-scratch
+                        // transpose+contiguous of every dense weight, every layer, every
+                        // token). A runtime cache keyed by weight name was tried first and
+                        // reverted: it doubled steady-state VRAM (original + transposed copy
+                        // both resident) and OOM'd this 8GB card on a 1.5B model - doing it
+                        // once at load, replacing the original entry instead of duplicating
+                        // it, avoids that entirely.
+                        let w_t_final = self.get_weight(weight, &mut local_cache)?.to_device(in_t.device())?;
+                        let w_t_final = if w_t_final.dtype() != DType::F32 {
+                            w_t_final.to_dtype(DType::F32)?
                         } else {
-                            w_t_aligned
+                            w_t_final
+                        };
+                        // Skip the transpose only for weights the load-time pass actually
+                        // pre-transposed (tracked explicitly in
+                        // `pretransposed_matmul_weights`, NOT inferred from shape - a
+                        // shape-based "does this still need transposing?" check was tried
+                        // here instead and is WRONG for square weights, e.g.
+                        // `q_proj`/`o_proj` where hidden_size == hidden_size: a transposed
+                        // square matrix has the same `dim(1)` value as an untransposed one,
+                        // so the check can't tell them apart and silently re-transposes
+                        // - undoing the load-time fix - confirmed by reproducing exactly
+                        // this failure, garbage output only for the square-projection
+                        // layers, on real CUDA hardware). Anything not in the set (the rare
+                        // tied-embedding-without-separate-lm_head-tensor edge case, skipped
+                        // at load time because the same tensor doubles as the embedding
+                        // table) falls back to transposing here, same as before this
+                        // optimization existed.
+                        let w_t_final = if self.pretransposed_matmul_weights.contains(weight) {
+                            w_t_final
+                        } else {
+                            let last_dim = in_t_aligned.dim(in_t_aligned.rank() - 1)?;
+                            if w_t_final.rank() == 2 && last_dim == w_t_final.dim(1)? {
+                                w_t_final.transpose(0, 1)?.contiguous()?
+                            } else {
+                                w_t_final
+                            }
                         };
 
                         let rank_in = in_t_aligned.rank();
