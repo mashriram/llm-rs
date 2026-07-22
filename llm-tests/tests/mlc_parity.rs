@@ -954,11 +954,21 @@ async fn test_openai_v1_completions() {
     let meta = std::sync::Arc::new(dummy.meta.clone());
     let backend = Box::new(dummy);
     let engine = Arc::new(ServingEngine::new(backend, 16));
-    let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("qwen2.5-0.5b/tokenizer.json");
-    let tokenizer = Arc::new(llm_core::tokenizer::LlmTokenizer::from_file(tokenizer_path).unwrap());
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let candidates = [
+        manifest_dir.parent().unwrap().join("qwen2.5-0.5b/tokenizer.json"),
+        manifest_dir.parent().unwrap().join("smollm3_tokenizer.json"),
+        manifest_dir.parent().unwrap().parent().unwrap().join("smollm3_tokenizer.json"),
+        manifest_dir.parent().unwrap().join("gemma4_tokenizer.json"),
+        manifest_dir.parent().unwrap().parent().unwrap().join("gemma4_tokenizer.json"),
+    ];
+    let tokenizer_inst = candidates.iter().find_map(|path| {
+        llm_core::tokenizer::LlmTokenizer::from_file(path).ok()
+    }).unwrap_or_else(|| {
+        let fallback_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"vocab":{"<unk>":0,"<s>":1,"</s>":2},"merges":[]}}"#;
+        llm_core::tokenizer::LlmTokenizer::from_str(fallback_json).expect("valid fallback tokenizer")
+    });
+    let tokenizer = Arc::new(tokenizer_inst);
     let state = Arc::new(llm_cli::AppState {
         engine,
         model_name: "test-model".to_string(),

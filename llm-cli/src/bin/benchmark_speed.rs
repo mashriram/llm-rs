@@ -76,16 +76,14 @@ async fn main() -> anyhow::Result<()> {
     let engine = Arc::new(ServingEngine::new(backend, 1024));
     let mut rx = engine.subscribe();
 
-    let prompt = if meta.is_gemma {
-        format!("<|turn>user\n{}<turn|>\n<|turn>model\n", args.prompt)
-    } else {
-        format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", args.prompt)
-    };
+    let prompt = llm_cli::render_prompt(
+        &[llm_cli::ChatMessage {
+            role: "user".to_string(),
+            content: args.prompt.clone(),
+        }],
+        &meta,
+    );
     let mut prompt_tokens = tokenizer.encode(&prompt, true)?;
-    // Previously missing here (unlike run_model.rs/chat.rs), which meant a
-    // Gemma checkpoint benchmarked through this bin silently generated from
-    // an unprimed prompt (no BOS token) — a real behavioral drift bug fixed
-    // by using the single shared implementation.
     maybe_prepend_bos(&mut prompt_tokens, &meta);
     let prompt_len = prompt_tokens.len();
     println!("Prompt ({} tokens): \"{}\"", prompt_len, args.prompt);

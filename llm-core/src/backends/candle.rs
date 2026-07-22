@@ -12,7 +12,7 @@ use crate::model::config::parse_config;
 use crate::sampler::sample_logits;
 use crate::graph::{ComputeGraph, Operator, scan_tensors, build_graph, map_gguf_name};
 use crate::backends::vision::VisionEncoder;
-use crate::backends::attention::{RmsNorm, RawKvCache, apply_rope, apply_rope_q, repeat_kv, rms_norm_no_scale};
+use crate::backends::attention::{RmsNorm, RawKvCache, repeat_kv, rms_norm_no_scale};
 use crate::backends::multimodal::splice_visual_embeddings;
 use crate::backends::weights::{ExecContext, WeightStore, meta_u32, meta_u32_agnostic, meta_f32_agnostic, find_meta_key};
 use crate::backends::audio::AudioEncoder;
@@ -403,6 +403,10 @@ impl CandleBackend {
     pub fn new() -> Self {
         let explicit_dequantize = std::env::var("LLM_EXPLICIT_DEQUANTIZE").is_ok();
         let use_vram_embeddings = std::env::var("LLM_USE_VRAM_EMBEDDINGS").is_ok();
+        let cpu_cores = crate::profile::HardwareProfile::get().cpu_cores;
+        if cpu_cores > 0 && std::env::var("RAYON_NUM_THREADS").is_err() {
+            std::env::set_var("RAYON_NUM_THREADS", cpu_cores.to_string());
+        }
         Self {
             weights: HashMap::new(),
             quantized_weights: HashMap::new(),
@@ -1803,16 +1807,11 @@ impl LlmBackend for CandleBackend {
         }
         let profile_t_op_loop_start = Instant::now();
 
+        let mut cos_sin_step_cache: HashMap<(usize, u32), (Tensor, Tensor)> = HashMap::new();
+
         // Execute operators sequentially
         for (idx, op) in graph.ops.iter().enumerate() {
             let profile_t_op_start = profile_step.then(Instant::now);
-            /*
-            if batch.seq_ids[0] == 1 && kv_cache.get_seq_len(batch.seq_ids[0]) == 0 {
-                use std::io::Write;
-                println!("Executing OP idx={}/{}: {:?}", idx, graph.ops.len(), op);
-                std::io::stdout().flush().ok();
-            }
-            */
             match op {
                 Operator::Embed { input_ids, weight, output } => {
                     let ids = ctx.get(input_ids)?;
@@ -1931,8 +1930,22 @@ impl LlmBackend for CandleBackend {
 
                     let q_4d = q_t.reshape((b_sz, seq_len, layer_n_heads, layer_head_dim))?;
                     let k_4d = k_t.reshape((b_sz, seq_len, layer_n_kv_heads, layer_k_head_dim))?;
-                    let inv_freq = self.get_inv_freq(head_dim, *rope_theta, q_4d.device())?;
-                    let (q_out_4d, k_out_4d) = apply_rope(&q_4d, &k_4d, batch, &kv_cache, *rope_theta, &inv_freq)?;
+
+                    let key = (head_dim, rope_theta.to_bits());
+                    let (cos, sin) = match cos_sin_step_cache.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            let inv_freq = self.get_inv_freq(head_dim, *rope_theta, q_4d.device())?;
+                            let half_dim = head_dim / 2;
+                            let (c, s) = crate::backends::attention::build_cos_sin(b_sz, seq_len, batch, &kv_cache, &inv_freq, q_4d.dtype(), q_4d.device())?;
+                            let c = c.reshape((b_sz, seq_len, 1, half_dim))?;
+                            let s = s.reshape((b_sz, seq_len, 1, half_dim))?;
+                            e.insert((c.clone(), s.clone()));
+                            (c, s)
+                        }
+                    };
+
+                    let (q_out_4d, k_out_4d) = crate::backends::attention::apply_rope_with_cos_sin(&q_4d, &k_4d, &cos, &sin, *rope_theta)?;
                     let q_out = q_out_4d.reshape((b_sz, seq_len, layer_n_heads * layer_head_dim))?;
                     let k_out = k_out_4d.reshape((b_sz, seq_len, layer_n_kv_heads * layer_k_head_dim))?;
                     ctx.insert(output_q.clone(), q_out);
@@ -1947,8 +1960,22 @@ impl LlmBackend for CandleBackend {
                     let layer_head_dim = head_dim;
 
                     let q_4d = q_t.reshape((b_sz, seq_len, layer_n_heads, layer_head_dim))?;
-                    let inv_freq = self.get_inv_freq(head_dim, *rope_theta, q_4d.device())?;
-                    let q_out_4d = apply_rope_q(&q_4d, batch, &kv_cache, *rope_theta, &inv_freq)?;
+
+                    let key = (head_dim, rope_theta.to_bits());
+                    let (cos, sin) = match cos_sin_step_cache.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            let inv_freq = self.get_inv_freq(head_dim, *rope_theta, q_4d.device())?;
+                            let half_dim = head_dim / 2;
+                            let (c, s) = crate::backends::attention::build_cos_sin(b_sz, seq_len, batch, &kv_cache, &inv_freq, q_4d.dtype(), q_4d.device())?;
+                            let c = c.reshape((b_sz, seq_len, 1, half_dim))?;
+                            let s = s.reshape((b_sz, seq_len, 1, half_dim))?;
+                            e.insert((c.clone(), s.clone()));
+                            (c, s)
+                        }
+                    };
+
+                    let q_out_4d = crate::backends::attention::apply_rope_q_with_cos_sin(&q_4d, &cos, &sin, *rope_theta)?;
                     let q_out = q_out_4d.reshape((b_sz, seq_len, layer_n_heads * layer_head_dim))?;
                     ctx.insert(output_q.clone(), q_out);
                 }

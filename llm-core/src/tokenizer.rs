@@ -14,6 +14,18 @@ impl LlmTokenizer {
         Ok(Self { tokenizer })
     }
 
+    /// Load a tokenizer from raw bytes (JSON data).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let tokenizer = Tokenizer::from_bytes(bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to parse tokenizer from bytes: {}", e))?;
+        Ok(Self { tokenizer })
+    }
+
+    /// Load a tokenizer from a JSON string.
+    pub fn from_str(json: &str) -> Result<Self> {
+        Self::from_bytes(json.as_bytes())
+    }
+
     /// Encode input text into token IDs.
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         let encoding = self.tokenizer.encode(text, add_special_tokens)

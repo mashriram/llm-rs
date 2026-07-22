@@ -52,6 +52,24 @@ fn assert_slice_close(actual: &[f32], expected: &[f32], tol: f32, label: &str) {
     }
 }
 
+fn load_test_tokenizer() -> Arc<LlmTokenizer> {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let candidates = [
+        manifest_dir.parent().unwrap().join("qwen2.5-0.5b/tokenizer.json"),
+        manifest_dir.parent().unwrap().join("smollm3_tokenizer.json"),
+        manifest_dir.parent().unwrap().parent().unwrap().join("smollm3_tokenizer.json"),
+        manifest_dir.parent().unwrap().join("gemma4_tokenizer.json"),
+        manifest_dir.parent().unwrap().parent().unwrap().join("gemma4_tokenizer.json"),
+    ];
+    let tokenizer_inst = candidates.iter().find_map(|path| {
+        LlmTokenizer::from_file(path).ok()
+    }).unwrap_or_else(|| {
+        let fallback_json = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"vocab":{"<unk>":0,"<s>":1,"</s>":2},"merges":[]}}"#;
+        LlmTokenizer::from_str(fallback_json).expect("valid fallback tokenizer")
+    });
+    Arc::new(tokenizer_inst)
+}
+
 // ============================================================================
 // DUMMY BACKEND — returns token 2 for every forward pass
 // ============================================================================
@@ -1148,11 +1166,7 @@ async fn test_http_chat_completions_returns_200() {
     let meta = std::sync::Arc::new(dummy.meta.clone());
     let backend = Box::new(dummy);
     let engine = Arc::new(ServingEngine::new(backend, 16));
-    let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("qwen2.5-0.5b/tokenizer.json");
-    let tokenizer = Arc::new(llm_core::tokenizer::LlmTokenizer::from_file(tokenizer_path).unwrap());
+    let tokenizer = load_test_tokenizer();
     let state = Arc::new(llm_cli::AppState {
         engine,
         model_name: "test-model".to_string(),
@@ -1200,11 +1214,7 @@ async fn test_http_chat_completions_response_has_choices() {
     let meta = std::sync::Arc::new(dummy.meta.clone());
     let backend = Box::new(dummy);
     let engine = Arc::new(ServingEngine::new(backend, 16));
-    let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("qwen2.5-0.5b/tokenizer.json");
-    let tokenizer = Arc::new(llm_core::tokenizer::LlmTokenizer::from_file(tokenizer_path).unwrap());
+    let tokenizer = load_test_tokenizer();
     let state = Arc::new(llm_cli::AppState {
         engine,
         model_name: "test-model".to_string(),
@@ -1256,11 +1266,7 @@ async fn test_http_health_endpoint_returns_200() {
     let meta = std::sync::Arc::new(dummy.meta.clone());
     let backend = Box::new(dummy);
     let engine = Arc::new(ServingEngine::new(backend, 16));
-    let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("qwen2.5-0.5b/tokenizer.json");
-    let tokenizer = Arc::new(llm_core::tokenizer::LlmTokenizer::from_file(tokenizer_path).unwrap());
+    let tokenizer = load_test_tokenizer();
     let state = Arc::new(llm_cli::AppState {
         engine,
         model_name: "test-model".to_string(),
@@ -1296,11 +1302,7 @@ async fn test_http_models_endpoint_lists_model() {
     let backend = Box::new(dummy);
     let engine = Arc::new(ServingEngine::new(backend, 16));
     let model_name = "my-test-model".to_string();
-    let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("qwen2.5-0.5b/tokenizer.json");
-    let tokenizer = Arc::new(llm_core::tokenizer::LlmTokenizer::from_file(tokenizer_path).unwrap());
+    let tokenizer = load_test_tokenizer();
     let state = Arc::new(llm_cli::AppState { engine, model_name: model_name.clone(), tokenizer, meta: meta.clone(), max_tokens_limit: 4096 });
     let app = llm_cli::create_router(state);
 
@@ -1335,11 +1337,7 @@ async fn test_http_missing_content_type_returns_415() {
     let meta = std::sync::Arc::new(dummy.meta.clone());
     let backend = Box::new(dummy);
     let engine = Arc::new(ServingEngine::new(backend, 16));
-    let tokenizer_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("qwen2.5-0.5b/tokenizer.json");
-    let tokenizer = Arc::new(llm_core::tokenizer::LlmTokenizer::from_file(tokenizer_path).unwrap());
+    let tokenizer = load_test_tokenizer();
     let state = Arc::new(llm_cli::AppState {
         engine, model_name: "m".to_string(),
         tokenizer,

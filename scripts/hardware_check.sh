@@ -255,7 +255,7 @@ supply one manually."
 fi
 
 MODEL_GGUF="$(find "$MODEL_DIR" -maxdepth 1 -iname '*.gguf' ! -iname '*mmproj*' | head -1)"
-TOKENIZER_JSON="$(find "$MODEL_DIR" -maxdepth 1 -iname 'tokenizer.json' | head -1)"
+TOKENIZER_JSON="$(find "$MODEL_DIR" -maxdepth 1 -iname '*tokenizer*.json' | head -1)"
 
 if [[ -n "$MODEL_GGUF" && -n "$TOKENIZER_JSON" ]]; then
   log "Running text generation smoke test with $MODEL_GGUF ..."
